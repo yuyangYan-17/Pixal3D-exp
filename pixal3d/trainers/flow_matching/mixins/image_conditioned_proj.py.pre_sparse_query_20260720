@@ -201,9 +201,7 @@ class ProjGrid(nn.Module):
         distance: torch.Tensor,
         mesh_scale: torch.Tensor,
         transform_matrix: Optional[torch.Tensor] = None,
-        BHWC: bool = True,
-        grid_indices: Optional[torch.Tensor] = None,
-        grid_resolution: Optional[int] = None,
+        BHWC: bool = True
     ) -> torch.Tensor:
         """
         Project 3D grid points to image and sample features.
@@ -215,70 +213,17 @@ class ProjGrid(nn.Module):
             mesh_scale: Mesh scale factor, shape [B]
             transform_matrix: Optional camera transform matrix, shape [B, 4, 4]
             BHWC: Whether features_map is in BHWC format
-            grid_indices: Optional integer grid coordinates, shape [K, 3] for
-                batch size 1 or [B, K, 3]. When provided, only these points are
-                projected instead of materializing the full 3D grid.
-            grid_resolution: Resolution used to map grid_indices to [-1, 1].
-                Defaults to this module's grid_resolution.
             
         Returns:
-            Projected features, shape [B, grid_resolution³, C] for the dense
-            path or [B, K, C] when grid_indices is provided.
+            Projected features, shape [B, grid_resolution³, C]
         """
         if BHWC:
             B, H, W, C = features_map.shape
         else:
             B, C, H, W = features_map.shape
             
-        if grid_indices is None:
-            grid_points = self.grid_points.expand(B, -1, -1)
-        else:
-            query_resolution = int(grid_resolution or self.grid_resolution)
-            if query_resolution <= 1:
-                raise ValueError(
-                    f"grid_resolution must be greater than 1, got {query_resolution}"
-                )
-            if grid_indices.ndim == 2:
-                if B != 1:
-                    raise ValueError(
-                        "Unbatched grid_indices are only supported for batch size 1"
-                    )
-                grid_indices = grid_indices.unsqueeze(0)
-            elif grid_indices.ndim != 3 or grid_indices.shape[0] != B:
-                raise ValueError(
-                    "grid_indices must have shape [K, 3] or [B, K, 3], "
-                    f"got {tuple(grid_indices.shape)} for batch size {B}"
-                )
-            if grid_indices.shape[-1] != 3:
-                raise ValueError(
-                    f"grid_indices must end with 3 coordinates, got {tuple(grid_indices.shape)}"
-                )
-
-            grid_indices = grid_indices.to(device=features_map.device, dtype=torch.long)
-            if torch.any(grid_indices < 0) or torch.any(grid_indices >= query_resolution):
-                raise ValueError(
-                    f"grid_indices must be in [0, {query_resolution - 1}]"
-                )
-
-            # Match the dense constructor's torch.linspace coordinate convention,
-            # then apply the same Blender alignment: (x, y, z) -> (x, -z, y).
-            one_dim = torch.linspace(
-                -1,
-                1,
-                query_resolution,
-                dtype=self.grid_points.dtype,
-                device=features_map.device,
-            )
-            grid_points_unrotated = one_dim[grid_indices]
-            grid_points = torch.stack(
-                (
-                    grid_points_unrotated[..., 0],
-                    -grid_points_unrotated[..., 2],
-                    grid_points_unrotated[..., 1],
-                ),
-                dim=-1,
-            )
-
+        grid_points = self.grid_points
+        grid_points = grid_points.expand(B, -1, -1)
         grid_points = grid_points / mesh_scale.unsqueeze(-1).unsqueeze(-1) / 2  # Scale alignment
         assert transform_matrix is None, "transform_matrix is not None"
         if transform_matrix is None:
@@ -540,8 +485,6 @@ class DinoV3ProjFeatureExtractor(nn.Module):
         distance: Optional[torch.Tensor] = None,
         mesh_scale: Optional[torch.Tensor] = None,
         transform_matrix: Optional[torch.Tensor] = None,
-        grid_indices: Optional[torch.Tensor] = None,
-        grid_resolution: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Extract view-aligned features from the image.
@@ -552,15 +495,11 @@ class DinoV3ProjFeatureExtractor(nn.Module):
             distance: Camera distance [B]
             mesh_scale: Mesh scale factor [B]
             transform_matrix: Optional camera transform matrix [B, 4, 4]
-            grid_indices: Optional grid coordinates to project directly. See
-                ProjGrid.forward for accepted shapes.
-            grid_resolution: Resolution associated with grid_indices.
         
         Returns:
             Tuple of (global_features, proj_features):
             - global_features: [B, num_global_tokens, embed_dim]
-            - proj_features: [B, grid_resolution³, proj_channels], or
-              [B, K, proj_channels] when grid_indices is provided
+            - proj_features: [B, grid_resolution³, proj_channels]
               where proj_channels = embed_dim (no NAF) or embed_dim*2 (with NAF)
         """
         # Handle input types
@@ -608,9 +547,7 @@ class DinoV3ProjFeatureExtractor(nn.Module):
                 camera_angle_x, 
                 distance, 
                 mesh_scale,
-                transform_matrix,
-                grid_indices=grid_indices,
-                grid_resolution=grid_resolution,
+                transform_matrix
             )  # [B, grid_res³, D]
             
             # --- High-resolution branch (NAF): upsample then sample ---
@@ -629,9 +566,7 @@ class DinoV3ProjFeatureExtractor(nn.Module):
                     distance,
                     mesh_scale,
                     transform_matrix,
-                    BHWC=False,  # hr_features is [B, C, H', W']
-                    grid_indices=grid_indices,
-                    grid_resolution=grid_resolution,
+                    BHWC=False  # hr_features is [B, C, H', W']
                 )  # [B, grid_res³, D]
                 
                 # Concatenate lr and hr: [B, grid_res³, D*2]

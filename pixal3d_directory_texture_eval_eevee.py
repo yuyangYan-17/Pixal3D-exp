@@ -1,0 +1,2621 @@
+#!/usr/bin/env python3
+"""Batch Pixal3D textured reconstruction and aligned-view evaluation.
+
+Renderer variant: EEVEE; original decoder mesh topology is preserved.
+
+The script reads every image from ``--image-dir`` and evaluates every
+image x resolution x seed x light combination.
+
+Persistent outputs
+------------------
+output_dir/
+  metrics.csv
+  metrics.json
+  run_config.json
+  run.log
+  <image_name>/
+    input_original.png
+    input_preprocessed_rgba.png
+    metric_reference_rgb.png
+    camera.json
+    r<resolution>/seed_<seed>/generation.json
+    r<resolution>/seed_<seed>/<light>/
+      <experiment>__original.png
+      <experiment>__render.png
+      <experiment>__comparison.png
+      <experiment>__metrics.json
+
+No GLB is retained in the output tree. Pixal3D/O-Voxel still has to bake the
+sparse PBR attributes into a textured mesh before Blender can render it. This
+script writes that mesh only into a temporary scratch directory, renders all
+requested views, and then removes the temporary directory.
+
+The per-experiment ``original`` image is the black-composited, Pixal3D-
+preprocessed aligned condition image. The unmodified source image is also saved
+once as ``input_original.png`` under the corresponding image directory.
+
+Example
+-------
+CUDA_VISIBLE_DEVICES=4 HF_HUB_OFFLINE=1 \
+python pixal3d_directory_texture_eval_eevee.py \
+  --image-dir assets/images \
+  --output-dir outputs/pixal3d_directory_texture_eval \
+  --blender-gpu 4 \
+  --resolutions 1024 1536 \
+  --seeds 42 123 \
+  --lights studio softbox front uniform \
+  --render-resolution 2048 \
+  --metric-resolution 512 \
+  --low-vram
+"""
+from __future__ import annotations
+
+import argparse
+import csv
+import gc
+import hashlib
+import json
+import math
+import os
+import random
+import re
+import shlex
+import shutil
+import subprocess
+import tempfile
+import time
+import traceback
+from collections import Counter
+from pathlib import Path
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+
+# Set backend-related variables before importing torch/Pixal3D.
+os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+os.environ.setdefault("ATTN_BACKEND", "flash_attn")
+os.environ.setdefault(
+    "FLEX_GEMM_AUTOTUNE_CACHE_PATH",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "autotune_cache.json"),
+)
+os.environ.setdefault("FLEX_GEMM_AUTOTUNER_VERBOSE", "1")
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+from PIL import Image
+
+
+# -----------------------------------------------------------------------------
+# User-local defaults, matching the supplied inference script.
+# -----------------------------------------------------------------------------
+MODEL_PATH = "/home/nvme04/yyyan/download/model/Pixal3D"
+MOGE_MODEL_NAME = "/home/nvme04/yyyan/download/model/moge-2-vitl/model.pt"
+DINOV3_PATH = (
+    "/home/nvme04/yyyan/download/model/"
+    "dinov3-vitl16-pretrain-lvd1689m/facebook/"
+    "dinov3-vitl16-pretrain-lvd1689m"
+)
+
+SUPPORTED_RESOLUTIONS = (1024, 1536)
+LIGHT_MODES = (
+    "studio",
+    "three_point",
+    "softbox",
+    "front",
+    "uniform",
+    "dramatic",
+)
+DEFAULT_IMAGE_EXTENSIONS = (
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".webp",
+    ".bmp",
+    ".tif",
+    ".tiff",
+)
+
+SS_SAMPLER = {
+    "steps": 12,
+    "guidance_strength": 7.5,
+    "guidance_rescale": 0.7,
+    "rescale_t": 5.0,
+}
+SHAPE_SAMPLER = {
+    "steps": 12,
+    "guidance_strength": 7.5,
+    "guidance_rescale": 0.5,
+    "rescale_t": 3.0,
+}
+TEXTURE_SAMPLER = {
+    "steps": 12,
+    "guidance_strength": 1.0,
+    "guidance_rescale": 0.0,
+    "rescale_t": 3.0,
+}
+
+# Pixal3D applies this matrix after o_voxel.postprocess.to_glb().
+PIXAL3D_EXPORT_ROTATION = np.array(
+    [
+        [-1.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, -1.0, 0.0],
+        [0.0, -1.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+    ],
+    dtype=np.float64,
+)
+
+# o_voxel decoder-space -> glTF-space conversion:
+# (x, y, z)_decoder -> (x, z, -y)_gltf.
+OVOXEL_DECODER_TO_GLTF = np.array(
+    [
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, -1.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+    ],
+    dtype=np.float64,
+)
+PIXAL3D_DECODER_TO_EXPORTED_GLTF = (
+    PIXAL3D_EXPORT_ROTATION @ OVOXEL_DECODER_TO_GLTF
+)
+PIXAL3D_EXPORTED_GLTF_TO_INTERNAL = np.linalg.inv(
+    PIXAL3D_DECODER_TO_EXPORTED_GLTF
+)
+
+
+# -----------------------------------------------------------------------------
+# Generic helpers
+# -----------------------------------------------------------------------------
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def json_safe(value: Any) -> Any:
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, np.generic):
+        return json_safe(value.item())
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().tolist()
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, Mapping):
+        return {str(key): json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_safe(item) for item in value]
+    return value
+
+
+def atomic_json(path: Path, value: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    with temporary.open("w", encoding="utf-8") as file:
+        json.dump(json_safe(value), file, ensure_ascii=False, indent=2, allow_nan=False)
+    temporary.replace(path)
+
+
+def write_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
+    rows = list(rows)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    preferred = [
+        "status",
+        "image_name",
+        "source_image",
+        "image_output_dir",
+        "pipeline_resolution",
+        "pipeline_type",
+        "seed",
+        "light",
+        "render_resolution",
+        "metric_resolution",
+        "psnr_db",
+        "ssim",
+        "lpips",
+        "decoder_vertices",
+        "decoder_faces",
+        "grid_resolution",
+        "pipeline_seconds",
+        "material_bake_seconds",
+        "temporary_asset_write_seconds",
+        "original_png",
+        "render_png",
+        "comparison_png",
+        "generation_json",
+        "error",
+    ]
+    keys = {key for row in rows for key in row.keys()}
+    fields = [key for key in preferred if key in keys]
+    fields.extend(sorted(key for key in keys if key not in fields))
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    with temporary.open("w", encoding="utf-8", newline="") as file:
+        writer = csv.DictWriter(file, fieldnames=fields, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+    temporary.replace(path)
+
+
+def composite_on_black(image: Image.Image) -> Image.Image:
+    rgba = image.convert("RGBA")
+    background = Image.new("RGBA", rgba.size, (0, 0, 0, 255))
+    background.alpha_composite(rgba)
+    return background.convert("RGB")
+
+
+def save_metric_reference(
+    condition_image: Image.Image,
+    output_path: Path,
+    render_resolution: int,
+) -> Image.Image:
+    reference = composite_on_black(condition_image)
+    target_size = (int(render_resolution), int(render_resolution))
+    if reference.size != target_size:
+        reference = reference.resize(target_size, Image.Resampling.LANCZOS)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    reference.save(output_path)
+    return reference
+
+
+def sanitize_directory_name(value: str) -> str:
+    value = value.strip()
+    value = re.sub(r"[\\/:*?\"<>|\x00-\x1f]+", "_", value)
+    value = re.sub(r"\s+", "_", value)
+    return value or "image"
+
+
+def path_is_within(path: Path, parent: Path) -> bool:
+    try:
+        path.resolve().relative_to(parent.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def discover_images(
+    image_dir: Path,
+    output_dir: Path,
+    recursive: bool,
+    extensions: Sequence[str],
+) -> List[Dict[str, Any]]:
+    normalized_extensions = {
+        extension.lower() if extension.startswith(".") else f".{extension.lower()}"
+        for extension in extensions
+    }
+    iterator = image_dir.rglob("*") if recursive else image_dir.glob("*")
+    candidates = []
+    for path in iterator:
+        if not path.is_file() or path.suffix.lower() not in normalized_extensions:
+            continue
+        if path_is_within(path, output_dir):
+            continue
+        candidates.append(path.resolve())
+    candidates.sort(key=lambda item: str(item.relative_to(image_dir)).lower())
+
+    sanitized_stems = [
+        sanitize_directory_name(path.stem) for path in candidates
+    ]
+    stem_counts = Counter(sanitized_stems)
+    records: List[Dict[str, Any]] = []
+    for path, sanitized_stem in zip(candidates, sanitized_stems):
+        relative_path = path.relative_to(image_dir)
+        output_name = sanitized_stem
+        if stem_counts[sanitized_stem] > 1:
+            digest = hashlib.sha1(
+                str(relative_path).encode("utf-8")
+            ).hexdigest()[:8]
+            output_name = f"{output_name}__{digest}"
+        records.append(
+            {
+                "path": path,
+                "relative_path": relative_path,
+                "output_name": output_name,
+            }
+        )
+    return records
+
+
+def save_black_composited_render(path: Path, expected_resolution: int) -> Image.Image:
+    with Image.open(path) as image:
+        rgb = composite_on_black(image)
+    target_size = (int(expected_resolution), int(expected_resolution))
+    if rgb.size != target_size:
+        rgb = rgb.resize(target_size, Image.Resampling.LANCZOS)
+    rgb.save(path)
+    return rgb
+
+
+def save_comparison(
+    original: Image.Image,
+    rendered: Image.Image,
+    output_path: Path,
+) -> None:
+    original_rgb = original.convert("RGB")
+    rendered_rgb = rendered.convert("RGB")
+    if rendered_rgb.size != original_rgb.size:
+        rendered_rgb = rendered_rgb.resize(
+            original_rgb.size,
+            Image.Resampling.LANCZOS,
+        )
+    width, height = original_rgb.size
+    comparison = Image.new("RGB", (width * 2, height), (255, 255, 255))
+    comparison.paste(original_rgb, (0, 0))
+    comparison.paste(rendered_rgb, (width, 0))
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    comparison.save(output_path)
+
+
+# -----------------------------------------------------------------------------
+# Pixal3D model and camera setup
+# -----------------------------------------------------------------------------
+def image_cond_configs(dino_model: str) -> Dict[str, Dict[str, Any]]:
+    return {
+        "ss": {
+            "model_name": dino_model,
+            "image_size": 512,
+            "grid_resolution": 16,
+        },
+        "shape_512": {
+            "model_name": dino_model,
+            "image_size": 512,
+            "grid_resolution": 32,
+            "use_naf_upsample": True,
+            "naf_target_size": 512,
+        },
+        "shape_1024": {
+            "model_name": dino_model,
+            "image_size": 1024,
+            "grid_resolution": 64,
+            "use_naf_upsample": True,
+            "naf_target_size": 512,
+        },
+        "tex_1024": {
+            "model_name": dino_model,
+            "image_size": 1024,
+            "grid_resolution": 64,
+            "use_naf_upsample": True,
+            "naf_target_size": 1024,
+        },
+    }
+
+
+def build_image_cond_model(config: Mapping[str, Any]):
+    from pixal3d.trainers.flow_matching.mixins.image_conditioned_proj import (
+        DinoV3ProjFeatureExtractor,
+    )
+
+    model = DinoV3ProjFeatureExtractor(**dict(config))
+    model.eval()
+    return model
+
+
+def init_pipeline(
+    model_path: str,
+    dino_model: str,
+    device: str,
+    low_vram: bool,
+):
+    from pixal3d.pipelines import Pixal3DImageTo3DPipeline
+
+    print(f"[pipeline] loading from {model_path}")
+    pipeline = Pixal3DImageTo3DPipeline.from_pretrained(model_path)
+    configs = image_cond_configs(dino_model)
+    pipeline.image_cond_model_ss = build_image_cond_model(configs["ss"])
+    pipeline.image_cond_model_shape_512 = build_image_cond_model(configs["shape_512"])
+    pipeline.image_cond_model_shape_1024 = build_image_cond_model(configs["shape_1024"])
+    pipeline.image_cond_model_tex_1024 = build_image_cond_model(configs["tex_1024"])
+
+    attributes = (
+        "image_cond_model_ss",
+        "image_cond_model_shape_512",
+        "image_cond_model_shape_1024",
+        "image_cond_model_tex_1024",
+    )
+    if low_vram:
+        print("[pipeline] enabling low-VRAM mode")
+        for attribute in attributes:
+            model = getattr(pipeline, attribute, None)
+            if model is not None and getattr(model, "use_naf_upsample", False):
+                model._load_naf()
+        pipeline._device = torch.device(device)
+        pipeline.low_vram = True
+    else:
+        pipeline.low_vram = False
+        if str(device).startswith("cuda"):
+            pipeline.cuda()
+        else:
+            pipeline.to(device)
+        for attribute in attributes:
+            model = getattr(pipeline, attribute, None)
+            if model is None:
+                continue
+            if str(device).startswith("cuda"):
+                model.cuda()
+            else:
+                model.to(device)
+            if getattr(model, "use_naf_upsample", False):
+                model._load_naf()
+    return pipeline
+
+
+def load_moge_model(model_name: str, device: str):
+    from moge.model.v2 import MoGeModel
+
+    print(f"[moge] loading from {model_name}")
+    model = MoGeModel.from_pretrained(model_name)
+    model = model.to(device)
+    model.eval()
+    return model
+
+
+def compute_f_pixels(camera_angle_x: float, resolution: int) -> float:
+    focal_length = 16.0 / math.tan(float(camera_angle_x) / 2.0)
+    return float(focal_length * float(resolution) / 32.0)
+
+
+def distance_from_fov(
+    camera_angle_x: float,
+    grid_point: torch.Tensor,
+    target_point: torch.Tensor,
+    mesh_scale: float,
+    image_resolution: int,
+) -> Dict[str, float]:
+    rotation_matrix = torch.tensor(
+        [[1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]],
+        dtype=torch.float32,
+    )
+    grid_rotated = grid_point.to(torch.float32) @ rotation_matrix.T
+    grid_rotated = grid_rotated / float(mesh_scale) / 2.0
+    x_world, y_world = grid_rotated[0].item(), grid_rotated[1].item()
+    x_target = float(target_point[0].item())
+    f_pixels = compute_f_pixels(camera_angle_x, image_resolution)
+    x_ndc = x_target - float(image_resolution) / 2.0
+    if abs(x_ndc) < 1e-8:
+        raise ValueError("Cannot derive camera distance because x_ndc is zero")
+    distance_x = f_pixels * x_world / x_ndc - y_world
+    return {"distance_from_x": float(distance_x), "f_pixels": float(f_pixels)}
+
+
+@torch.inference_mode()
+def estimate_camera_with_moge(
+    condition_image: Image.Image,
+    moge_model: Any,
+    device: str,
+    mesh_scale: float,
+    extend_pixel: int,
+) -> Dict[str, float]:
+    rgb = condition_image.convert("RGB")
+    width, height = rgb.size
+    if width != height:
+        print(
+            f"[warning] preprocessed image is {width}x{height}; "
+            "the aligned Pixal3D camera normally expects a square canvas"
+        )
+    image_np = np.asarray(rgb, dtype=np.float32) / 255.0
+    image_tensor = torch.from_numpy(image_np).permute(2, 0, 1).to(device)
+    output = moge_model.infer(image_tensor)
+    intrinsics = output["intrinsics"].squeeze().detach().cpu().numpy()
+    fx_normalized = float(intrinsics[0, 0])
+    fx = fx_normalized * float(width)
+    if not math.isfinite(fx) or fx <= 0.0:
+        raise ValueError(f"MoGe returned invalid focal length: {fx}")
+    camera_angle_x = float(2.0 * math.atan(width / (2.0 * fx)))
+    image_resolution = int(width)
+    distance = distance_from_fov(
+        camera_angle_x=camera_angle_x,
+        grid_point=torch.tensor([-1.0, 0.0, 0.0]),
+        target_point=torch.tensor(
+            [0 - int(extend_pixel), image_resolution - 1 + int(extend_pixel)]
+        ),
+        mesh_scale=mesh_scale,
+        image_resolution=image_resolution,
+    )["distance_from_x"]
+    return {
+        "camera_angle_x": camera_angle_x,
+        "distance": float(distance),
+        "mesh_scale": float(mesh_scale),
+        "source": "moge2",
+        "condition_width": int(width),
+        "condition_height": int(height),
+        "fx_normalized": fx_normalized,
+        "fx_pixels": float(fx),
+    }
+
+
+def manual_camera_params(
+    fov_rad: float,
+    condition_image: Image.Image,
+    mesh_scale: float,
+    extend_pixel: int,
+) -> Dict[str, float]:
+    width = int(condition_image.size[0])
+    distance = distance_from_fov(
+        camera_angle_x=float(fov_rad),
+        grid_point=torch.tensor([-1.0, 0.0, 0.0]),
+        target_point=torch.tensor([0 - int(extend_pixel), width - 1 + int(extend_pixel)]),
+        mesh_scale=mesh_scale,
+        image_resolution=width,
+    )["distance_from_x"]
+    return {
+        "camera_angle_x": float(fov_rad),
+        "distance": float(distance),
+        "mesh_scale": float(mesh_scale),
+        "source": "manual_fov",
+        "condition_width": int(condition_image.size[0]),
+        "condition_height": int(condition_image.size[1]),
+    }
+
+
+class Pixal3DGenerator:
+    def __init__(self, pipeline: Any, args: argparse.Namespace):
+        self.pipeline = pipeline
+        self.args = args
+
+    @staticmethod
+    def _sharded_uv_unwrap(
+        mesh,
+        compute_charts_kwargs=None,
+        xatlas_compute_charts_kwargs=None,
+        xatlas_pack_charts_kwargs=None,
+        return_vmaps=False,
+        verbose=False,
+        max_faces_per_shard=10_000,
+    ):
+        """Feed balanced, lossless face shards to xatlas.
+
+        CuMesh normally calls ``Atlas.add_mesh`` once per GPU-generated chart.
+        Raw Pixal3D meshes can contain hundreds of thousands of tiny charts,
+        making those Python/C++ calls a dominant serial cost.  Adding every
+        chart as one mesh also leaves a long single-core tail when one chart is
+        much larger than the others.  Contiguous face shards keep all triangles
+        while bounding the largest independent xatlas job so its native worker
+        pool can process multiple shards concurrently.
+        """
+        from cumesh.xatlas import Atlas
+        from tqdm import tqdm
+
+        compute_charts_kwargs = dict(compute_charts_kwargs or {})
+        xatlas_compute_charts_kwargs = dict(xatlas_compute_charts_kwargs or {})
+        xatlas_pack_charts_kwargs = dict(xatlas_pack_charts_kwargs or {})
+        xatlas_compute_charts_kwargs["verbose"] = bool(verbose)
+        xatlas_pack_charts_kwargs["verbose"] = bool(verbose)
+
+        mesh.remove_degenerate_faces()
+        clustering_started = time.perf_counter()
+        mesh.compute_charts(**compute_charts_kwargs)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        print(
+            f"[uv-sharded] gpu_clustering_seconds="
+            f"{time.perf_counter() - clustering_started:.3f}"
+        )
+
+        new_vertices, _ = mesh.read()
+        (
+            num_charts,
+            _,
+            chart_vmap,
+            chart_faces,
+            _,
+            chart_face_offset,
+        ) = mesh.read_atlas_charts()
+        face_counts = (chart_face_offset[1:] - chart_face_offset[:-1]).cpu()
+        if face_counts.numel():
+            quantiles = torch.quantile(
+                face_counts.float(),
+                torch.tensor([0.5, 0.9, 0.99]),
+            ).tolist()
+            print(
+                f"[uv-sharded] clusters={int(num_charts):,} "
+                f"faces_per_cluster median={quantiles[0]:.0f} "
+                f"p90={quantiles[1]:.0f} p99={quantiles[2]:.0f} "
+                f"max={int(face_counts.max()):,}"
+            )
+
+        transfer_started = time.perf_counter()
+        new_vertices_cpu = new_vertices.cpu().contiguous()
+        chart_faces = chart_faces.cpu().contiguous()
+        chart_vmap = chart_vmap.cpu().contiguous()
+        max_faces_per_shard = int(max_faces_per_shard)
+        if max_faces_per_shard <= 0:
+            raise ValueError("max_faces_per_shard must be positive")
+
+        atlas = Atlas()
+        input_vmaps = []
+        num_faces = int(chart_faces.shape[0])
+        shard_ranges = list(range(0, num_faces, max_faces_per_shard))
+        for start in tqdm(
+            shard_ranges,
+            desc="Preparing balanced xatlas shards",
+            disable=not verbose,
+        ):
+            end = min(start + max_faces_per_shard, num_faces)
+            shard_chart_faces = chart_faces[start:end]
+            chart_vertex_ids, inverse = torch.unique(
+                shard_chart_faces.reshape(-1),
+                sorted=True,
+                return_inverse=True,
+            )
+            shard_faces = inverse.reshape(-1, 3).to(torch.int32).contiguous()
+            shard_vmap = chart_vmap[chart_vertex_ids.long()].contiguous()
+            shard_vertices = new_vertices_cpu[shard_vmap.long()].contiguous()
+            atlas.add_mesh(shard_vertices * 1024.0, shard_faces)
+            input_vmaps.append(shard_vmap)
+        print(
+            f"[uv-sharded] shards={len(input_vmaps):,} "
+            f"max_faces_per_shard={max_faces_per_shard:,} "
+            f"prepare_cpu_seconds={time.perf_counter() - transfer_started:.3f}"
+        )
+
+        xatlas_started = time.perf_counter()
+        compute_started = time.perf_counter()
+        atlas.compute_charts(**xatlas_compute_charts_kwargs)
+        compute_seconds = time.perf_counter() - compute_started
+        print(f"[uv-sharded] xatlas_compute_seconds={compute_seconds:.3f}")
+        pack_started = time.perf_counter()
+        atlas.pack_charts(**xatlas_pack_charts_kwargs)
+        pack_seconds = time.perf_counter() - pack_started
+        print(f"[uv-sharded] xatlas_pack_seconds={pack_seconds:.3f}")
+        print(
+            f"[uv-sharded] xatlas_seconds="
+            f"{time.perf_counter() - xatlas_started:.3f}"
+        )
+
+        vmaps = []
+        faces = []
+        uvs = []
+        vertex_offset = 0
+        for index, input_vmap in enumerate(
+            tqdm(
+                input_vmaps,
+                desc="Gathering balanced xatlas shards",
+                disable=not verbose,
+            )
+        ):
+            vmap, shard_faces, shard_uvs = atlas.get_mesh(index)
+            vmaps.append(input_vmap[vmap.long()])
+            faces.append(shard_faces + vertex_offset)
+            uvs.append(shard_uvs)
+            vertex_offset += int(vmap.shape[0])
+
+        out_vmaps = torch.cat(vmaps, dim=0)
+        out_faces = torch.cat(faces, dim=0)
+        out_uvs = torch.cat(uvs, dim=0)
+        if int(out_faces.shape[0]) != num_faces:
+            raise RuntimeError(
+                f"xatlas changed face count: expected {num_faces}, "
+                f"got {int(out_faces.shape[0])}"
+            )
+        out_vertices = new_vertices_cpu[out_vmaps.long()]
+        output = [out_vertices, out_faces, out_uvs]
+        if return_vmaps:
+            output.append(out_vmaps)
+        return tuple(output)
+
+    @torch.inference_mode()
+    def generate_temporary_render_asset(
+        self,
+        condition_image: Image.Image,
+        camera_params: Mapping[str, float],
+        resolution: int,
+        seed: int,
+        temporary_glb: Path,
+    ) -> Dict[str, Any]:
+        """Generate one textured model and write only a temporary Blender asset.
+
+        O-Voxel's ``to_glb`` call performs the UV unwrap and PBR texture bake.
+        The resulting GLB is a transport file for Blender, not a user output.
+        The caller removes the scratch directory after all renders finish.
+        """
+        import o_voxel
+
+        started = time.perf_counter()
+        resolution = int(resolution)
+        if resolution not in SUPPORTED_RESOLUTIONS:
+            raise ValueError(f"Unsupported Pixal3D resolution: {resolution}")
+        pipeline_type = f"{resolution}_cascade"
+        set_seed(int(seed))
+        print(
+            f"[generate] pipeline_type={pipeline_type} seed={seed} "
+            f"temporary_asset={temporary_glb}"
+        )
+
+        pipeline_started = time.perf_counter()
+        mesh_list, latent_bundle = self.pipeline.run(
+            condition_image,
+            camera_params=dict(camera_params),
+            seed=int(seed),
+            sparse_structure_sampler_params=dict(SS_SAMPLER),
+            shape_slat_sampler_params=dict(SHAPE_SAMPLER),
+            tex_slat_sampler_params=dict(TEXTURE_SAMPLER),
+            preprocess_image=False,
+            return_latent=True,
+            pipeline_type=pipeline_type,
+            max_num_tokens=int(self.args.max_num_tokens),
+        )
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        pipeline_seconds = time.perf_counter() - pipeline_started
+        shape_slat, tex_slat, grid_resolution = latent_bundle
+        mesh = mesh_list[0]
+        print(
+            f"[decoder] vertices={int(mesh.vertices.shape[0]):,} "
+            f"faces={int(mesh.faces.shape[0]):,} grid={int(grid_resolution)} "
+            f"pipeline_seconds={pipeline_seconds:.3f}"
+        )
+
+        # Preserve the decoder mesh topology for visualization.  O-Voxel's
+        # API expects a decimation target, so set it to the current face count:
+        # the decimator has no lower target to simplify toward.  Remeshing is
+        # forced off even if a legacy command line passes --remesh.
+        original_face_count = int(mesh.faces.shape[0])
+        print(
+            f"[export] preserve-original-mesh faces={original_face_count:,} "
+            "remesh=False"
+        )
+        export_kwargs: Dict[str, Any] = {
+            "vertices": mesh.vertices,
+            "faces": mesh.faces,
+            "attr_volume": mesh.attrs,
+            "coords": mesh.coords,
+            "attr_layout": self.pipeline.pbr_attr_layout,
+            "grid_size": grid_resolution,
+            "aabb": [[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
+            "decimation_target": original_face_count,
+            "texture_size": int(self.args.texture_size),
+            "remesh": False,
+            "use_tqdm": True,
+            "verbose": True,
+        }
+
+        bake_started = time.perf_counter()
+        original_uv_unwrap = None
+        if self.args.uv_mode == "sharded":
+            import cumesh
+
+            original_uv_unwrap = cumesh.CuMesh.uv_unwrap
+
+            def sharded_uv_unwrap(mesh_instance, *unwrap_args, **unwrap_kwargs):
+                return self._sharded_uv_unwrap(
+                    mesh_instance,
+                    *unwrap_args,
+                    **unwrap_kwargs,
+                    max_faces_per_shard=int(self.args.uv_shard_faces),
+                )
+
+            cumesh.CuMesh.uv_unwrap = sharded_uv_unwrap
+        try:
+            glb_scene = o_voxel.postprocess.to_glb(**export_kwargs)
+        finally:
+            if original_uv_unwrap is not None:
+                cumesh.CuMesh.uv_unwrap = original_uv_unwrap
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        material_bake_seconds = time.perf_counter() - bake_started
+        print(f"[material-bake] seconds={material_bake_seconds:.3f}")
+
+        glb_scene.apply_transform(PIXAL3D_EXPORT_ROTATION)
+        temporary_glb.parent.mkdir(parents=True, exist_ok=True)
+        write_started = time.perf_counter()
+        glb_scene.export(
+            str(temporary_glb),
+            extension_webp=bool(self.args.extension_webp),
+        )
+        temporary_asset_write_seconds = time.perf_counter() - write_started
+        print(
+            f"[temporary-asset] write_seconds="
+            f"{temporary_asset_write_seconds:.3f}"
+        )
+
+        metadata = {
+            "status": "success",
+            "pipeline_resolution": resolution,
+            "pipeline_type": pipeline_type,
+            "seed": int(seed),
+            "grid_resolution": int(grid_resolution),
+            "camera_params": dict(camera_params),
+            "decoder_vertices": int(mesh.vertices.shape[0]),
+            "decoder_faces": int(mesh.faces.shape[0]),
+            "requested_decimation_target": int(self.args.decimation_target),
+            "decimation_target": int(original_face_count),
+            "texture_size": int(self.args.texture_size),
+            "requested_remesh": bool(self.args.remesh),
+            "remesh": False,
+            "uv_mode": str(self.args.uv_mode),
+            "uv_shard_faces": int(self.args.uv_shard_faces),
+            "extension_webp": bool(self.args.extension_webp),
+            "pipeline_seconds": float(pipeline_seconds),
+            "material_bake_seconds": float(material_bake_seconds),
+            "temporary_asset_write_seconds": float(
+                temporary_asset_write_seconds
+            ),
+            "elapsed_seconds": float(time.perf_counter() - started),
+            "temporary_asset_retained": False,
+        }
+
+        del glb_scene, mesh, mesh_list, latent_bundle, shape_slat, tex_slat
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return metadata
+
+
+# -----------------------------------------------------------------------------
+# Blender EEVEE PBR renderer with selectable light rigs
+# -----------------------------------------------------------------------------
+BLENDER_HELPER_SOURCE = r"""
+import argparse
+import json
+import math
+import os
+import sys
+import time
+import traceback
+from collections import OrderedDict
+from pathlib import Path
+
+import bpy
+from mathutils import Matrix
+
+
+def log(message):
+    print("[blender-eevee] %s" % message, flush=True)
+
+
+def log_cuda_visibility():
+    value = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+    log(
+        "CUDA_DEVICE_ORDER=%s CUDA_VISIBLE_DEVICES=%s"
+        % (os.environ.get("CUDA_DEVICE_ORDER", "<unset>"), value or "<unset>")
+    )
+    log(
+        "note: CUDA_VISIBLE_DEVICES selects CUDA workloads, not the "
+        "OpenGL/Vulkan device used by EEVEE"
+    )
+
+
+def log_graphics_device():
+    # Log the graphics context actually used by EEVEE.
+    try:
+        import gpu
+
+        platform = gpu.platform
+
+        def read_value(name, default="<unavailable>"):
+            function = getattr(platform, name, None)
+            if not callable(function):
+                return default
+            try:
+                return function()
+            except Exception:
+                return default
+
+        log(
+            "graphics backend=%s device=%s renderer=%s vendor=%s version=%s"
+            % (
+                read_value("backend_type_get"),
+                read_value("device_type_get"),
+                read_value("renderer_get"),
+                read_value("vendor_get"),
+                read_value("version_get"),
+            )
+        )
+    except Exception as exc:
+        log("unable to query graphics device: %s" % exc)
+
+
+def clear_scene():
+    bpy.ops.object.select_all(action="SELECT")
+    bpy.ops.object.delete(use_global=False)
+    for datablocks in (
+        bpy.data.meshes,
+        bpy.data.curves,
+        bpy.data.materials,
+        bpy.data.cameras,
+        bpy.data.lights,
+        bpy.data.images,
+    ):
+        for block in list(datablocks):
+            try:
+                datablocks.remove(block)
+            except Exception:
+                pass
+
+
+def clear_lights():
+    for obj in list(bpy.data.objects):
+        if obj.type == "LIGHT":
+            bpy.data.objects.remove(obj, do_unlink=True)
+    for light in list(bpy.data.lights):
+        if light.users == 0:
+            try:
+                bpy.data.lights.remove(light)
+            except Exception:
+                pass
+
+
+def select_eevee_engine(scene):
+    # Select EEVEE Next when available, otherwise legacy EEVEE.
+    errors = []
+    for engine in ("BLENDER_EEVEE_NEXT", "BLENDER_EEVEE"):
+        try:
+            scene.render.engine = engine
+            if scene.render.engine == engine:
+                return engine
+        except Exception as exc:
+            errors.append("%s: %s" % (engine, exc))
+    raise RuntimeError("No usable EEVEE render engine found: " + "; ".join(errors))
+
+
+def configure_eevee_samples(scene, samples):
+    # Set EEVEE render samples across Blender 3.x/4.x variants.
+    eevee = getattr(scene, "eevee", None)
+    if eevee is None:
+        log("scene.eevee settings are unavailable; using Blender defaults")
+        return
+
+    configured = []
+    for attribute in ("taa_render_samples", "taa_samples"):
+        if hasattr(eevee, attribute):
+            try:
+                setattr(eevee, attribute, int(samples))
+                configured.append(attribute)
+            except Exception as exc:
+                log("could not set scene.eevee.%s: %s" % (attribute, exc))
+
+    # These settings exist only on some Blender versions.  Keep hardware
+    # ray tracing disabled for the fast EEVEE path and enable the inexpensive
+    # rasterization features when available.
+    optional_boolean_settings = {
+        "use_gtao": True,
+        "use_soft_shadows": True,
+        "use_raytracing": False,
+    }
+    for attribute, value in optional_boolean_settings.items():
+        if hasattr(eevee, attribute):
+            try:
+                setattr(eevee, attribute, value)
+            except Exception:
+                pass
+
+    log(
+        "eevee render_samples=%d configured_fields=%s"
+        % (int(samples), configured or ["Blender default"])
+    )
+
+
+def configure_render(resolution, samples):
+    scene = bpy.context.scene
+    engine = select_eevee_engine(scene)
+    scene.render.resolution_x = int(resolution)
+    scene.render.resolution_y = int(resolution)
+    scene.render.resolution_percentage = 100
+    scene.render.image_settings.file_format = "PNG"
+    scene.render.image_settings.color_mode = "RGBA"
+    scene.render.image_settings.color_depth = "8"
+    scene.render.film_transparent = True
+    scene.render.use_file_extension = True
+    configure_eevee_samples(scene, samples)
+
+    # Reuse imported geometry and shader resources across light variants of
+    # the same model.  EEVEE does not build a Cycles BVH.
+    if hasattr(scene.render, "use_persistent_data"):
+        scene.render.use_persistent_data = True
+
+    try:
+        scene.display_settings.display_device = "sRGB"
+        scene.view_settings.view_transform = "Standard"
+        scene.view_settings.look = "None"
+    except Exception:
+        pass
+    scene.view_settings.exposure = 0.0
+    scene.view_settings.gamma = 1.0
+    world = scene.world or bpy.data.worlds.new("World")
+    scene.world = world
+    world.use_nodes = True
+    log("render engine=%s resolution=%dx%d" % (engine, resolution, resolution))
+    log_graphics_device()
+    return scene
+
+def set_world(scene, strength, color=(1.0, 1.0, 1.0, 1.0)):
+    world = scene.world
+    world.use_nodes = True
+    background = world.node_tree.nodes.get("Background")
+    if background is not None:
+        background.inputs["Color"].default_value = color
+        background.inputs["Strength"].default_value = float(strength)
+
+
+def import_glb(path):
+    before = set(bpy.data.objects)
+    try:
+        bpy.ops.import_scene.gltf(
+            filepath=str(path),
+            merge_vertices=False,
+            import_shading="NORMALS",
+        )
+    except TypeError:
+        bpy.ops.import_scene.gltf(filepath=str(path))
+    imported = [obj for obj in bpy.data.objects if obj not in before]
+    roots = [obj for obj in imported if obj.parent is None]
+    meshes = [obj for obj in imported if obj.type == "MESH"]
+    if not meshes:
+        raise RuntimeError("temporary GLB contains no mesh objects")
+    total_vertices = sum(len(obj.data.vertices) for obj in meshes)
+    total_polygons = sum(len(obj.data.polygons) for obj in meshes)
+    log(
+        "imported meshes=%d vertices=%d polygons=%d merge_vertices=False"
+        % (len(meshes), total_vertices, total_polygons)
+    )
+    return imported, roots
+
+
+def apply_root_transform(roots, values):
+    matrix_gltf = Matrix(values)
+    gltf_to_blender = Matrix((
+        (1.0, 0.0,  0.0, 0.0),
+        (0.0, 0.0, -1.0, 0.0),
+        (0.0, 1.0,  0.0, 0.0),
+        (0.0, 0.0,  0.0, 1.0),
+    ))
+    matrix_blender = gltf_to_blender @ matrix_gltf @ gltf_to_blender.inverted()
+    for root in roots:
+        root.matrix_world = matrix_blender @ root.matrix_world
+    bpy.context.view_layer.update()
+
+
+def add_area(scene, name, location, energy, size, color=(1.0, 1.0, 1.0)):
+    data = bpy.data.lights.new(name=name, type="AREA")
+    data.energy = float(energy)
+    data.shape = "DISK"
+    data.size = float(size)
+    data.color = color
+    obj = bpy.data.objects.new(name, data)
+    scene.collection.objects.link(obj)
+    obj.location = location
+    obj.rotation_euler = (-obj.location).to_track_quat("-Z", "Y").to_euler()
+    return obj
+
+
+def add_light_rig(scene, mode):
+    if mode == "studio":
+        set_world(scene, 0.22)
+        add_area(scene, "Key", (-3.5, -4.5, 4.5), 850.0, 4.5)
+        add_area(scene, "Fill", (4.0, -2.5, 2.0), 430.0, 5.0)
+        add_area(scene, "Top", (0.0, 0.5, 5.0), 300.0, 4.0)
+        add_area(scene, "Rim", (0.5, 4.0, 3.0), 300.0, 3.0)
+    elif mode == "three_point":
+        set_world(scene, 0.12)
+        add_area(scene, "Key", (-3.0, -4.0, 3.5), 1000.0, 3.0)
+        add_area(scene, "Fill", (3.5, -2.5, 1.5), 350.0, 4.0)
+        add_area(scene, "Rim", (1.0, 4.0, 3.0), 650.0, 2.5)
+    elif mode == "softbox":
+        set_world(scene, 0.30)
+        add_area(scene, "SoftboxLeft", (-3.5, -3.5, 3.0), 650.0, 6.0)
+        add_area(scene, "SoftboxRight", (3.5, -3.0, 2.5), 600.0, 6.0)
+        add_area(scene, "SoftboxTop", (0.0, 0.0, 5.0), 250.0, 5.0)
+    elif mode == "front":
+        set_world(scene, 0.15)
+        add_area(scene, "Front", (0.0, -4.5, 0.8), 1000.0, 5.0)
+        add_area(scene, "FrontTop", (0.0, -2.5, 4.0), 250.0, 4.0)
+    elif mode == "uniform":
+        set_world(scene, 0.35)
+        positions = (
+            (0.0, -4.0, 0.0),
+            (0.0, 4.0, 0.0),
+            (-4.0, 0.0, 0.0),
+            (4.0, 0.0, 0.0),
+            (0.0, 0.0, 4.0),
+            (0.0, 0.0, -4.0),
+        )
+        for index, position in enumerate(positions):
+            add_area(scene, "Uniform%02d" % index, position, 230.0, 4.5)
+    elif mode == "dramatic":
+        set_world(scene, 0.035)
+        add_area(scene, "HardKey", (-3.0, -3.5, 4.5), 1250.0, 1.5)
+        add_area(
+            scene,
+            "CoolRim",
+            (2.5, 4.0, 3.5),
+            900.0,
+            2.0,
+            (0.65, 0.75, 1.0),
+        )
+        add_area(
+            scene,
+            "WarmFill",
+            (3.5, -1.5, 0.5),
+            120.0,
+            3.0,
+            (1.0, 0.72, 0.55),
+        )
+    else:
+        raise ValueError("unsupported light mode: %s" % mode)
+
+
+def create_aligned_camera(scene, distance, fov_rad):
+    camera_data = bpy.data.cameras.new("Camera")
+    camera = bpy.data.objects.new("Camera", camera_data)
+    scene.collection.objects.link(camera)
+    camera.matrix_world = Matrix((
+        (1.0, 0.0,  0.0, 0.0),
+        (0.0, 0.0, -1.0, -float(distance)),
+        (0.0, 1.0,  0.0, 0.0),
+        (0.0, 0.0,  0.0, 1.0),
+    ))
+    camera_data.type = "PERSP"
+    camera_data.sensor_fit = "HORIZONTAL"
+    camera_data.sensor_width = 32.0
+    camera_data.sensor_height = 32.0
+    camera_data.lens = 16.0 / math.tan(float(fov_rad) / 2.0)
+    camera_data.clip_start = 0.01
+    camera_data.clip_end = 100.0
+    scene.camera = camera
+    return camera
+
+
+def write_status(path, payload):
+    status_path = Path(path)
+    status_path.parent.mkdir(parents=True, exist_ok=True)
+    status_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def preference_vulkan_devices():
+    system = bpy.context.preferences.system
+    prop = system.bl_rna.properties["gpu_preferred_device"]
+    return [item for item in prop.enum_items if item.identifier != "AUTO"]
+
+
+def configure_vulkan_gpu(gpu_index):
+    system = bpy.context.preferences.system
+    if system.gpu_backend != "VULKAN":
+        raise RuntimeError(
+            "Blender did not start with the Vulkan backend. The installed "
+            "Blender build or graphics driver may not support Vulkan. "
+            "On Linux/NVIDIA, Blender requires driver 550 or newer."
+        )
+
+    devices = preference_vulkan_devices()
+    for index, item in enumerate(devices):
+        log("Vulkan device %d: %s [%s]" % (index, item.name, item.identifier))
+    if gpu_index < 0 or gpu_index >= len(devices):
+        raise RuntimeError(
+            "Vulkan GPU index %d is out of range; Blender reported %d devices"
+            % (gpu_index, len(devices))
+        )
+
+    selected = devices[gpu_index]
+    system.gpu_backend = "VULKAN"
+    system.gpu_preferred_device = selected.identifier
+    if system.gpu_preferred_device != selected.identifier:
+        raise RuntimeError(
+            "Blender rejected Vulkan GPU %d (%s)"
+            % (gpu_index, selected.identifier)
+        )
+    result = bpy.ops.wm.save_userpref()
+    if "FINISHED" not in result:
+        raise RuntimeError("Blender could not save the isolated GPU preferences")
+    log(
+        "saved Vulkan GPU %d: %s [%s]"
+        % (gpu_index, selected.name, selected.identifier)
+    )
+    return {
+        "gpu_index": int(gpu_index),
+        "name": selected.name,
+        "identifier": selected.identifier,
+        "backend": "VULKAN",
+    }
+
+
+def validate_vulkan_gpu(gpu_index):
+    system = bpy.context.preferences.system
+    if system.gpu_backend != "VULKAN":
+        raise RuntimeError(
+            "Vulkan GPU %d was requested, but Blender fell back to %s. "
+            "Update the graphics driver or use a Vulkan-capable Blender build."
+            % (gpu_index, system.gpu_backend)
+        )
+
+    devices = preference_vulkan_devices()
+    if gpu_index < 0 or gpu_index >= len(devices):
+        raise RuntimeError(
+            "Vulkan GPU index %d is out of range during render; Blender "
+            "reported %d devices" % (gpu_index, len(devices))
+        )
+    expected = devices[gpu_index]
+    actual = system.gpu_preferred_device
+    if actual != expected.identifier:
+        raise RuntimeError(
+            "Blender GPU preference mismatch: expected %s, got %s"
+            % (expected.identifier, actual)
+        )
+    log(
+        "validated Vulkan GPU %d: %s [%s]"
+        % (gpu_index, expected.name, expected.identifier)
+    )
+
+
+def group_key(job):
+    return (
+        job["input_glb"],
+        int(job["resolution"]),
+        float(job["fov_rad"]),
+        float(job["distance"]),
+        int(job.get("samples", 64)),
+        json.dumps(job["transform"], separators=(",", ":")),
+    )
+
+
+def render_group(group_index, group_count, jobs):
+    first = jobs[0]
+    clear_scene()
+    scene = configure_render(first["resolution"], first.get("samples", 64))
+
+    started = time.perf_counter()
+    _, roots = import_glb(first["input_glb"])
+    apply_root_transform(roots, first["transform"])
+    create_aligned_camera(scene, first["distance"], first["fov_rad"])
+    log(
+        "group=%d/%d imported_once jobs=%d seconds=%.3f input=%s"
+        % (
+            group_index,
+            group_count,
+            len(jobs),
+            time.perf_counter() - started,
+            first["input_glb"],
+        )
+    )
+
+    for job_index, job in enumerate(jobs, start=1):
+        try:
+            clear_lights()
+            add_light_rig(scene, job["light_mode"])
+            output = Path(job["output_png"])
+            output.parent.mkdir(parents=True, exist_ok=True)
+            scene.render.filepath = str(output)
+            render_started = time.perf_counter()
+            log(
+                "render group=%d job=%d/%d light=%s start"
+                % (group_index, job_index, len(jobs), job["light_mode"])
+            )
+            bpy.ops.render.render(write_still=True)
+            log(
+                "render group=%d job=%d/%d light=%s seconds=%.3f done"
+                % (
+                    group_index,
+                    job_index,
+                    len(jobs),
+                    job["light_mode"],
+                    time.perf_counter() - render_started,
+                )
+            )
+            write_status(
+                job["status_json"],
+                {"status": "success", "output_png": job["output_png"], "error": None},
+            )
+        except Exception as exc:
+            error = "%s: %s" % (type(exc).__name__, exc)
+            traceback.print_exc()
+            write_status(
+                job["status_json"],
+                {
+                    "status": "failed",
+                    "output_png": job["output_png"],
+                    "error": error,
+                    "traceback": traceback.format_exc(),
+                },
+            )
+
+
+def main():
+    argv = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else []
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--jobs-json")
+    parser.add_argument("--configure-vulkan-gpu", type=int)
+    parser.add_argument("--configuration-status-json")
+    parser.add_argument("--expected-vulkan-gpu", type=int)
+    args = parser.parse_args(argv)
+
+    if args.configure_vulkan_gpu is not None:
+        if not args.configuration_status_json:
+            parser.error(
+                "--configuration-status-json is required with "
+                "--configure-vulkan-gpu"
+            )
+        try:
+            payload = configure_vulkan_gpu(args.configure_vulkan_gpu)
+            write_status(
+                args.configuration_status_json,
+                {"status": "success", "error": None, **payload},
+            )
+        except Exception as exc:
+            traceback.print_exc()
+            write_status(
+                args.configuration_status_json,
+                {
+                    "status": "failed",
+                    "error": "%s: %s" % (type(exc).__name__, exc),
+                    "traceback": traceback.format_exc(),
+                },
+            )
+        return
+
+    if not args.jobs_json:
+        parser.error("--jobs-json is required for rendering")
+    jobs = json.loads(Path(args.jobs_json).read_text(encoding="utf-8"))
+
+    try:
+        log_cuda_visibility()
+        if args.expected_vulkan_gpu is not None:
+            validate_vulkan_gpu(args.expected_vulkan_gpu)
+    except Exception as exc:
+        error = "%s: %s" % (type(exc).__name__, exc)
+        traceback.print_exc()
+        for job in jobs:
+            write_status(
+                job["status_json"],
+                {
+                    "status": "failed",
+                    "output_png": job["output_png"],
+                    "error": error,
+                    "traceback": traceback.format_exc(),
+                },
+            )
+        return
+
+    groups = OrderedDict()
+    for job in jobs:
+        groups.setdefault(group_key(job), []).append(job)
+
+    group_values = list(groups.values())
+    for group_index, group_jobs in enumerate(group_values, start=1):
+        try:
+            render_group(group_index, len(group_values), group_jobs)
+        except Exception as exc:
+            error = "%s: %s" % (type(exc).__name__, exc)
+            traceback.print_exc()
+            for job in group_jobs:
+                write_status(
+                    job["status_json"],
+                    {
+                        "status": "failed",
+                        "output_png": job["output_png"],
+                        "error": error,
+                        "traceback": traceback.format_exc(),
+                    },
+                )
+
+
+if __name__ == "__main__":
+    main()
+"""
+
+
+def ensure_blender_helper(work_dir: Path) -> Path:
+    helper_path = work_dir / "_pixal3d_blender_texture_render.py"
+    helper_path.parent.mkdir(parents=True, exist_ok=True)
+    helper_path.write_text(BLENDER_HELPER_SOURCE, encoding="utf-8")
+    return helper_path
+
+
+def blender_subprocess_environment(
+    user_config_dir: Optional[Path] = None,
+) -> Dict[str, str]:
+    """Build a clean environment for Blender without pretending CUDA selects EEVEE."""
+    environment = os.environ.copy()
+    environment.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
+    environment.pop("LIBGL_ALWAYS_SOFTWARE", None)
+
+    if user_config_dir is not None:
+        user_config_dir.mkdir(parents=True, exist_ok=True)
+        environment["BLENDER_USER_CONFIG"] = str(user_config_dir)
+
+    for key in ("PYTHONHOME", "PYTHONPATH"):
+        environment.pop(key, None)
+
+    ld_library_path = environment.get("LD_LIBRARY_PATH", "")
+    if "conda" in ld_library_path.lower() or "miniconda" in ld_library_path.lower():
+        environment.pop("LD_LIBRARY_PATH", None)
+    return environment
+
+
+def configure_blender_vulkan_gpu(
+    blender_executable: str,
+    helper_path: Path,
+    gpu_index: int,
+    user_config_dir: Path,
+    work_dir: Path,
+    log_path: Path,
+) -> Dict[str, Any]:
+    """Save an isolated Blender preference selecting one Vulkan device."""
+    status_path = work_dir / "blender_gpu_configuration.json"
+    command = [
+        blender_executable,
+        "--gpu-backend",
+        "vulkan",
+        "--background",
+        "--factory-startup",
+        "--python",
+        str(helper_path),
+        "--",
+        "--configure-vulkan-gpu",
+        str(gpu_index),
+        "--configuration-status-json",
+        str(status_path),
+    ]
+    environment = blender_subprocess_environment(user_config_dir)
+    print(f"[blender-gpu-setup] {shlex.join(command)}")
+    print(
+        f"[blender-gpu-setup] requested_vulkan_index={gpu_index} "
+        f"user_config={user_config_dir}"
+    )
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a", encoding="utf-8") as log_file:
+        log_file.write(
+            f"\n# Blender GPU setup command: {shlex.join(command)}\n"
+        )
+        process = subprocess.run(
+            command,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            text=True,
+            check=False,
+            env=environment,
+        )
+
+    if status_path.is_file():
+        try:
+            status = json.loads(status_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise RuntimeError(
+                f"Invalid Blender GPU configuration status: {exc}; see {log_path}"
+            ) from exc
+    else:
+        status = {
+            "status": "failed",
+            "error": (
+                f"Blender exited with code {process.returncode} without writing "
+                "GPU configuration status"
+            ),
+        }
+
+    if process.returncode != 0 or status.get("status") != "success":
+        raise RuntimeError(
+            f"Could not select Blender Vulkan GPU {gpu_index}: "
+            f"{status.get('error', 'unknown error')}; see {log_path}"
+        )
+    print(
+        f"[blender-gpu-setup] selected index={status['gpu_index']} "
+        f"name={status['name']} identifier={status['identifier']}"
+    )
+    return status
+
+
+def run_blender_jobs(
+    blender_executable: str,
+    helper_path: Path,
+    jobs: Sequence[Mapping[str, Any]],
+    work_dir: Path,
+    log_path: Path,
+    blender_gpu: Optional[int] = None,
+    blender_user_config: Optional[Path] = None,
+) -> Dict[str, Dict[str, Any]]:
+    jobs = list(jobs)
+    if not jobs:
+        print("[render] no missing renders")
+        return {}
+
+    jobs_path = work_dir / "blender_jobs.json"
+    atomic_json(jobs_path, jobs)
+    command = [blender_executable]
+    if blender_gpu is not None:
+        command.extend(["--gpu-backend", "vulkan"])
+    command.extend([
+        "--background",
+        "--python",
+        str(helper_path),
+        "--",
+        "--jobs-json",
+        str(jobs_path),
+    ])
+    if blender_gpu is not None:
+        command.extend(["--expected-vulkan-gpu", str(blender_gpu)])
+    print(f"[render] {shlex.join(command)}")
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    environment = blender_subprocess_environment(blender_user_config)
+    print(
+        "[blender-env] CUDA_DEVICE_ORDER=",
+        environment.get("CUDA_DEVICE_ORDER", "<unset>"),
+        "CUDA_VISIBLE_DEVICES=",
+        environment.get("CUDA_VISIBLE_DEVICES", "<unset>"),
+        "BLENDER_USER_CONFIG=",
+        environment.get("BLENDER_USER_CONFIG", "<default>"),
+    )
+
+    with log_path.open("a", encoding="utf-8") as log_file:
+        log_file.write(f"\n# Blender command: {shlex.join(command)}\n")
+        process = subprocess.run(
+            command,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            text=True,
+            check=False,
+            env=environment,
+        )
+
+    results: Dict[str, Dict[str, Any]] = {}
+    for job in jobs:
+        output_png = str(job["output_png"])
+        status_path = Path(job["status_json"])
+        if status_path.is_file():
+            try:
+                status = json.loads(status_path.read_text(encoding="utf-8"))
+            except Exception as exc:
+                status = {
+                    "status": "failed",
+                    "output_png": output_png,
+                    "error": f"invalid Blender status JSON: {exc}",
+                }
+        elif Path(output_png).is_file():
+            status = {
+                "status": "success",
+                "output_png": output_png,
+                "error": None,
+            }
+        else:
+            status = {
+                "status": "failed",
+                "output_png": output_png,
+                "error": (
+                    f"Blender exited with code {process.returncode} "
+                    "without producing this render"
+                ),
+            }
+        results[output_png] = status
+
+    if process.returncode != 0:
+        print(
+            f"[render-warning] Blender exited with code {process.returncode}; "
+            f"see {log_path}"
+        )
+    failures = sum(
+        result.get("status") != "success" for result in results.values()
+    )
+    print(
+        f"[render] requested={len(jobs)} "
+        f"success={len(jobs) - failures} failed={failures}"
+    )
+    return results
+
+
+# -----------------------------------------------------------------------------
+# PSNR, SSIM and LPIPS
+# -----------------------------------------------------------------------------
+def load_metric_tensor(path: Path, size: Tuple[int, int]) -> torch.Tensor:
+    with Image.open(path) as image:
+        rgb = composite_on_black(image)
+    if rgb.size != size:
+        rgb = rgb.resize(size, Image.Resampling.LANCZOS)
+    array = np.asarray(rgb, dtype=np.float32) / 255.0
+    return torch.from_numpy(array).permute(2, 0, 1).contiguous()
+
+
+def psnr_metric(reference: torch.Tensor, prediction: torch.Tensor) -> float:
+    mse = float(F.mse_loss(prediction, reference).item())
+    if mse <= 0.0:
+        return float("inf")
+    return float(10.0 * math.log10(1.0 / mse))
+
+
+def gaussian_kernel(
+    window_size: int,
+    sigma: float,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    coordinates = torch.arange(window_size, device=device, dtype=dtype)
+    coordinates = coordinates - (window_size - 1) / 2.0
+    kernel_1d = torch.exp(-(coordinates**2) / (2.0 * sigma**2))
+    kernel_1d = kernel_1d / kernel_1d.sum()
+    return kernel_1d[:, None] * kernel_1d[None, :]
+
+
+def ssim_metric(
+    reference: torch.Tensor,
+    prediction: torch.Tensor,
+    window_size: int = 11,
+    sigma: float = 1.5,
+) -> float:
+    x = reference.unsqueeze(0).float()
+    y = prediction.unsqueeze(0).float()
+    channels = int(x.shape[1])
+    kernel = gaussian_kernel(window_size, sigma, x.device, x.dtype)
+    kernel = kernel[None, None].expand(channels, 1, window_size, window_size)
+    padding = window_size // 2
+
+    mu_x = F.conv2d(x, kernel, padding=padding, groups=channels)
+    mu_y = F.conv2d(y, kernel, padding=padding, groups=channels)
+    mu_x_sq = mu_x**2
+    mu_y_sq = mu_y**2
+    mu_xy = mu_x * mu_y
+    sigma_x_sq = F.conv2d(x * x, kernel, padding=padding, groups=channels) - mu_x_sq
+    sigma_y_sq = F.conv2d(y * y, kernel, padding=padding, groups=channels) - mu_y_sq
+    sigma_xy = F.conv2d(x * y, kernel, padding=padding, groups=channels) - mu_xy
+
+    c1 = 0.01**2
+    c2 = 0.03**2
+    ssim_map = (
+        (2.0 * mu_xy + c1)
+        * (2.0 * sigma_xy + c2)
+        / ((mu_x_sq + mu_y_sq + c1) * (sigma_x_sq + sigma_y_sq + c2) + 1e-12)
+    )
+    return float(ssim_map.mean().item())
+
+
+class LPIPSEvaluator:
+    def __init__(self, network: str, device: torch.device):
+        try:
+            import lpips
+        except ImportError as exc:
+            raise RuntimeError(
+                "The lpips package is required. Install it with: pip install lpips"
+            ) from exc
+        self.device = device
+        self.model = lpips.LPIPS(net=network).eval().to(device)
+
+    @torch.inference_mode()
+    def evaluate(self, reference: torch.Tensor, prediction: torch.Tensor) -> float:
+        x = reference.unsqueeze(0).to(self.device)
+        y = prediction.unsqueeze(0).to(self.device)
+        value = self.model(x * 2.0 - 1.0, y * 2.0 - 1.0)
+        return float(value.mean().item())
+
+
+def evaluate_render(
+    reference_cpu: torch.Tensor,
+    prediction_path: Path,
+    lpips_evaluator: LPIPSEvaluator,
+) -> Dict[str, float]:
+    height, width = int(reference_cpu.shape[1]), int(reference_cpu.shape[2])
+    prediction_cpu = load_metric_tensor(prediction_path, (width, height))
+    # PSNR/SSIM are inexpensive and stay on CPU. LPIPS uses the selected device.
+    metrics = {
+        "psnr_db": psnr_metric(reference_cpu, prediction_cpu),
+        "ssim": ssim_metric(reference_cpu, prediction_cpu),
+        "lpips": lpips_evaluator.evaluate(reference_cpu, prediction_cpu),
+    }
+    del prediction_cpu
+    return metrics
+
+
+# -----------------------------------------------------------------------------
+# Output paths
+# -----------------------------------------------------------------------------
+def run_paths(
+    image_output_dir: Path,
+    resolution: int,
+    seed: int,
+) -> Dict[str, Path]:
+    directory = (
+        image_output_dir
+        / f"r{int(resolution)}"
+        / f"seed_{int(seed)}"
+    )
+    return {
+        "dir": directory,
+        "generation": directory / "generation.json",
+    }
+
+
+def experiment_paths(
+    run_directory: Path,
+    image_output_name: str,
+    resolution: int,
+    seed: int,
+    light: str,
+) -> Dict[str, Path]:
+    directory = run_directory / str(light)
+    base = (
+        f"{image_output_name}__r{int(resolution)}"
+        f"__seed{int(seed)}__{light}"
+    )
+    return {
+        "dir": directory,
+        "original": directory / f"{base}__original.png",
+        "render": directory / f"{base}__render.png",
+        "comparison": directory / f"{base}__comparison.png",
+        "metrics": directory / f"{base}__metrics.json",
+    }
+
+
+def selected_generation_fields(
+    metadata: Optional[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    if not metadata:
+        return {}
+    keys = (
+        "grid_resolution",
+        "decoder_vertices",
+        "decoder_faces",
+        "pipeline_seconds",
+        "material_bake_seconds",
+        "temporary_asset_write_seconds",
+    )
+    return {key: metadata.get(key) for key in keys if key in metadata}
+
+
+# -----------------------------------------------------------------------------
+# CLI and main
+# -----------------------------------------------------------------------------
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--image-dir", type=Path, required=True)
+    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument(
+        "--recursive",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Recursively scan --image-dir. Use --no-recursive for one level.",
+    )
+    parser.add_argument(
+        "--image-extensions",
+        nargs="+",
+        default=list(DEFAULT_IMAGE_EXTENSIONS),
+        help="Image extensions to include.",
+    )
+
+    parser.add_argument("--model-path", default=MODEL_PATH)
+    parser.add_argument("--moge-model", default=MOGE_MODEL_NAME)
+    parser.add_argument("--dino-model", default=DINOV3_PATH)
+    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--low-vram", action="store_true")
+
+    parser.add_argument(
+        "--resolutions",
+        type=int,
+        nargs="+",
+        choices=SUPPORTED_RESOLUTIONS,
+        default=[1024, 1536],
+        help="Pixal3D cascade resolutions to evaluate.",
+    )
+    parser.add_argument(
+        "--seeds",
+        type=int,
+        nargs="+",
+        default=[42],
+        help="One or more generation seeds.",
+    )
+    parser.add_argument(
+        "--lights",
+        nargs="+",
+        choices=LIGHT_MODES,
+        default=["studio"],
+        help="One or more Blender EEVEE PBR light rigs.",
+    )
+
+    parser.add_argument(
+        "--fov-rad",
+        type=float,
+        default=-1.0,
+        help="Manual horizontal FOV in radians. <=0 uses MoGe-2.",
+    )
+    parser.add_argument("--mesh-scale", type=float, default=1.0)
+    parser.add_argument("--extend-pixel", type=int, default=0)
+    parser.add_argument(
+        "--max-num-tokens",
+        type=int,
+        default=1_000_000,
+        help="Maximum sparse tokens passed to pipeline.run.",
+    )
+
+    parser.add_argument(
+        "--decimation-target",
+        type=int,
+        default=1_000_000,
+        help=(
+            "Compatibility-only in this original-mesh variant; the "
+            "effective target is always the decoder face count."
+        ),
+    )
+    parser.add_argument("--texture-size", type=int, default=4096)
+    parser.add_argument(
+        "--uv-mode",
+        choices=("upstream", "sharded"),
+        default="sharded",
+        help="Use upstream per-chart xatlas calls or balanced lossless shards.",
+    )
+    parser.add_argument(
+        "--uv-shard-faces",
+        type=int,
+        default=10_000,
+        help="Maximum faces in each xatlas input when --uv-mode=sharded.",
+    )
+    parser.add_argument(
+        "--remesh",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Compatibility-only in this original-mesh variant; "
+            "remeshing is always disabled."
+        ),
+    )
+    parser.add_argument(
+        "--extension-webp",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use WebP textures inside the temporary Blender transport GLB.",
+    )
+
+    parser.add_argument(
+        "--render-resolution",
+        type=int,
+        default=2048,
+        help=(
+            "Saved original/render panel resolution. The comparison image is "
+            "twice this width."
+        ),
+    )
+    parser.add_argument(
+        "--metric-resolution",
+        type=int,
+        default=512,
+        help=(
+            "Resolution used for PSNR, SSIM and LPIPS. Keeping this below the "
+            "2048 render resolution avoids LPIPS OOM."
+        ),
+    )
+    parser.add_argument("--blender", default="blender")
+    parser.add_argument(
+        "--blender-gpu",
+        type=int,
+        default=None,
+        metavar="INDEX",
+        help=(
+            "Vulkan device index used by Blender/EEVEE (normally the physical "
+            "nvidia-smi index). This is separate from CUDA_VISIBLE_DEVICES and "
+            "requires Blender 4.5+ plus a supported Vulkan driver (550+ on "
+            "Linux/NVIDIA). If omitted, Blender keeps its default OpenGL "
+            "device selection."
+        ),
+    )
+    parser.add_argument(
+        "--blender-samples",
+        type=int,
+        default=64,
+        help="EEVEE temporal render samples (kept at 64 by default).",
+    )
+    parser.add_argument(
+        "--lpips-net",
+        choices=["alex", "vgg", "squeeze"],
+        default="vgg",
+    )
+    parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--fail-fast", action="store_true")
+    args = parser.parse_args()
+
+    args.resolutions = list(dict.fromkeys(int(value) for value in args.resolutions))
+    args.seeds = list(dict.fromkeys(int(value) for value in args.seeds))
+    args.lights = list(dict.fromkeys(str(value) for value in args.lights))
+
+    if args.mesh_scale <= 0.0:
+        parser.error("--mesh-scale must be positive")
+    if args.render_resolution <= 0:
+        parser.error("--render-resolution must be positive")
+    if args.metric_resolution <= 0:
+        parser.error("--metric-resolution must be positive")
+    if args.max_num_tokens <= 0:
+        parser.error("--max-num-tokens must be positive")
+    if args.decimation_target <= 0:
+        parser.error("--decimation-target must be positive")
+    if args.texture_size <= 0:
+        parser.error("--texture-size must be positive")
+    if args.uv_shard_faces <= 0:
+        parser.error("--uv-shard-faces must be positive")
+    if args.blender_samples <= 0:
+        parser.error("--blender-samples must be positive")
+    if args.blender_gpu is not None and args.blender_gpu < 0:
+        parser.error("--blender-gpu must be non-negative")
+    if args.fov_rad > 0.0 and not 0.01 < args.fov_rad < math.pi - 0.01:
+        parser.error("--fov-rad must be a plausible angle in radians")
+    return args
+
+
+def main() -> int:
+    args = parse_args()
+    args.image_dir = args.image_dir.resolve()
+    args.output_dir = args.output_dir.resolve()
+    if not args.image_dir.is_dir():
+        raise NotADirectoryError(args.image_dir)
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    log_path = args.output_dir / "run.log"
+
+    image_items = discover_images(
+        image_dir=args.image_dir,
+        output_dir=args.output_dir,
+        recursive=bool(args.recursive),
+        extensions=args.image_extensions,
+    )
+    if not image_items:
+        raise FileNotFoundError(
+            f"No supported images found under {args.image_dir}"
+        )
+
+    print(
+        f"[setup] images={len(image_items)} resolutions={args.resolutions} "
+        f"seeds={args.seeds} lights={args.lights} "
+        f"render_resolution={args.render_resolution} "
+        f"metric_resolution={args.metric_resolution}"
+    )
+
+    scratch_dir = Path(
+        tempfile.mkdtemp(
+            prefix=".pixal3d_render_scratch_",
+            dir=str(args.output_dir),
+        )
+    )
+    image_records: List[Dict[str, Any]] = []
+    generation_records: List[Dict[str, Any]] = []
+    generation_by_key: Dict[Tuple[str, int, int], Dict[str, Any]] = {}
+    image_error_by_name: Dict[str, str] = {}
+    blender_jobs: List[Dict[str, Any]] = []
+    blender_results: Dict[str, Dict[str, Any]] = {}
+    blender_gpu_configuration: Optional[Dict[str, Any]] = None
+    blender_user_config: Optional[Path] = None
+
+    pipeline = None
+    generator = None
+    moge_model = None
+
+    try:
+        helper_path = ensure_blender_helper(scratch_dir)
+        if args.blender_gpu is not None:
+            blender_user_config = scratch_dir / "blender_user_config"
+            blender_gpu_configuration = configure_blender_vulkan_gpu(
+                blender_executable=args.blender,
+                helper_path=helper_path,
+                gpu_index=args.blender_gpu,
+                user_config_dir=blender_user_config,
+                work_dir=scratch_dir,
+                log_path=log_path,
+            )
+        pipeline = init_pipeline(
+            model_path=args.model_path,
+            dino_model=args.dino_model,
+            device=args.device,
+            low_vram=args.low_vram,
+        )
+        generator = Pixal3DGenerator(pipeline, args)
+
+        if args.fov_rad <= 0.0:
+            # Keep one MoGe instance on CPU between images. It is moved to the
+            # selected device only while estimating each image camera.
+            moge_model = load_moge_model(args.moge_model, "cpu")
+
+        for image_index, item in enumerate(image_items, start=1):
+            image_path = Path(item["path"])
+            image_output_name = str(item["output_name"])
+            image_output_dir = args.output_dir / image_output_name
+            image_output_dir.mkdir(parents=True, exist_ok=True)
+            print(
+                f"[image] {image_index}/{len(image_items)} "
+                f"source={image_path} output={image_output_dir}"
+            )
+
+            try:
+                with Image.open(image_path) as source:
+                    source_copy = source.convert("RGBA")
+                source_copy.save(image_output_dir / "input_original.png")
+
+                condition_image = pipeline.preprocess_image(source_copy)
+                condition_path = (
+                    image_output_dir / "input_preprocessed_rgba.png"
+                )
+                condition_image.save(condition_path)
+
+                reference_path = (
+                    image_output_dir / "metric_reference_rgb.png"
+                )
+                reference_image = save_metric_reference(
+                    condition_image=condition_image,
+                    output_path=reference_path,
+                    render_resolution=args.render_resolution,
+                )
+
+                if args.fov_rad > 0.0:
+                    camera_params = manual_camera_params(
+                        fov_rad=args.fov_rad,
+                        condition_image=condition_image,
+                        mesh_scale=args.mesh_scale,
+                        extend_pixel=args.extend_pixel,
+                    )
+                else:
+                    moge_model = moge_model.to(args.device)
+                    camera_params = estimate_camera_with_moge(
+                        condition_image=condition_image,
+                        moge_model=moge_model,
+                        device=args.device,
+                        mesh_scale=args.mesh_scale,
+                        extend_pixel=args.extend_pixel,
+                    )
+                    moge_model = moge_model.cpu()
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+
+                pipeline_camera_params = {
+                    "camera_angle_x": float(camera_params["camera_angle_x"]),
+                    "distance": float(camera_params["distance"]),
+                    "mesh_scale": float(camera_params["mesh_scale"]),
+                }
+                grid_space_camera_distance = float(
+                    pipeline_camera_params["distance"]
+                    * pipeline_camera_params["mesh_scale"]
+                )
+                camera_record = {
+                    **camera_params,
+                    "pipeline_camera_params": pipeline_camera_params,
+                    "grid_space_camera_distance": grid_space_camera_distance,
+                    "fov_degrees": math.degrees(
+                        pipeline_camera_params["camera_angle_x"]
+                    ),
+                    "reference_image": str(reference_path),
+                }
+                atomic_json(image_output_dir / "camera.json", camera_record)
+                print(
+                    f"[camera] image={image_path.name} "
+                    f"source={camera_params['source']} "
+                    f"fov={camera_record['fov_degrees']:.3f}deg "
+                    f"distance={pipeline_camera_params['distance']:.6f}"
+                )
+
+                image_record = {
+                    "status": "success",
+                    "image_name": image_path.name,
+                    "source_image": str(image_path),
+                    "relative_source_image": str(item["relative_path"]),
+                    "image_output_name": image_output_name,
+                    "image_output_dir": str(image_output_dir),
+                    "input_original": str(
+                        image_output_dir / "input_original.png"
+                    ),
+                    "condition_image": str(condition_path),
+                    "reference_image": str(reference_path),
+                    "camera": camera_record,
+                }
+                image_records.append(image_record)
+
+                for resolution in args.resolutions:
+                    for seed in args.seeds:
+                        key = (
+                            image_output_name,
+                            int(resolution),
+                            int(seed),
+                        )
+                        paths = run_paths(
+                            image_output_dir=image_output_dir,
+                            resolution=resolution,
+                            seed=seed,
+                        )
+                        paths["dir"].mkdir(parents=True, exist_ok=True)
+
+                        missing_lights = []
+                        for light in args.lights:
+                            experiment = experiment_paths(
+                                run_directory=paths["dir"],
+                                image_output_name=image_output_name,
+                                resolution=resolution,
+                                seed=seed,
+                                light=light,
+                            )
+                            if args.overwrite or not experiment["render"].is_file():
+                                missing_lights.append(light)
+
+                        existing_metadata: Optional[Dict[str, Any]] = None
+                        if paths["generation"].is_file() and not args.overwrite:
+                            try:
+                                existing_metadata = json.loads(
+                                    paths["generation"].read_text(
+                                        encoding="utf-8"
+                                    )
+                                )
+                            except Exception:
+                                existing_metadata = None
+
+                        if not missing_lights:
+                            if (
+                                existing_metadata
+                                and existing_metadata.get("status") == "success"
+                            ):
+                                metadata = dict(existing_metadata)
+                                metadata["resumed_from_existing_renders"] = True
+                            else:
+                                metadata = {
+                                    "status": "success",
+                                    "pipeline_resolution": int(resolution),
+                                    "pipeline_type": f"{int(resolution)}_cascade",
+                                    "seed": int(seed),
+                                    "resumed_from_existing_renders": True,
+                                    "temporary_asset_retained": False,
+                                }
+                            generation_by_key[key] = metadata
+                            generation_records.append(
+                                {
+                                    "image_name": image_path.name,
+                                    "image_output_name": image_output_name,
+                                    **metadata,
+                                }
+                            )
+                            continue
+
+                        temporary_glb = (
+                            scratch_dir
+                            / "models"
+                            / image_output_name
+                            / f"r{int(resolution)}"
+                            / f"seed_{int(seed)}.glb"
+                        )
+                        try:
+                            metadata = generator.generate_temporary_render_asset(
+                                condition_image=condition_image,
+                                camera_params=pipeline_camera_params,
+                                resolution=resolution,
+                                seed=seed,
+                                temporary_glb=temporary_glb,
+                            )
+                            atomic_json(paths["generation"], metadata)
+                            generation_by_key[key] = metadata
+                            generation_records.append(
+                                {
+                                    "image_name": image_path.name,
+                                    "image_output_name": image_output_name,
+                                    **metadata,
+                                }
+                            )
+                        except Exception as exc:
+                            error_record = {
+                                "status": "failed",
+                                "pipeline_resolution": int(resolution),
+                                "pipeline_type": f"{int(resolution)}_cascade",
+                                "seed": int(seed),
+                                "temporary_asset_retained": False,
+                                "error": f"{type(exc).__name__}: {exc}",
+                                "traceback": traceback.format_exc(),
+                            }
+                            atomic_json(paths["generation"], error_record)
+                            generation_by_key[key] = error_record
+                            generation_records.append(
+                                {
+                                    "image_name": image_path.name,
+                                    "image_output_name": image_output_name,
+                                    **error_record,
+                                }
+                            )
+                            with log_path.open(
+                                "a",
+                                encoding="utf-8",
+                            ) as log_file:
+                                log_file.write(
+                                    "\n" + traceback.format_exc() + "\n"
+                                )
+                            print(
+                                f"[generation-error] image={image_path.name} "
+                                f"r={resolution} seed={seed} "
+                                f"{error_record['error']}"
+                            )
+                            if args.fail_fast:
+                                raise
+                            continue
+
+                        for light in missing_lights:
+                            experiment = experiment_paths(
+                                run_directory=paths["dir"],
+                                image_output_name=image_output_name,
+                                resolution=resolution,
+                                seed=seed,
+                                light=light,
+                            )
+                            experiment["dir"].mkdir(
+                                parents=True,
+                                exist_ok=True,
+                            )
+                            status_json = (
+                                scratch_dir
+                                / "render_status"
+                                / image_output_name
+                                / f"r{int(resolution)}"
+                                / f"seed_{int(seed)}"
+                                / f"{light}.json"
+                            )
+                            blender_jobs.append(
+                                {
+                                    "input_glb": str(temporary_glb),
+                                    "output_png": str(experiment["render"]),
+                                    "status_json": str(status_json),
+                                    "transform": (
+                                        PIXAL3D_EXPORTED_GLTF_TO_INTERNAL.tolist()
+                                    ),
+                                    "resolution": int(
+                                        args.render_resolution
+                                    ),
+                                    "fov_rad": float(
+                                        pipeline_camera_params[
+                                            "camera_angle_x"
+                                        ]
+                                    ),
+                                    "distance": grid_space_camera_distance,
+                                    "samples": int(args.blender_samples),
+                                    "light_mode": light,
+                                }
+                            )
+
+                del source_copy, condition_image, reference_image
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+            except Exception as exc:
+                error = f"{type(exc).__name__}: {exc}"
+                image_error_by_name[image_output_name] = error
+                image_records.append(
+                    {
+                        "status": "failed",
+                        "image_name": image_path.name,
+                        "source_image": str(image_path),
+                        "relative_source_image": str(item["relative_path"]),
+                        "image_output_name": image_output_name,
+                        "image_output_dir": str(image_output_dir),
+                        "error": error,
+                        "traceback": traceback.format_exc(),
+                    }
+                )
+                with log_path.open("a", encoding="utf-8") as log_file:
+                    log_file.write("\n" + traceback.format_exc() + "\n")
+                print(
+                    f"[image-error] image={image_path.name} error={error}"
+                )
+                if moge_model is not None:
+                    try:
+                        moge_model = moge_model.cpu()
+                    except Exception:
+                        pass
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                if args.fail_fast:
+                    raise
+
+        if moge_model is not None:
+            try:
+                moge_model = moge_model.cpu()
+            except Exception:
+                pass
+            del moge_model
+            moge_model = None
+
+        # Release Pixal3D before Blender and LPIPS to avoid competing for GPU memory.
+        del generator, pipeline
+        generator = None
+        pipeline = None
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        blender_results = run_blender_jobs(
+            blender_executable=args.blender,
+            helper_path=helper_path,
+            jobs=blender_jobs,
+            work_dir=scratch_dir,
+            log_path=log_path,
+            blender_gpu=args.blender_gpu,
+            blender_user_config=blender_user_config,
+        )
+
+        # Blender no longer needs the temporary textured meshes.
+        models_dir = scratch_dir / "models"
+        if models_dir.exists():
+            shutil.rmtree(models_dir)
+
+        metric_device = torch.device(
+            args.device
+            if str(args.device).startswith("cuda")
+            and torch.cuda.is_available()
+            else "cpu"
+        )
+        lpips_evaluator = LPIPSEvaluator(args.lpips_net, metric_device)
+
+        metric_rows: List[Dict[str, Any]] = []
+        for item in image_items:
+            image_path = Path(item["path"])
+            image_output_name = str(item["output_name"])
+            image_output_dir = args.output_dir / image_output_name
+            reference_path = (
+                image_output_dir / "metric_reference_rgb.png"
+            )
+            image_error = image_error_by_name.get(image_output_name)
+
+            reference_cpu: Optional[torch.Tensor] = None
+            reference_image: Optional[Image.Image] = None
+            if image_error is None and reference_path.is_file():
+                reference_cpu = load_metric_tensor(
+                    reference_path,
+                    (
+                        int(args.metric_resolution),
+                        int(args.metric_resolution),
+                    ),
+                )
+                with Image.open(reference_path) as image:
+                    reference_image = image.convert("RGB").copy()
+
+            for resolution in args.resolutions:
+                for seed in args.seeds:
+                    key = (
+                        image_output_name,
+                        int(resolution),
+                        int(seed),
+                    )
+                    paths = run_paths(
+                        image_output_dir=image_output_dir,
+                        resolution=resolution,
+                        seed=seed,
+                    )
+                    metadata = generation_by_key.get(key)
+                    if metadata is None and paths["generation"].is_file():
+                        try:
+                            metadata = json.loads(
+                                paths["generation"].read_text(
+                                    encoding="utf-8"
+                                )
+                            )
+                        except Exception:
+                            metadata = None
+
+                    for light in args.lights:
+                        experiment = experiment_paths(
+                            run_directory=paths["dir"],
+                            image_output_name=image_output_name,
+                            resolution=resolution,
+                            seed=seed,
+                            light=light,
+                        )
+                        base_row: Dict[str, Any] = {
+                            "status": "failed",
+                            "image_name": image_path.name,
+                            "source_image": str(image_path),
+                            "image_output_dir": str(image_output_dir),
+                            "pipeline_resolution": int(resolution),
+                            "pipeline_type": f"{int(resolution)}_cascade",
+                            "seed": int(seed),
+                            "light": light,
+                            "render_resolution": int(
+                                args.render_resolution
+                            ),
+                            "metric_resolution": int(
+                                args.metric_resolution
+                            ),
+                            "original_png": str(experiment["original"]),
+                            "render_png": str(experiment["render"]),
+                            "comparison_png": str(
+                                experiment["comparison"]
+                            ),
+                            "generation_json": str(paths["generation"]),
+                            **selected_generation_fields(metadata),
+                        }
+
+                        if image_error is not None:
+                            row = {
+                                **base_row,
+                                "error": f"image preprocessing/camera failed: {image_error}",
+                            }
+                            metric_rows.append(row)
+                            atomic_json(experiment["metrics"], row)
+                            continue
+
+                        if (
+                            metadata
+                            and metadata.get("status") == "failed"
+                            and not experiment["render"].is_file()
+                        ):
+                            row = {
+                                **base_row,
+                                "error": (
+                                    "generation failed: "
+                                    f"{metadata.get('error', 'unknown error')}"
+                                ),
+                            }
+                            metric_rows.append(row)
+                            atomic_json(experiment["metrics"], row)
+                            continue
+
+                        render_status = blender_results.get(
+                            str(experiment["render"])
+                        )
+                        if (
+                            render_status is not None
+                            and render_status.get("status") != "success"
+                        ):
+                            row = {
+                                **base_row,
+                                "error": (
+                                    "render failed: "
+                                    f"{render_status.get('error')}"
+                                ),
+                            }
+                            metric_rows.append(row)
+                            atomic_json(experiment["metrics"], row)
+                            continue
+
+                        if not experiment["render"].is_file():
+                            row = {
+                                **base_row,
+                                "error": "render PNG is missing",
+                            }
+                            metric_rows.append(row)
+                            atomic_json(experiment["metrics"], row)
+                            continue
+
+                        try:
+                            rendered_image = save_black_composited_render(
+                                experiment["render"],
+                                args.render_resolution,
+                            )
+                            experiment["dir"].mkdir(
+                                parents=True,
+                                exist_ok=True,
+                            )
+                            reference_image.save(experiment["original"])
+                            save_comparison(
+                                original=reference_image,
+                                rendered=rendered_image,
+                                output_path=experiment["comparison"],
+                            )
+                            metrics = evaluate_render(
+                                reference_cpu=reference_cpu,
+                                prediction_path=experiment["render"],
+                                lpips_evaluator=lpips_evaluator,
+                            )
+                            row = {
+                                **base_row,
+                                "status": "success",
+                                **metrics,
+                                "error": None,
+                            }
+                            metric_rows.append(row)
+                            atomic_json(experiment["metrics"], row)
+                            print(
+                                f"[metrics] image={image_path.name} "
+                                f"r={resolution} seed={seed} light={light} "
+                                f"PSNR={metrics['psnr_db']:.4f} "
+                                f"SSIM={metrics['ssim']:.6f} "
+                                f"LPIPS={metrics['lpips']:.6f}"
+                            )
+                            del rendered_image
+                        except Exception as exc:
+                            row = {
+                                **base_row,
+                                "error": f"{type(exc).__name__}: {exc}",
+                            }
+                            metric_rows.append(row)
+                            atomic_json(experiment["metrics"], row)
+                            with log_path.open(
+                                "a",
+                                encoding="utf-8",
+                            ) as log_file:
+                                log_file.write(
+                                    "\n" + traceback.format_exc() + "\n"
+                                )
+                            print(
+                                f"[metric-error] image={image_path.name} "
+                                f"r={resolution} seed={seed} light={light} "
+                                f"{row['error']}"
+                            )
+                            if args.fail_fast:
+                                raise
+
+            if reference_image is not None:
+                reference_image.close()
+            del reference_cpu
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        # Only per-experiment rows are written. No light/seed/resolution/global
+        # mean is computed anywhere in this script.
+        write_csv(args.output_dir / "metrics.csv", metric_rows)
+        atomic_json(
+            args.output_dir / "metrics.json",
+            {
+                "config": vars(args),
+                "metric_convention": {
+                    "reference": (
+                        "Pixal3D preprocessed aligned condition image"
+                    ),
+                    "background": "black",
+                    "region": "full RGB canvas",
+                    "saved_render_resolution": int(
+                        args.render_resolution
+                    ),
+                    "metric_resolution": int(
+                        args.metric_resolution
+                    ),
+                    "ssim": "11x11 Gaussian-window RGB SSIM",
+                    "lpips_network": args.lpips_net,
+                    "averages_included": False,
+                },
+                "images": image_records,
+                "generation": generation_records,
+                "rows": metric_rows,
+            },
+        )
+        atomic_json(
+            args.output_dir / "run_config.json",
+            {
+                "config": vars(args),
+                "input_image_count": len(image_items),
+                "images": [
+                    {
+                        "source": str(item["path"]),
+                        "relative_source": str(item["relative_path"]),
+                        "output_name": str(item["output_name"]),
+                    }
+                    for item in image_items
+                ],
+                "decoder_to_exported_gltf": (
+                    PIXAL3D_DECODER_TO_EXPORTED_GLTF
+                ),
+                "exported_gltf_to_internal": (
+                    PIXAL3D_EXPORTED_GLTF_TO_INTERNAL
+                ),
+                "light_modes": list(args.lights),
+                "blender_renderer": "EEVEE",
+                "blender_gpu_backend": (
+                    "VULKAN" if args.blender_gpu is not None else "OPENGL/default"
+                ),
+                "blender_gpu_configuration": blender_gpu_configuration,
+                "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+                "persistent_glb_outputs": False,
+                "temporary_render_assets_deleted": True,
+                "comparison_layout": (
+                    "aligned original on the left, textured render on the right"
+                ),
+            },
+        )
+
+        successful = sum(
+            row.get("status") == "success" for row in metric_rows
+        )
+        failed = len(metric_rows) - successful
+        print(
+            f"[done] images={len(image_items)} "
+            f"successful_experiments={successful} "
+            f"failed_experiments={failed} output={args.output_dir}"
+        )
+        return 1 if failed else 0
+
+    finally:
+        if moge_model is not None:
+            try:
+                moge_model = moge_model.cpu()
+            except Exception:
+                pass
+        if generator is not None:
+            del generator
+        if pipeline is not None:
+            del pipeline
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        if scratch_dir.exists():
+            shutil.rmtree(scratch_dir, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

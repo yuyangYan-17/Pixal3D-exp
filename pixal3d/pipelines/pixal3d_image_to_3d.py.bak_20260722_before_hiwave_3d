@@ -1,6 +1,5 @@
 from typing import *
 from pathlib import Path
-import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -788,21 +787,20 @@ class Pixal3DImageTo3DPipeline(Pipeline):
         token_indices: torch.Tensor,
         patch_local_coords: torch.Tensor,
         global_token_count: int,
-        global_coords: torch.Tensor,
     ) -> Dict[str, Any]:
         """Slice projected features and attach the patch-local coordinates."""
         patch_branch: Dict[str, Any] = {}
         for key, value in branch.items():
-            if isinstance(value, SparseTensor):
+            if key == "proj":
+                if not isinstance(value, SparseTensor):
+                    raise TypeError(
+                        f"Condition {key!r} must be a SparseTensor, "
+                        f"got {type(value).__name__}"
+                    )
                 if value.feats.shape[0] != global_token_count:
                     raise ValueError(
                         f"Sparse condition {key!r} has {value.feats.shape[0]} "
                         f"tokens; expected {global_token_count}"
-                    )
-                if not torch.equal(value.coords, global_coords):
-                    raise RuntimeError(
-                        f"Sparse condition {key!r} coordinates/order are not "
-                        "aligned with the global latent"
                     )
                 patch_branch[key] = SparseTensor(
                     feats=value.feats[token_indices],
@@ -813,33 +811,6 @@ class Pixal3DImageTo3DPipeline(Pipeline):
                 # the exact same tensor/value used by the global flow.
                 patch_branch[key] = value
         return patch_branch
-
-    @staticmethod
-    def _slice_aligned_sparse_tensor(
-        value: Optional[SparseTensor],
-        token_indices: torch.Tensor,
-        patch_local_coords: torch.Tensor,
-        global_coords: torch.Tensor,
-        name: str,
-    ) -> Optional[SparseTensor]:
-        """Slice a token-aligned sparse tensor and switch to local coordinates."""
-        if value is None:
-            return None
-        if not isinstance(value, SparseTensor):
-            raise TypeError(f"{name} must be a SparseTensor")
-        if value.feats.shape[0] != global_coords.shape[0]:
-            raise ValueError(
-                f"{name} has {value.feats.shape[0]} tokens; expected "
-                f"{global_coords.shape[0]}"
-            )
-        if not torch.equal(value.coords, global_coords):
-            raise RuntimeError(
-                f"{name} coordinates/order are not aligned with the global latent"
-            )
-        return SparseTensor(
-            feats=value.feats[token_indices],
-            coords=patch_local_coords,
-        )
 
     @staticmethod
     def _velocity_similarity(
@@ -882,255 +853,24 @@ class Pixal3DImageTo3DPipeline(Pipeline):
             ),
         }
 
-    _HAAR_3D_BAND_NAMES = (
-        "LLL",
-        "LLH",
-        "LHL",
-        "LHH",
-        "HLL",
-        "HLH",
-        "HHL",
-        "HHH",
-    )
-
-    @staticmethod
-    def _haar_analysis_axis(
-        value: torch.Tensor,
-        axis: int,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        moved = value.movedim(axis, -1)
-        if moved.shape[-1] % 2 != 0:
-            raise ValueError(
-                f"Haar DWT axis length must be even, got {moved.shape[-1]}"
-            )
-        even = moved[..., 0::2]
-        odd = moved[..., 1::2]
-        scale = math.sqrt(2.0)
-        low = (even + odd) / scale
-        high = (even - odd) / scale
-        return low.movedim(-1, axis), high.movedim(-1, axis)
-
-    @staticmethod
-    def _haar_synthesis_axis(
-        low: torch.Tensor,
-        high: torch.Tensor,
-        axis: int,
-    ) -> torch.Tensor:
-        if low.shape != high.shape:
-            raise ValueError(
-                f"Haar low/high shapes differ: {low.shape} vs {high.shape}"
-            )
-        low_moved = low.movedim(axis, -1)
-        high_moved = high.movedim(axis, -1)
-        scale = math.sqrt(2.0)
-        even = (low_moved + high_moved) / scale
-        odd = (low_moved - high_moved) / scale
-        output = torch.empty(
-            (*low_moved.shape[:-1], low_moved.shape[-1] * 2),
-            dtype=low.dtype,
-            device=low.device,
-        )
-        output[..., 0::2] = even
-        output[..., 1::2] = odd
-        return output.movedim(-1, axis)
-
-    @classmethod
-    def _haar_dwt3d(cls, value: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """One-level orthonormal 3D Haar DWT for [B,C,X,Y,Z]."""
-        if value.ndim != 5:
-            raise ValueError(f"3D DWT expects [B,C,X,Y,Z], got {value.shape}")
-        x_low, x_high = cls._haar_analysis_axis(value, 2)
-        ll, lh = cls._haar_analysis_axis(x_low, 3)
-        hl, hh = cls._haar_analysis_axis(x_high, 3)
-        lll, llh = cls._haar_analysis_axis(ll, 4)
-        lhl, lhh = cls._haar_analysis_axis(lh, 4)
-        hll, hlh = cls._haar_analysis_axis(hl, 4)
-        hhl, hhh = cls._haar_analysis_axis(hh, 4)
-        return {
-            "LLL": lll,
-            "LLH": llh,
-            "LHL": lhl,
-            "LHH": lhh,
-            "HLL": hll,
-            "HLH": hlh,
-            "HHL": hhl,
-            "HHH": hhh,
-        }
-
-    @classmethod
-    def _haar_idwt3d(cls, bands: Mapping[str, torch.Tensor]) -> torch.Tensor:
-        """Inverse of :meth:`_haar_dwt3d`."""
-        missing = set(cls._HAAR_3D_BAND_NAMES) - set(bands)
-        if missing:
-            raise ValueError(f"Missing Haar bands: {sorted(missing)}")
-        ll = cls._haar_synthesis_axis(bands["LLL"], bands["LLH"], 4)
-        lh = cls._haar_synthesis_axis(bands["LHL"], bands["LHH"], 4)
-        hl = cls._haar_synthesis_axis(bands["HLL"], bands["HLH"], 4)
-        hh = cls._haar_synthesis_axis(bands["HHL"], bands["HHH"], 4)
-        x_low = cls._haar_synthesis_axis(ll, lh, 3)
-        x_high = cls._haar_synthesis_axis(hl, hh, 3)
-        return cls._haar_synthesis_axis(x_low, x_high, 2)
-
-    @classmethod
-    def _dwt3d(
-        cls,
-        value: torch.Tensor,
-        wavelet_family: str,
-    ) -> Dict[str, torch.Tensor]:
-        if wavelet_family == "haar":
-            return cls._haar_dwt3d(value)
-        if wavelet_family == "sym4":
-            raise NotImplementedError(
-                "sym4 is reserved for a later implementation; use haar"
-            )
-        raise ValueError(f"Unsupported wavelet family: {wavelet_family}")
-
-    @classmethod
-    def _idwt3d(
-        cls,
-        bands: Mapping[str, torch.Tensor],
-        wavelet_family: str,
-    ) -> torch.Tensor:
-        if wavelet_family == "haar":
-            return cls._haar_idwt3d(bands)
-        if wavelet_family == "sym4":
-            raise NotImplementedError(
-                "sym4 is reserved for a later implementation; use haar"
-            )
-        raise ValueError(f"Unsupported wavelet family: {wavelet_family}")
-
-    @staticmethod
-    def _sparse_patch_velocity_to_dense(
-        velocity: SparseTensor,
-        local_coords: torch.Tensor,
-        patch_size: int = 64,
-    ) -> torch.Tensor:
-        """Scatter [N,C] sparse velocity into an FP32 dense patch."""
-        if velocity.feats.shape[0] != local_coords.shape[0]:
-            raise ValueError("Velocity and coordinate token counts differ")
-        xyz = local_coords[:, 1:4].long()
-        if torch.any(xyz < 0) or torch.any(xyz >= patch_size):
-            raise ValueError("Patch-local coordinates must lie in [0, 63]")
-        channels = int(velocity.feats.shape[1])
-        # Model predictions may be FP16/BF16.  Haar analysis, frequency CFG,
-        # synthesis, and sparse gathering deliberately run in FP32 so their
-        # numerical error does not perturb the subsequent Euler trajectory.
-        dense_flat = torch.zeros(
-            (channels, patch_size ** 3),
-            device=velocity.feats.device,
-            dtype=torch.float32,
-        )
-        linear = (xyz[:, 0] * patch_size + xyz[:, 1]) * patch_size + xyz[:, 2]
-        dense_flat[:, linear] = velocity.feats.float().transpose(0, 1)
-        return dense_flat.reshape(
-            1, channels, patch_size, patch_size, patch_size
-        )
-
-    @staticmethod
-    def _gather_dense_patch_velocity(
-        dense: torch.Tensor,
-        local_coords: torch.Tensor,
-    ) -> torch.Tensor:
-        """Gather [1,C,64,64,64] back into local sparse token order."""
-        if dense.ndim != 5 or dense.shape[0] != 1:
-            raise ValueError(f"Expected dense [1,C,X,Y,Z], got {dense.shape}")
-        patch_size = int(dense.shape[2])
-        if tuple(dense.shape[2:]) != (patch_size, patch_size, patch_size):
-            raise ValueError("Dense patch must be cubic")
-        xyz = local_coords[:, 1:4].long()
-        linear = (xyz[:, 0] * patch_size + xyz[:, 1]) * patch_size + xyz[:, 2]
-        dense_flat = dense.reshape(dense.shape[1], -1)
-        return dense_flat[:, linear].transpose(0, 1).contiguous()
-
-    @classmethod
-    def _check_3d_wavelet_implementation(
-        cls,
-        device: Union[str, torch.device],
-        wavelet_family: str,
-    ) -> Dict[str, Any]:
-        """Check DWT round-trip and uniform-band CFG equivalence."""
-        if wavelet_family != "haar":
-            raise NotImplementedError(
-                "Only haar is implemented; sym4 remains a reserved interface"
-            )
-        values = torch.linspace(
-            -1.0,
-            1.0,
-            steps=2 * 8 * 8 * 8,
-            device=device,
-            dtype=torch.float32,
-        ).reshape(1, 2, 8, 8, 8)
-        conditional = values
-        unconditional = values.flip(dims=(2, 3, 4)) * 0.75
-        cond_bands = cls._dwt3d(conditional, wavelet_family)
-        reconstruction = cls._idwt3d(cond_bands, wavelet_family)
-        round_trip_error = float(
-            (reconstruction - conditional).abs().max().item()
-        )
-
-        strength = 2.75
-        uncond_bands = cls._dwt3d(unconditional, wavelet_family)
-        uniform_bands = {
-            name: uncond_bands[name]
-            + strength * (cond_bands[name] - uncond_bands[name])
-            for name in cls._HAAR_3D_BAND_NAMES
-        }
-        uniform_reconstruction = cls._idwt3d(
-            uniform_bands, wavelet_family
-        )
-        spatial_cfg = unconditional + strength * (
-            conditional - unconditional
-        )
-        uniform_cfg_error = float(
-            (uniform_reconstruction - spatial_cfg).abs().max().item()
-        )
-        tolerance = 2e-6
-        if round_trip_error > tolerance or uniform_cfg_error > tolerance:
-            raise RuntimeError(
-                "3D wavelet self-check failed: "
-                f"round_trip={round_trip_error:.8e}, "
-                f"uniform_cfg={uniform_cfg_error:.8e}, "
-                f"tolerance={tolerance:.8e}"
-            )
-        return {
-            "round_trip_max_abs_error": round_trip_error,
-            "uniform_band_cfg_max_abs_error": uniform_cfg_error,
-            "tolerance": tolerance,
-        }
-
     @torch.no_grad()
     def _run_2048_patch_flow(
         self,
         flow_model: nn.Module,
-        sampler: Any,
-        stage_name: str,
         global_noise: SparseTensor,
         cond: Dict[str, Any],
-        concat_cond: Optional[SparseTensor],
         sampler_params: Dict[str, Any],
         global_flow: Any,
         start_step: int,
         start_source: str,
-        patch_guidance_mode: str = "original_cfg",
-        guidance_strength: float = 7.5,
-        guidance_interval: str = "original_interval",
-        guidance_rescale: float = 0.0,
-        wavelet_family: str = "haar",
-        skip_residual_mode: str = "off",
     ) -> Tuple[SparseTensor, Dict[str, Any], Dict[str, Any]]:
-        """Resume a sparse shape/texture flow with local spatial predictions.
+        """Resume shape flow with per-step patch prediction and fusion.
 
-        Texture ``concat_cond`` is sliced with the latent but is deliberately
-        shared by the positive and negative image branches. Skip residuals and
-        sym4 remain disabled interfaces.
+        This first validation pass intentionally contains no wavelet branch.
         """
-        if stage_name not in {"shape", "texture"}:
-            raise ValueError("stage_name must be shape or texture")
         trajectory = global_flow.trajectory
         if trajectory is None:
-            raise RuntimeError(
-                f"The global {stage_name} flow did not record a trajectory"
-            )
+            raise RuntimeError("The global shape flow did not record a trajectory")
         num_steps = len(trajectory.velocities)
         if num_steps != 12:
             raise ValueError(
@@ -1144,41 +884,8 @@ class Pixal3DImageTo3DPipeline(Pipeline):
             raise ValueError(
                 "start_source must be 'saved_state' or 'algebraic_inverse'"
             )
-        if patch_guidance_mode not in {
-            "original_cfg",
-            "conditional_only",
-            "uniform_cfg",
-            "wavelet_cfg",
-        }:
-            raise ValueError(
-                "patch_guidance_mode must be original_cfg, conditional_only, "
-                "uniform_cfg, or wavelet_cfg"
-            )
-        if guidance_interval not in {
-            "original_interval",
-            "all_remaining",
-        }:
-            raise ValueError(
-                "guidance_interval must be original_interval or "
-                "all_remaining"
-            )
-        if not math.isfinite(guidance_strength):
-            raise ValueError("guidance_strength must be finite")
-        if not math.isfinite(guidance_rescale) or not 0.0 <= guidance_rescale <= 1.0:
-            raise ValueError("guidance_rescale must be finite and in [0, 1]")
-        if skip_residual_mode != "off":
-            raise NotImplementedError(
-                "Skip residual is reserved but not implemented in this pass"
-            )
-        wavelet_checks = None
-        if patch_guidance_mode == "wavelet_cfg":
-            wavelet_checks = self._check_3d_wavelet_implementation(
-                global_noise.device,
-                wavelet_family,
-            )
-        real_patch_wavelet_check: Optional[Dict[str, Any]] = None
 
-        inverse_state = sampler.invert_euler_trajectory(
+        inverse_state = self.shape_slat_sampler.invert_euler_trajectory(
             trajectory.states[-1],
             trajectory.velocities,
             trajectory.time_intervals,
@@ -1239,33 +946,17 @@ class Pixal3DImageTo3DPipeline(Pipeline):
             for patch in patches
         ]
         print(
-            f"[{stage_name}-patch-flow] start_step={start_step}/{num_steps} "
+            f"[patch-flow] start_step={start_step}/{num_steps} "
             f"source={start_source} active_patches={len(active_patches)}/27 "
             f"tokens={patch_state.feats.shape[0]:,}"
         )
         print(
-            f"[{stage_name}-patch-flow-coordinates] patch_coordinate_mode=local "
+            "[patch-flow-coordinates] patch_coordinate_mode=local "
             f"validated_nonempty_patches={len(active_patches)}/27 "
             "model_local_range=[0,63] global_latent_coords=preserved"
         )
         print(
-            f"[{stage_name}-patch-flow-guidance] mode={patch_guidance_mode} "
-            f"wavelet_family={wavelet_family} "
-            f"strength={guidance_strength:.6g} "
-            f"interval={guidance_interval} "
-            f"rescale={guidance_rescale:.6g} "
-            f"skip_residual={skip_residual_mode}"
-        )
-        if wavelet_checks is not None:
-            print(
-                f"[{stage_name}-patch-flow-wavelet-check] "
-                f"round_trip_max_abs="
-                f"{wavelet_checks['round_trip_max_abs_error']:.8e} "
-                f"uniform_cfg_max_abs="
-                f"{wavelet_checks['uniform_band_cfg_max_abs_error']:.8e}"
-            )
-        print(
-            f"[{stage_name}-patch-flow] algebraic inverse check: "
+            "[patch-flow] algebraic inverse check: "
             f"max_abs={inverse_check['max_abs_error']:.8e} "
             f"mean_abs={inverse_check['mean_abs_error']:.8e}"
         )
@@ -1284,25 +975,6 @@ class Pixal3DImageTo3DPipeline(Pipeline):
                 "return_model_history",
             }
         }
-        raw_prediction_kwargs = {
-            key: value
-            for key, value in prediction_kwargs.items()
-            if key
-            not in {
-                "guidance_strength",
-                "guidance_rescale",
-                "guidance_interval",
-            }
-        }
-        original_guidance_strength = float(
-            prediction_kwargs.get("guidance_strength", 1.0)
-        )
-        original_guidance_rescale = float(
-            prediction_kwargs.get("guidance_rescale", 0.0)
-        )
-        original_guidance_interval = tuple(
-            prediction_kwargs.get("guidance_interval", (0.0, 1.0))
-        )
         similarities: List[Dict[str, Any]] = []
         merged_velocities: List[torch.Tensor] = []
         token_count = int(patch_state.feats.shape[0])
@@ -1310,51 +982,15 @@ class Pixal3DImageTo3DPipeline(Pipeline):
             t = float(trajectory.times[step_index])
             t_prev = float(trajectory.times[step_index + 1])
             time_interval = float(trajectory.time_intervals[step_index])
-            original_interval_active = (
-                original_guidance_interval[0]
-                <= t
-                <= original_guidance_interval[1]
-            )
-            guidance_step_active = (
-                patch_guidance_mode in {"uniform_cfg", "wavelet_cfg"}
-                and (
-                    guidance_interval == "all_remaining"
-                    or original_interval_active
-                )
-            )
             velocity_sum = torch.zeros(
                 patch_state.feats.shape,
                 device=patch_state.device,
                 dtype=torch.float32,
             )
-            plain_velocity_sum = (
-                torch.zeros_like(velocity_sum)
-                if patch_guidance_mode in {"uniform_cfg", "wavelet_cfg"}
-                else None
-            )
             weight_sum = torch.zeros(
                 (token_count, 1),
                 device=patch_state.device,
                 dtype=torch.float32,
-            )
-            conditional_band_energy_sum = (
-                torch.zeros(
-                    len(self._HAAR_3D_BAND_NAMES),
-                    device=patch_state.device,
-                    dtype=torch.float64,
-                )
-                if patch_guidance_mode == "wavelet_cfg"
-                else None
-            )
-            unconditional_band_energy_sum = (
-                torch.zeros_like(conditional_band_energy_sum)
-                if conditional_band_energy_sum is not None
-                else None
-            )
-            guided_band_energy_sum = (
-                torch.zeros_like(conditional_band_energy_sum)
-                if conditional_band_energy_sum is not None
-                else None
             )
 
             for patch in active_patches:
@@ -1373,285 +1009,31 @@ class Pixal3DImageTo3DPipeline(Pipeline):
                     token_indices,
                     patch_local_coords,
                     token_count,
-                    patch_state.coords,
                 )
                 patch_neg_cond = self._slice_sparse_condition(
                     cond["neg_cond"],
                     token_indices,
                     patch_local_coords,
                     token_count,
-                    patch_state.coords,
                 )
-                patch_concat_cond = self._slice_aligned_sparse_tensor(
-                    concat_cond,
-                    token_indices,
-                    patch_local_coords,
-                    patch_state.coords,
-                    name=f"{stage_name} concat_cond",
-                )
-                patch_raw_kwargs = dict(raw_prediction_kwargs)
-                patch_prediction_kwargs = dict(prediction_kwargs)
-                if patch_concat_cond is not None:
-                    # The identical object is supplied to both raw CFG calls;
-                    # only patch_cond versus patch_neg_cond changes.
-                    patch_raw_kwargs["concat_cond"] = patch_concat_cond
-                    patch_prediction_kwargs["concat_cond"] = patch_concat_cond
-                if patch_guidance_mode == "original_cfg":
-                    # Keep the baseline path byte-for-byte equivalent: the
-                    # sampler still owns interval CFG and guidance rescale.
-                    _, _, patch_velocity = (
-                        sampler._get_model_prediction(
-                            flow_model,
-                            patch_input,
-                            t,
-                            patch_cond,
-                            neg_cond=patch_neg_cond,
-                            **patch_prediction_kwargs,
-                        )
-                    )
-                    plain_patch_velocity = patch_velocity
-                elif patch_guidance_mode == "conditional_only":
-                    conditional_kwargs = dict(patch_raw_kwargs)
-                    conditional_kwargs.update(
-                        {
-                            "guidance_strength": 1.0,
-                            "guidance_rescale": 0.0,
-                            "guidance_interval": (0.0, 1.0),
-                        }
-                    )
-                    _, _, patch_velocity = sampler._get_model_prediction(
+                _, _, patch_velocity = (
+                    self.shape_slat_sampler._get_model_prediction(
                         flow_model,
                         patch_input,
                         t,
                         patch_cond,
                         neg_cond=patch_neg_cond,
-                        **conditional_kwargs,
+                        **prediction_kwargs,
                     )
-                    plain_patch_velocity = patch_velocity
-                else:
-                    pred_cond, pred_uncond = (
-                        sampler._inference_model_cfg_pair(
-                            flow_model,
-                            patch_input,
-                            t,
-                            patch_cond,
-                            patch_neg_cond,
-                            **patch_raw_kwargs,
-                        )
-                    )
-                    plain_strength = (
-                        original_guidance_strength
-                        if original_interval_active
-                        else 1.0
-                    )
-                    plain_patch_velocity = (
-                        sampler._combine_cfg_predictions(
-                            patch_input,
-                            t,
-                            pred_cond,
-                            pred_uncond,
-                            guidance_strength=plain_strength,
-                            guidance_rescale=(
-                                original_guidance_rescale
-                                if original_interval_active
-                                else 0.0
-                            ),
-                        )
-                    )
-                    if patch_guidance_mode == "uniform_cfg":
-                        patch_velocity = sampler._combine_cfg_predictions(
-                            patch_input,
-                            t,
-                            pred_cond,
-                            pred_uncond,
-                            guidance_strength=(
-                                float(guidance_strength)
-                                if guidance_step_active
-                                else 1.0
-                            ),
-                            guidance_rescale=(
-                                float(guidance_rescale)
-                                if guidance_step_active
-                                else 0.0
-                            ),
-                        )
-                    else:
-                        cond_dense = self._sparse_patch_velocity_to_dense(
-                            pred_cond,
-                            patch_local_coords,
-                        )
-                        uncond_dense = self._sparse_patch_velocity_to_dense(
-                            pred_uncond,
-                            patch_local_coords,
-                        )
-                        cond_bands = self._dwt3d(cond_dense, wavelet_family)
-                        uncond_bands = self._dwt3d(
-                            uncond_dense, wavelet_family
-                        )
-                        if real_patch_wavelet_check is None:
-                            if cond_dense.dtype != torch.float32:
-                                raise RuntimeError(
-                                    "Wavelet dense velocity must be FP32, got "
-                                    f"{cond_dense.dtype}"
-                                )
-                            roundtrip_dense = self._idwt3d(
-                                cond_bands, wavelet_family
-                            )
-                            roundtrip_sparse = (
-                                self._gather_dense_patch_velocity(
-                                    roundtrip_dense,
-                                    patch_local_coords,
-                                )
-                            )
-                            roundtrip_max_abs = float(
-                                (
-                                    roundtrip_sparse
-                                    - pred_cond.feats.float()
-                                )
-                                .abs()
-                                .max()
-                                .item()
-                            )
-                            real_patch_tolerance = 1e-5
-                            real_patch_wavelet_check = {
-                                "step_index": int(step_index),
-                                "patch_index": int(patch["patch_index"]),
-                                "token_count": int(
-                                    patch_local_coords.shape[0]
-                                ),
-                                "model_prediction_dtype": str(
-                                    pred_cond.feats.dtype
-                                ).replace("torch.", ""),
-                                "wavelet_compute_dtype": str(
-                                    cond_dense.dtype
-                                ).replace("torch.", ""),
-                                "round_trip_max_abs_error": roundtrip_max_abs,
-                                "tolerance_exclusive": real_patch_tolerance,
-                            }
-                            if (
-                                not math.isfinite(roundtrip_max_abs)
-                                or roundtrip_max_abs >= real_patch_tolerance
-                            ):
-                                raise RuntimeError(
-                                    "Real-patch FP32 wavelet round-trip failed: "
-                                    f"max_abs={roundtrip_max_abs:.8e}, "
-                                    f"required<{real_patch_tolerance:.8e}"
-                                )
-                            if wavelet_checks is None:
-                                raise RuntimeError(
-                                    "Wavelet checks were not initialized"
-                                )
-                            wavelet_checks["real_patch_sparse_round_trip"] = (
-                                real_patch_wavelet_check
-                            )
-                            print(
-                                f"[{stage_name}-patch-flow-wavelet-real-patch-check] "
-                                f"step={step_index:02d} "
-                                f"patch={patch['patch_index']} "
-                                f"model_dtype="
-                                f"{real_patch_wavelet_check['model_prediction_dtype']} "
-                                "wavelet_dtype=float32 "
-                                f"max_abs={roundtrip_max_abs:.8e} "
-                                f"required<{real_patch_tolerance:.8e}"
-                            )
-                            del roundtrip_dense, roundtrip_sparse
-                        if guidance_step_active:
-                            guided_bands = {"LLL": cond_bands["LLL"]}
-                            for band_name in self._HAAR_3D_BAND_NAMES[1:]:
-                                guided_bands[band_name] = (
-                                    uncond_bands[band_name]
-                                    + float(guidance_strength)
-                                    * (
-                                        cond_bands[band_name]
-                                        - uncond_bands[band_name]
-                                    )
-                                )
-                            guided_dense = self._idwt3d(
-                                guided_bands, wavelet_family
-                            )
-                            patch_velocity = patch_input.replace(
-                                self._gather_dense_patch_velocity(
-                                    guided_dense,
-                                    patch_local_coords,
-                                ).to(patch_input.dtype)
-                            )
-                            if guidance_rescale > 0.0:
-                                patch_velocity = sampler._rescale_cfg_prediction(
-                                    patch_input,
-                                    t,
-                                    pred_cond,
-                                    patch_velocity,
-                                    guidance_rescale=float(guidance_rescale),
-                                )
-                        else:
-                            guided_bands = cond_bands
-                            guided_dense = None
-                            patch_velocity = pred_cond
-
-                        conditional_band_energy_sum += torch.stack(
-                            [
-                                cond_bands[name]
-                                .to(torch.float32)
-                                .square()
-                                .mean()
-                                .to(torch.float64)
-                                for name in self._HAAR_3D_BAND_NAMES
-                            ]
-                        )
-                        unconditional_band_energy_sum += torch.stack(
-                            [
-                                uncond_bands[name]
-                                .to(torch.float32)
-                                .square()
-                                .mean()
-                                .to(torch.float64)
-                                for name in self._HAAR_3D_BAND_NAMES
-                            ]
-                        )
-                        guided_band_energy_sum += torch.stack(
-                            [
-                                guided_bands[name]
-                                .to(torch.float32)
-                                .square()
-                                .mean()
-                                .to(torch.float64)
-                                for name in self._HAAR_3D_BAND_NAMES
-                            ]
-                        )
+                )
                 weights = patch["weights"].unsqueeze(1)
                 velocity_sum.index_add_(
                     0,
                     token_indices,
                     patch_velocity.feats.to(torch.float32) * weights,
                 )
-                if plain_velocity_sum is not None:
-                    plain_velocity_sum.index_add_(
-                        0,
-                        token_indices,
-                        plain_patch_velocity.feats.to(torch.float32) * weights,
-                    )
                 weight_sum.index_add_(0, token_indices, weights)
-                del (
-                    patch_input,
-                    patch_cond,
-                    patch_neg_cond,
-                    patch_concat_cond,
-                    patch_raw_kwargs,
-                    patch_prediction_kwargs,
-                    patch_velocity,
-                )
-                if patch_guidance_mode == "wavelet_cfg":
-                    del (
-                        pred_cond,
-                        pred_uncond,
-                        plain_patch_velocity,
-                        cond_dense,
-                        uncond_dense,
-                        cond_bands,
-                        uncond_bands,
-                        guided_bands,
-                        guided_dense,
-                    )
+                del patch_input, patch_cond, patch_neg_cond, patch_velocity
 
             if torch.any(weight_sum <= 0):
                 uncovered = int((weight_sum <= 0).sum().item())
@@ -1660,147 +1042,32 @@ class Pixal3DImageTo3DPipeline(Pipeline):
                 )
             merged_velocity = velocity_sum / weight_sum
             merged_velocity_cpu = merged_velocity.detach().cpu()
-            if plain_velocity_sum is None:
-                plain_merged_velocity = merged_velocity
-            else:
-                plain_merged_velocity = plain_velocity_sum / weight_sum
-            plain_merged_velocity_cpu = plain_merged_velocity.detach().cpu()
-            global_velocity_cpu = trajectory.velocities[step_index]
             metrics = self._velocity_similarity(
                 merged_velocity_cpu,
-                global_velocity_cpu,
+                trajectory.velocities[step_index],
             )
-            similarity_to_plain = self._velocity_similarity(
-                merged_velocity_cpu,
-                plain_merged_velocity_cpu,
-            )
-            plain_similarity_to_global = self._velocity_similarity(
-                plain_merged_velocity_cpu,
-                global_velocity_cpu,
-            )
-            if patch_guidance_mode == "wavelet_cfg":
-                divisor = float(len(active_patches))
-                conditional_energy_values = (
-                    conditional_band_energy_sum / divisor
-                ).detach().cpu().tolist()
-                unconditional_energy_values = (
-                    unconditional_band_energy_sum / divisor
-                ).detach().cpu().tolist()
-                guided_energy_values = (
-                    guided_band_energy_sum / divisor
-                ).detach().cpu().tolist()
-                conditional_energy = dict(
-                    zip(self._HAAR_3D_BAND_NAMES, conditional_energy_values)
-                )
-                unconditional_energy = dict(
-                    zip(self._HAAR_3D_BAND_NAMES, unconditional_energy_values)
-                )
-                guided_energy = dict(
-                    zip(self._HAAR_3D_BAND_NAMES, guided_energy_values)
-                )
-                conditional_high_energy = sum(
-                    conditional_energy[name]
-                    for name in self._HAAR_3D_BAND_NAMES[1:]
-                )
-                guided_high_energy = sum(
-                    guided_energy[name]
-                    for name in self._HAAR_3D_BAND_NAMES[1:]
-                )
-                high_energy_ratio = guided_high_energy / max(
-                    conditional_high_energy,
-                    torch.finfo(torch.float64).eps,
-                )
-                frequency_metrics = {
-                    "enabled": True,
-                    "active_this_step": bool(guidance_step_active),
-                    "low_frequency_source": "conditional",
-                    "low_frequency_strict_after_rescale": bool(
-                        not guidance_step_active or guidance_rescale == 0.0
-                    ),
-                    "guidance_rescale_applied": bool(
-                        guidance_step_active and guidance_rescale > 0.0
-                    ),
-                    "band_energy_definition": (
-                        "mean_squared_coefficient_averaged_over_active_patches"
-                    ),
-                    "conditional_band_energy": conditional_energy,
-                    "unconditional_band_energy": unconditional_energy,
-                    "guided_band_energy_pre_rescale": guided_energy,
-                    "high_frequency_energy_ratio": float(high_energy_ratio),
-                    "high_frequency_rms_amplification": float(
-                        math.sqrt(max(high_energy_ratio, 0.0))
-                    ),
-                }
-            else:
-                frequency_metrics = {
-                    "enabled": False,
-                    "active_this_step": False,
-                }
             metrics.update(
                 {
                     "step_index": int(step_index),
                     "t": t,
                     "t_prev": t_prev,
                     "time_interval": time_interval,
-                    "guidance_active_this_step": bool(guidance_step_active),
-                    "similarity_to_plain_patch_velocity": (
-                        similarity_to_plain
-                    ),
-                    "plain_patch_similarity_to_global_velocity": (
-                        plain_similarity_to_global
-                    ),
-                    "velocity_norm": {
-                        "merged": float(merged_velocity_cpu.float().norm().item()),
-                        "plain_patch": float(
-                            plain_merged_velocity_cpu.float().norm().item()
-                        ),
-                        "global": float(
-                            global_velocity_cpu.float().norm().item()
-                        ),
-                    },
-                    "frequency_guidance": frequency_metrics,
                 }
             )
             similarities.append(metrics)
             merged_velocities.append(merged_velocity_cpu)
             print(
-                f"[{stage_name}-patch-flow-similarity] step={step_index:02d} "
+                f"[patch-flow-similarity] step={step_index:02d} "
                 f"t={t:.8f}->{t_prev:.8f} "
                 f"cos={metrics['cosine_similarity']:.8f} "
                 f"token_cos={metrics['mean_token_cosine_similarity']:.8f} "
-                f"rel_l2={metrics['relative_l2']:.8f} "
-                f"plain_cos={similarity_to_plain['cosine_similarity']:.8f} "
-                f"hf_amp={frequency_metrics.get('high_frequency_rms_amplification', 1.0):.8f}"
+                f"rel_l2={metrics['relative_l2']:.8f}"
             )
-            if frequency_metrics["enabled"]:
-                guided_energy_log = ",".join(
-                    f"{name}="
-                    f"{frequency_metrics['guided_band_energy_pre_rescale'][name]:.6e}"
-                    for name in self._HAAR_3D_BAND_NAMES
-                )
-                print(
-                    f"[{stage_name}-patch-flow-frequency] step={step_index:02d} "
-                    f"active={frequency_metrics['active_this_step']} "
-                    f"merged_v_norm="
-                    f"{metrics['velocity_norm']['merged']:.8e} "
-                    f"plain_v_norm="
-                    f"{metrics['velocity_norm']['plain_patch']:.8e} "
-                    f"global_v_norm="
-                    f"{metrics['velocity_norm']['global']:.8e} "
-                    f"guided_band_energy[{guided_energy_log}]"
-                )
             patch_state = patch_state.replace(
                 patch_state.feats
                 - time_interval * merged_velocity.to(patch_state.dtype)
             )
-            del (
-                velocity_sum,
-                weight_sum,
-                merged_velocity,
-                plain_merged_velocity,
-            )
-            if plain_velocity_sum is not None:
-                del plain_velocity_sum
+            del velocity_sum, weight_sum, merged_velocity
 
         if not torch.equal(patch_state.coords, global_noise.coords):
             raise RuntimeError(
@@ -1810,7 +1077,6 @@ class Pixal3DImageTo3DPipeline(Pipeline):
         trace_patch = {
             "enabled": True,
             "status": "complete",
-            "stage": stage_name,
             "patch_coordinate_mode": "local",
             "global_latent_coordinate_mode": "global",
             "grid_resolution": 128,
@@ -1821,19 +1087,6 @@ class Pixal3DImageTo3DPipeline(Pipeline):
             "start_step": int(start_step),
             "start_source": start_source,
             "start_time": float(trajectory.times[start_step]),
-            "guidance": {
-                "mode": patch_guidance_mode,
-                "strength": float(guidance_strength),
-                "interval": guidance_interval,
-                "rescale": float(guidance_rescale),
-                "wavelet_family": wavelet_family,
-                "skip_residual_mode": skip_residual_mode,
-                "wavelet_checks": wavelet_checks,
-                "wavelet_compute_dtype": (
-                    "float32" if patch_guidance_mode == "wavelet_cfg" else None
-                ),
-                "dense_wavelet_bands_saved": False,
-            },
             "algebraic_inverse_check": inverse_check,
             "patches": patch_records,
             "similarities": similarities,
@@ -1845,23 +1098,8 @@ class Pixal3DImageTo3DPipeline(Pipeline):
             "global_latent_coordinate_mode": "global",
             "patch_start_step": int(start_step),
             "patch_start_source": start_source,
-            "patch_guidance_mode": patch_guidance_mode,
-            "guidance_strength": float(guidance_strength),
-            "guidance_interval": guidance_interval,
-            "guidance_rescale": float(guidance_rescale),
-            "wavelet_family": wavelet_family,
-            "skip_residual_mode": skip_residual_mode,
-            "wavelet_checks": wavelet_checks,
-            "wavelet_compute_dtype": (
-                "float32" if patch_guidance_mode == "wavelet_cfg" else None
-            ),
-            "dense_wavelet_bands_saved": False,
             "patch_count": 27,
             "active_patch_count": len(active_patches),
-            "concat_cond_present": bool(concat_cond is not None),
-            "conditional_unconditional_share_concat_cond": bool(
-                concat_cond is not None
-            ),
             "algebraic_inverse_check": inverse_check,
             "velocity_similarities": similarities,
         }
@@ -1870,24 +1108,18 @@ class Pixal3DImageTo3DPipeline(Pipeline):
     @staticmethod
     def _save_2048_flow_trace(
         output_path: Union[str, Path],
-        stage_name: str,
         coords: torch.Tensor,
         sampler_params: Dict[str, Any],
         global_flow: Any,
         patch_trace: Dict[str, Any],
-        experiment_tag: Optional[str] = None,
     ) -> int:
         """Atomically persist every global state/velocity and patch results."""
-        if stage_name not in {"shape", "texture"}:
-            raise ValueError("stage_name must be shape or texture")
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         temporary_path = output_path.with_suffix(output_path.suffix + ".tmp")
         trajectory = global_flow.trajectory
         payload = {
-            "format": f"pixal3d_2048_{stage_name}_flow_trace_v3",
-            "stage": stage_name,
-            "experiment_tag": experiment_tag,
+            "format": "pixal3d_2048_shape_flow_trace_v1",
             "coordinate_system": {
                 "source_candidate_resolution": 512,
                 "target_resolution": 2048,
@@ -1928,24 +1160,8 @@ class Pixal3DImageTo3DPipeline(Pipeline):
         pipeline_type: Optional[str] = None,
         max_num_tokens: int = 49152,
         shape_flow_trace_path: Optional[Union[str, Path]] = None,
-        texture_flow_trace_path: Optional[Union[str, Path]] = None,
-        shape_patch_start_step: int = 6,
-        shape_patch_start_source: str = "saved_state",
-        shape_guidance_mode: str = "original_cfg",
-        shape_guidance_strength: float = 7.5,
-        shape_guidance_interval: str = "original_interval",
-        shape_guidance_rescale: float = 0.0,
-        shape_wavelet_family: str = "haar",
-        shape_skip_residual_mode: str = "off",
-        texture_patch_start_step: int = 6,
-        texture_patch_start_source: str = "saved_state",
-        texture_guidance_mode: str = "global_original",
-        texture_guidance_strength: float = 1.0,
-        texture_guidance_interval: str = "original_interval",
-        texture_guidance_rescale: float = 0.0,
-        texture_wavelet_family: str = "haar",
-        texture_skip_residual_mode: str = "off",
-        flow_experiment_tag: Optional[str] = None,
+        patch_start_step: int = 6,
+        patch_start_source: str = "saved_state",
     ) -> List[MeshWithVoxel]:
         """
         Run the Pixal3D pipeline (proj mode, cascade).
@@ -1966,14 +1182,11 @@ class Pixal3DImageTo3DPipeline(Pipeline):
             pipeline_type (str): Cascade type, including experimental '2048_cascade'.
             max_num_tokens (int): The maximum number of tokens to use.
             shape_flow_trace_path: Required output artifact for 2048 shape flow.
-            texture_flow_trace_path: Required output artifact for 2048 texture flow.
-            shape_*: Independent local guidance controls for shape flow.
-            texture_*: Independent global/local guidance controls for texture flow.
-            flow_experiment_tag: Unique output/cache identity for this flow.
+            patch_start_step: Saved global state index used to start patch flow.
+            patch_start_source: Use the saved state or algebraic Euler inverse.
         """
         # Check pipeline type
         self.last_shape_flow_diagnostics = None
-        self.last_texture_flow_diagnostics = None
         pipeline_type = pipeline_type or self.default_pipeline_type
         if pipeline_type == '1024_cascade':
             assert 'shape_slat_flow_model_512' in self.models, "No 512 resolution shape SLat flow model found."
@@ -1992,10 +1205,6 @@ class Pixal3DImageTo3DPipeline(Pipeline):
             if shape_flow_trace_path is None:
                 raise ValueError(
                     "shape_flow_trace_path is required for the 2048 experiment"
-                )
-            if texture_flow_trace_path is None:
-                raise ValueError(
-                    "texture_flow_trace_path is required for the 2048 experiment"
                 )
             hr_resolution = 2048
         else:
@@ -2143,40 +1352,21 @@ class Pixal3DImageTo3DPipeline(Pipeline):
             # replaces this artifact below.
             baseline_trace_size = self._save_2048_flow_trace(
                 output_path=shape_flow_trace_path,
-                stage_name="shape",
                 coords=hr_coords_unique,
                 sampler_params=sampler_params_hr,
                 global_flow=global_flow,
                 patch_trace={
                     "enabled": True,
                     "status": "global_complete_patch_pending",
-                    "stage": "shape",
                     "patch_coordinate_mode": "local",
                     "global_latent_coordinate_mode": "global",
                     "grid_resolution": 128,
                     "patch_size": 64,
                     "patch_stride": 32,
                     "patch_count": 27,
-                    "start_step": int(shape_patch_start_step),
-                    "start_source": str(shape_patch_start_source),
-                    "guidance": {
-                        "mode": str(shape_guidance_mode),
-                        "strength": float(shape_guidance_strength),
-                        "interval": str(shape_guidance_interval),
-                        "rescale": float(shape_guidance_rescale),
-                        "wavelet_family": str(shape_wavelet_family),
-                        "skip_residual_mode": str(
-                            shape_skip_residual_mode
-                        ),
-                        "wavelet_compute_dtype": (
-                            "float32"
-                            if shape_guidance_mode == "wavelet_cfg"
-                            else None
-                        ),
-                        "dense_wavelet_bands_saved": False,
-                    },
+                    "start_step": int(patch_start_step),
+                    "start_source": str(patch_start_source),
                 },
-                experiment_tag=flow_experiment_tag,
             )
             print(
                 f"[shape-2048-trace] global baseline saved="
@@ -2184,30 +1374,19 @@ class Pixal3DImageTo3DPipeline(Pipeline):
             )
             hr_slat, patch_trace, flow_diagnostics = self._run_2048_patch_flow(
                 flow_model=flow_model_hr,
-                sampler=self.shape_slat_sampler,
-                stage_name="shape",
                 global_noise=noise_hr,
                 cond=cond_shape_hr,
-                concat_cond=None,
                 sampler_params=sampler_params_hr,
                 global_flow=global_flow,
-                start_step=int(shape_patch_start_step),
-                start_source=str(shape_patch_start_source),
-                patch_guidance_mode=str(shape_guidance_mode),
-                guidance_strength=float(shape_guidance_strength),
-                guidance_interval=str(shape_guidance_interval),
-                guidance_rescale=float(shape_guidance_rescale),
-                wavelet_family=str(shape_wavelet_family),
-                skip_residual_mode=str(shape_skip_residual_mode),
+                start_step=int(patch_start_step),
+                start_source=str(patch_start_source),
             )
             trace_size = self._save_2048_flow_trace(
                 output_path=shape_flow_trace_path,
-                stage_name="shape",
                 coords=hr_coords_unique,
                 sampler_params=sampler_params_hr,
                 global_flow=global_flow,
                 patch_trace=patch_trace,
-                experiment_tag=flow_experiment_tag,
             )
             flow_diagnostics.update(
                 {
@@ -2217,7 +1396,6 @@ class Pixal3DImageTo3DPipeline(Pipeline):
                     "global_velocity_count": len(
                         global_flow.trajectory.velocities
                     ),
-                    "experiment_tag": flow_experiment_tag,
                 }
             )
             self.last_shape_flow_diagnostics = flow_diagnostics
@@ -2262,207 +1440,10 @@ class Pixal3DImageTo3DPipeline(Pipeline):
             mesh_scale=mesh_scale,
             grid_resolution_override=tex_grid_res,
         )
-        if actual_hr_resolution == 2048:
-            shape_std = torch.tensor(
-                self.shape_slat_normalization['std']
-            )[None].to(shape_slat.device)
-            shape_mean = torch.tensor(
-                self.shape_slat_normalization['mean']
-            )[None].to(shape_slat.device)
-            shape_concat_cond = (shape_slat - shape_mean) / shape_std
-            tex_flow_model = self.models['tex_slat_flow_model_1024']
-            tex_noise_channels = (
-                int(tex_flow_model.in_channels)
-                - int(shape_concat_cond.feats.shape[1])
-            )
-            if tex_noise_channels <= 0:
-                raise RuntimeError(
-                    "Texture flow input channels must exceed shape condition "
-                    f"channels, got {tex_flow_model.in_channels} and "
-                    f"{shape_concat_cond.feats.shape[1]}"
-                )
-            tex_noise = shape_concat_cond.replace(
-                feats=torch.randn(
-                    shape_concat_cond.coords.shape[0],
-                    tex_noise_channels,
-                    device=self.device,
-                )
-            )
-            if not torch.equal(tex_noise.coords, shape_concat_cond.coords):
-                raise RuntimeError("Texture noise and shape condition misaligned")
-            tex_sampler_params = {
-                **self.tex_slat_sampler_params,
-                **tex_slat_sampler_params,
-            }
-            if self.low_vram:
-                tex_flow_model.to(self.device)
-            global_tex_flow = self.tex_slat_sampler.sample(
-                tex_flow_model,
-                tex_noise,
-                concat_cond=shape_concat_cond,
-                **cond_tex,
-                **tex_sampler_params,
-                verbose=True,
-                tqdm_desc="Sampling global texture SLat (proj, 2048)",
-                record_trajectory=True,
-                trajectory_device="cpu",
-                return_model_history=False,
-            )
-            texture_patch_enabled = texture_guidance_mode != "global_original"
-            pending_texture_trace = {
-                "enabled": bool(texture_patch_enabled),
-                "status": (
-                    "global_complete_patch_pending"
-                    if texture_patch_enabled
-                    else "global_only_complete"
-                ),
-                "stage": "texture",
-                "patch_coordinate_mode": (
-                    "local" if texture_patch_enabled else None
-                ),
-                "global_latent_coordinate_mode": "global",
-                "grid_resolution": 128,
-                "patch_size": 64,
-                "patch_stride": 32,
-                "patch_count": 27,
-                "start_step": int(texture_patch_start_step),
-                "start_source": str(texture_patch_start_source),
-                "concat_cond": {
-                    "present": True,
-                    "token_aligned": True,
-                    "same_for_conditional_and_unconditional": True,
-                    "channels": int(shape_concat_cond.feats.shape[1]),
-                },
-                "guidance": {
-                    "mode": str(texture_guidance_mode),
-                    "strength": float(texture_guidance_strength),
-                    "interval": str(texture_guidance_interval),
-                    "rescale": float(texture_guidance_rescale),
-                    "wavelet_family": str(texture_wavelet_family),
-                    "skip_residual_mode": str(
-                        texture_skip_residual_mode
-                    ),
-                    "wavelet_compute_dtype": (
-                        "float32"
-                        if texture_guidance_mode == "wavelet_cfg"
-                        else None
-                    ),
-                    "dense_wavelet_bands_saved": False,
-                },
-            }
-            baseline_tex_trace_size = self._save_2048_flow_trace(
-                output_path=texture_flow_trace_path,
-                stage_name="texture",
-                coords=shape_slat.coords,
-                sampler_params=tex_sampler_params,
-                global_flow=global_tex_flow,
-                patch_trace=pending_texture_trace,
-                experiment_tag=flow_experiment_tag,
-            )
-            print(
-                f"[texture-2048-trace] global baseline saved="
-                f"{texture_flow_trace_path} bytes={baseline_tex_trace_size:,}"
-            )
-            if texture_patch_enabled:
-                tex_slat_normalized, texture_patch_trace, texture_diagnostics = (
-                    self._run_2048_patch_flow(
-                        flow_model=tex_flow_model,
-                        sampler=self.tex_slat_sampler,
-                        stage_name="texture",
-                        global_noise=tex_noise,
-                        cond=cond_tex,
-                        concat_cond=shape_concat_cond,
-                        sampler_params=tex_sampler_params,
-                        global_flow=global_tex_flow,
-                        start_step=int(texture_patch_start_step),
-                        start_source=str(texture_patch_start_source),
-                        patch_guidance_mode=str(texture_guidance_mode),
-                        guidance_strength=float(texture_guidance_strength),
-                        guidance_interval=str(texture_guidance_interval),
-                        guidance_rescale=float(texture_guidance_rescale),
-                        wavelet_family=str(texture_wavelet_family),
-                        skip_residual_mode=str(
-                            texture_skip_residual_mode
-                        ),
-                    )
-                )
-            else:
-                tex_slat_normalized = global_tex_flow.samples
-                texture_patch_trace = pending_texture_trace
-                texture_diagnostics = {
-                    "patch_coordinate_mode": None,
-                    "global_latent_coordinate_mode": "global",
-                    "patch_start_step": int(texture_patch_start_step),
-                    "patch_start_source": str(texture_patch_start_source),
-                    "patch_guidance_mode": "global_original",
-                    "guidance_strength": float(texture_guidance_strength),
-                    "guidance_interval": str(texture_guidance_interval),
-                    "guidance_rescale": float(texture_guidance_rescale),
-                    "wavelet_family": str(texture_wavelet_family),
-                    "skip_residual_mode": str(
-                        texture_skip_residual_mode
-                    ),
-                    "concat_cond_present": True,
-                    "conditional_unconditional_share_concat_cond": True,
-                    "velocity_similarities": [],
-                }
-            tex_trace_size = self._save_2048_flow_trace(
-                output_path=texture_flow_trace_path,
-                stage_name="texture",
-                coords=shape_slat.coords,
-                sampler_params=tex_sampler_params,
-                global_flow=global_tex_flow,
-                patch_trace=texture_patch_trace,
-                experiment_tag=flow_experiment_tag,
-            )
-            texture_diagnostics.update(
-                {
-                    "trace_path": str(
-                        Path(texture_flow_trace_path).resolve()
-                    ),
-                    "trace_bytes": int(tex_trace_size),
-                    "global_state_count": len(
-                        global_tex_flow.trajectory.states
-                    ),
-                    "global_velocity_count": len(
-                        global_tex_flow.trajectory.velocities
-                    ),
-                    "experiment_tag": flow_experiment_tag,
-                }
-            )
-            self.last_texture_flow_diagnostics = texture_diagnostics
-            print(
-                f"[texture-2048-trace] saved={texture_flow_trace_path} "
-                f"bytes={tex_trace_size:,}"
-            )
-            tex_std = torch.tensor(
-                self.tex_slat_normalization['std']
-            )[None].to(tex_slat_normalized.device)
-            tex_mean = torch.tensor(
-                self.tex_slat_normalization['mean']
-            )[None].to(tex_slat_normalized.device)
-            tex_slat = tex_slat_normalized * tex_std + tex_mean
-            if self.low_vram:
-                tex_flow_model.cpu()
-            del (
-                shape_std,
-                shape_mean,
-                shape_concat_cond,
-                tex_noise,
-                tex_sampler_params,
-                global_tex_flow,
-                pending_texture_trace,
-                texture_patch_trace,
-                texture_diagnostics,
-                tex_slat_normalized,
-                tex_std,
-                tex_mean,
-            )
-        else:
-            tex_slat = self.sample_tex_slat(
-                cond_tex, self.models['tex_slat_flow_model_1024'],
-                shape_slat, tex_slat_sampler_params
-            )
+        tex_slat = self.sample_tex_slat(
+            cond_tex, self.models['tex_slat_flow_model_1024'],
+            shape_slat, tex_slat_sampler_params
+        )
         del cond_tex
         torch.cuda.empty_cache()
 

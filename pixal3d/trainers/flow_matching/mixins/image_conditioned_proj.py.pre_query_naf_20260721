@@ -28,7 +28,7 @@ def project_points_to_image_batch(
     points_3d: torch.Tensor, 
     transform_matrix: torch.Tensor, 
     camera_angle_x: torch.Tensor, 
-    resolution: int = 518
+    image_size: Union[int, Tuple[int, int]] = 518,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Project 3D points to 2D image coordinates (batch processing).
@@ -37,7 +37,7 @@ def project_points_to_image_batch(
         points_3d: torch.Tensor, shape [N, 3] or [B, N, 3], 3D point coordinates (in [-1, 1] range)
         transform_matrix: torch.Tensor, shape [B, 4, 4], camera transformation matrix
         camera_angle_x: torch.Tensor, shape [B], horizontal field of view angle (radians)
-        resolution: int, image resolution, default 518
+        image_size: Image size as ``(height, width)`` or a square side length.
     
     Returns:
         points_2d: torch.Tensor, shape [B, N, 2], image coordinates [x, y]
@@ -80,10 +80,18 @@ def project_points_to_image_batch(
     # Depth value (Z value in camera coordinate system, note Blender camera faces -Z direction)
     depth = -z_cam  # [B, N]
     
-    # Compute camera intrinsics (batch processing)
+    if isinstance(image_size, int):
+        image_height = image_width = int(image_size)
+    else:
+        image_height, image_width = (int(value) for value in image_size)
+    if image_height <= 0 or image_width <= 0:
+        raise ValueError(f"image_size must be positive, got {image_size}")
+
+    # Compute camera intrinsics (batch processing). camera_angle_x is the
+    # horizontal FOV, so both focal lengths are expressed in source pixels.
     sensor_width = 32.0  # mm
     focal_length = 16.0 / torch.tan(camera_angle_x / 2.0)  # [B]
-    focal_length_pixels = focal_length * resolution / sensor_width  # [B]
+    focal_length_pixels = focal_length * image_width / sensor_width  # [B]
     
     # Expand focal_length_pixels dimension for broadcasting: [B] -> [B, 1]
     focal_length_pixels = focal_length_pixels.unsqueeze(1)  # [B, 1]
@@ -93,13 +101,13 @@ def project_points_to_image_batch(
     y_ndc = focal_length_pixels * y_cam / (-z_cam + 1e-8)  # [B, N]
     
     # Convert to image coordinates (pixel coordinates)
-    x_pixel = x_ndc + resolution / 2.0  # [B, N]
-    y_pixel = -y_ndc + resolution / 2.0  # [B, N], flip Y axis
+    x_pixel = x_ndc + image_width / 2.0  # [B, N]
+    y_pixel = -y_ndc + image_height / 2.0  # [B, N], flip Y axis
     
     # Create validity mask (points within image range and in front of camera)
     valid_mask = (
-        (x_pixel >= 0) & (x_pixel < resolution) &
-        (y_pixel >= 0) & (y_pixel < resolution) &
+        (x_pixel >= 0) & (x_pixel < image_width) &
+        (y_pixel >= 0) & (y_pixel < image_height) &
         (depth > 0)  # In front of camera
     )  # [B, N]
     
@@ -165,7 +173,11 @@ class ProjGrid(nn.Module):
     
     This is the core module for view-aligned feature extraction.
     """
-    def __init__(self, grid_resolution: int = 16, image_resolution: int = 518):
+    def __init__(
+        self,
+        grid_resolution: int = 16,
+        image_resolution: Optional[int] = 518,
+    ):
         super().__init__()
         self.grid_resolution = grid_resolution
         self.image_resolution = image_resolution
@@ -204,6 +216,7 @@ class ProjGrid(nn.Module):
         BHWC: bool = True,
         grid_indices: Optional[torch.Tensor] = None,
         grid_resolution: Optional[int] = None,
+        image_window_size: Optional[Tuple[int, int]] = None,
     ) -> torch.Tensor:
         """
         Project 3D grid points to image and sample features.
@@ -220,6 +233,9 @@ class ProjGrid(nn.Module):
                 projected instead of materializing the full 3D grid.
             grid_resolution: Resolution used to map grid_indices to [-1, 1].
                 Defaults to this module's grid_resolution.
+            image_window_size: Native condition window size as
+                ``(height, width)``. Projection coordinates are converted to
+                positions relative to this window before feature sampling.
             
         Returns:
             Projected features, shape [B, grid_resolution³, C] for the dense
@@ -286,13 +302,33 @@ class ProjGrid(nn.Module):
             transform_matrix = transform_matrix.expand(B, -1, -1).clone()
             transform_matrix[:, 1, 3] = -distance  # Set camera distance
             
-        # Project to image coordinates (simulate Blender projection)
-        image_points, depth, valid_mask = project_points_to_image_batch(
-            grid_points, transform_matrix, camera_angle_x, self.image_resolution
+        if image_window_size is None:
+            if self.image_resolution is None:
+                raise ValueError(
+                    "image_window_size is required when image_resolution is dynamic"
+                )
+            image_window_size = (
+                int(self.image_resolution),
+                int(self.image_resolution),
+            )
+        image_height, image_width = (
+            int(value) for value in image_window_size
         )
-        
-        # Normalize to [-1, 1] for grid_sample
-        image_points_norm = (image_points + 0.5) / self.image_resolution * 2 - 1
+
+        # Project voxels onto the camera plane in native-window pixel units.
+        image_points, depth, valid_mask = project_points_to_image_batch(
+            grid_points,
+            transform_matrix,
+            camera_angle_x,
+            (image_height, image_width),
+        )
+
+        # Convert camera-plane pixels to relative positions in the square image
+        # window. The resulting coordinates can sample either the DINO patch map
+        # or the NAF map without assuming that either is 512 or 1024 pixels.
+        window_scale = image_points.new_tensor([image_width, image_height])
+        image_points_relative = image_points / window_scale
+        image_points_norm = image_points_relative * 2.0 - 1.0
         
         if BHWC:
             features_map = features_map.permute(0, 3, 1, 2)  # [B, C, H, W]
@@ -329,6 +365,7 @@ class ProjGrid(nn.Module):
             List of PIL Images with projected points overlaid
         """
         B = image.shape[0]
+        image_height, image_width = (int(value) for value in image.shape[-2:])
         
         # Get projected points
         grid_points = self.grid_points.expand(B, -1, -1)
@@ -340,7 +377,10 @@ class ProjGrid(nn.Module):
             transform_matrix[:, 1, 3] = -distance
             
         image_points, depth, valid_mask = project_points_to_image_batch(
-            grid_points, transform_matrix, camera_angle_x, self.image_resolution
+            grid_points,
+            transform_matrix,
+            camera_angle_x,
+            (image_height, image_width),
         )
         
         # Convert image to PIL for visualization
@@ -350,10 +390,7 @@ class ProjGrid(nn.Module):
             img_np = image[b].cpu().permute(1, 2, 0).numpy()
             img_np = (img_np * 255).clip(0, 255).astype(np.uint8)
             
-            # Resize to image_resolution if needed
             pil_img = Image.fromarray(img_np)
-            if pil_img.size != (self.image_resolution, self.image_resolution):
-                pil_img = pil_img.resize((self.image_resolution, self.image_resolution), Image.LANCZOS)
             
             # Create a copy for drawing
             vis_img = pil_img.copy()
@@ -428,18 +465,20 @@ class DinoV3ProjFeatureExtractor(nn.Module):
     
     Args:
         model_name: Name of the pretrained DINOv3 model
-        image_size: Input image size (default: 512)
+        image_size: Fixed input image size. Set to ``None`` to keep the native
+            foreground-window size without resizing.
         grid_resolution: Resolution of the 3D projection grid (default: 16)
         use_naf_upsample: Whether to use NAF to upsample features (default: False)
-        naf_target_size: Target spatial size for NAF upsampling (default: [128, 128])
+        naf_target_size: Target spatial size for NAF upsampling. When both this
+            and ``image_size`` are ``None``, the current window size is used.
     """
     def __init__(
         self, 
         model_name: str,
-        image_size: int = 512,
+        image_size: Optional[int] = 512,
         grid_resolution: int = 16,
         use_naf_upsample: bool = False,
-        naf_target_size: Optional[List[int]] = None,
+        naf_target_size: Optional[Union[int, Sequence[int]]] = None,
     ):
         super().__init__()
         self.model_name = model_name
@@ -447,7 +486,7 @@ class DinoV3ProjFeatureExtractor(nn.Module):
         self.grid_resolution = grid_resolution
         self.use_naf_upsample = use_naf_upsample
         if naf_target_size is None:
-            self.naf_target_size = (128, 128)
+            self.naf_target_size = None if image_size is None else (128, 128)
         elif isinstance(naf_target_size, int):
             self.naf_target_size = (naf_target_size, naf_target_size)
         else:
@@ -465,7 +504,9 @@ class DinoV3ProjFeatureExtractor(nn.Module):
         
         # Get patch info
         self.patch_size = self.model.config.patch_size
-        self.patch_number = image_size // self.patch_size
+        self.patch_number = (
+            None if image_size is None else image_size // self.patch_size
+        )
         self.embed_dim = self.model.config.hidden_size
         
         # Projection grid for view-aligned features
@@ -542,6 +583,7 @@ class DinoV3ProjFeatureExtractor(nn.Module):
         transform_matrix: Optional[torch.Tensor] = None,
         grid_indices: Optional[torch.Tensor] = None,
         grid_resolution: Optional[int] = None,
+        image_window_size: Optional[Tuple[int, int]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Extract view-aligned features from the image.
@@ -555,6 +597,8 @@ class DinoV3ProjFeatureExtractor(nn.Module):
             grid_indices: Optional grid coordinates to project directly. See
                 ProjGrid.forward for accepted shapes.
             grid_resolution: Resolution associated with grid_indices.
+            image_window_size: Native square condition window as
+                ``(height, width)``. When omitted it is inferred from the input.
         
         Returns:
             Tuple of (global_features, proj_features):
@@ -568,14 +612,42 @@ class DinoV3ProjFeatureExtractor(nn.Module):
             assert image.ndim == 4, "Image tensor should be batched (B, C, H, W)"
         elif isinstance(image, list):
             assert all(isinstance(i, Image.Image) for i in image), "Image list should be list of PIL images"
-            image = [i.resize((self.image_size, self.image_size), Image.LANCZOS) for i in image]
+            if self.image_size is not None:
+                image = [
+                    i.resize((self.image_size, self.image_size), Image.LANCZOS)
+                    for i in image
+                ]
+            elif len({i.size for i in image}) != 1:
+                raise ValueError(
+                    "Native-size DINO inputs in one batch must share a window size"
+                )
             image = [np.array(i.convert('RGB')).astype(np.float32) / 255 for i in image]
             image = [torch.from_numpy(i).permute(2, 0, 1).float() for i in image]
-            image = torch.stack(image).cuda()
+            device = next(self.model.parameters()).device
+            image = torch.stack(image).to(device)
         else:
             raise ValueError(f"Unsupported type of image: {type(image)}")
         
         B = image.shape[0]
+        input_height, input_width = (int(value) for value in image.shape[-2:])
+        actual_window_size = (input_height, input_width)
+        if self.image_size is not None:
+            # Fixed-size mode is retained for callers outside this evaluation
+            # script; projection still uses relative positions after the resize.
+            image_window_size = actual_window_size
+        elif image_window_size is not None:
+            image_window_size = tuple(int(value) for value in image_window_size)
+            if image_window_size != actual_window_size:
+                raise ValueError(
+                    "Condition window metadata does not match the DINO input: "
+                    f"metadata={image_window_size}, tensor={actual_window_size}"
+                )
+        else:
+            image_window_size = actual_window_size
+        if image_window_size[0] != image_window_size[1]:
+            raise ValueError(
+                f"Native projection window must be square, got {image_window_size}"
+            )
         
         # Keep a copy of the unnormalized image for NAF guide
         if self.use_naf_upsample:
@@ -595,8 +667,18 @@ class DinoV3ProjFeatureExtractor(nn.Module):
             z_patchtokens = z[:, 1+num_reg:]  # [B, num_patches, D]
             
             # Reshape patch tokens to spatial grid: [B, h, w, D]
+            patch_height = input_height // self.patch_size
+            patch_width = input_width // self.patch_size
+            expected_patch_tokens = patch_height * patch_width
+            if z_patchtokens.shape[1] != expected_patch_tokens:
+                raise RuntimeError(
+                    "Unexpected DINO patch-token count: "
+                    f"got {z_patchtokens.shape[1]}, expected {expected_patch_tokens} "
+                    f"for input {input_width}x{input_height} and patch size "
+                    f"{self.patch_size}"
+                )
             z_patchtokens_spatial = z_patchtokens.reshape(
-                B, self.patch_number, self.patch_number, -1
+                B, patch_height, patch_width, -1
             )  # [B, h, w, D]
             
             if camera_angle_x is None or distance is None or mesh_scale is None:
@@ -611,6 +693,7 @@ class DinoV3ProjFeatureExtractor(nn.Module):
                 transform_matrix,
                 grid_indices=grid_indices,
                 grid_resolution=grid_resolution,
+                image_window_size=image_window_size,
             )  # [B, grid_res³, D]
             
             # --- High-resolution branch (NAF): upsample then sample ---
@@ -618,8 +701,9 @@ class DinoV3ProjFeatureExtractor(nn.Module):
                 self._load_naf()
                 # NAF expects: guide [B, 3, H, W], lr_features [B, C, h, w], target_size (H', W')
                 lr_features_bchw = z_patchtokens_spatial.permute(0, 3, 1, 2)  # [B, D, h, w]
+                naf_target_size = self.naf_target_size or image_window_size
                 hr_features = self.naf_model(
-                    image_for_naf, lr_features_bchw, self.naf_target_size
+                    image_for_naf, lr_features_bchw, naf_target_size
                 )  # [B, D, H', W']
                 
                 # Sample from high-res feature map using same projection coordinates
@@ -632,6 +716,7 @@ class DinoV3ProjFeatureExtractor(nn.Module):
                     BHWC=False,  # hr_features is [B, C, H', W']
                     grid_indices=grid_indices,
                     grid_resolution=grid_resolution,
+                    image_window_size=image_window_size,
                 )  # [B, grid_res³, D]
                 
                 # Concatenate lr and hr: [B, grid_res³, D*2]

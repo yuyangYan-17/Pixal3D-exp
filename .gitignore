@@ -5,8 +5,11 @@ __pycache__/
 *.so
 
 # Output files
-output.glb
-autotune_cache.json
+*.glb
+*.ply
+*.json
+*.csv
+*.log
 
 # Virtual environment
 venv/
@@ -24,3 +27,5 @@ env/
 Thumbs.db
 
 tmp
+
+outputs/

@@ -50,59 +50,6 @@ class FlowEulerSampler(Sampler):
         pred_x_0, pred_eps = self._v_to_xstart_eps(x_t=x_t, t=t, v=pred_v)
         return pred_x_0, pred_eps, pred_v
 
-    @staticmethod
-    def timestep_schedule(steps: int, rescale_t: float = 1.0) -> List[float]:
-        """Return the exact nonlinear time schedule used by Euler sampling."""
-        if steps <= 0:
-            raise ValueError(f"steps must be positive, got {steps}")
-        t_seq = np.linspace(1, 0, steps + 1)
-        t_seq = rescale_t * t_seq / (1 + (rescale_t - 1) * t_seq)
-        return [float(t) for t in t_seq]
-
-    @staticmethod
-    def _snapshot_features(value, device: Union[str, torch.device]):
-        """Detach one dense/sparse prediction as a plain feature tensor."""
-        features = value.feats if hasattr(value, "feats") else value
-        return features.detach().to(device=device, copy=True)
-
-    @staticmethod
-    def invert_euler_trajectory(
-        final_sample,
-        velocities: Sequence[torch.Tensor],
-        time_intervals: Sequence[float],
-        target_step: int,
-    ):
-        """Algebraically undo saved Euler updates back to ``target_step``.
-
-        Forward sampling uses ``x_next = x - (t - t_next) * velocity``.
-        Consequently no model call (and no DDIM inversion) is needed here.
-        ``target_step=0`` reconstructs the initial noise and
-        ``target_step=len(velocities)`` returns the final sample.
-        """
-        if len(velocities) != len(time_intervals):
-            raise ValueError(
-                "velocities and time_intervals must have identical lengths"
-            )
-        if not 0 <= target_step <= len(velocities):
-            raise ValueError(
-                f"target_step must be in [0, {len(velocities)}], "
-                f"got {target_step}"
-            )
-
-        is_sparse = hasattr(final_sample, "feats")
-        current = (
-            final_sample.feats.detach().clone()
-            if is_sparse
-            else final_sample.detach().clone()
-        )
-        for step_index in range(len(velocities) - 1, target_step - 1, -1):
-            velocity = velocities[step_index].to(
-                device=current.device,
-                dtype=current.dtype,
-            )
-            current = current + float(time_intervals[step_index]) * velocity
-        return final_sample.replace(current) if is_sparse else current
-
     @torch.no_grad()
     def sample_once(
         self,
@@ -131,12 +78,7 @@ class FlowEulerSampler(Sampler):
         """
         pred_x_0, pred_eps, pred_v = self._get_model_prediction(model, x_t, t, cond, **kwargs)
         pred_x_prev = x_t - (t - t_prev) * pred_v
-        return edict({
-            "pred_x_prev": pred_x_prev,
-            "pred_x_0": pred_x_0,
-            "pred_v": pred_v,
-            "time_interval": float(t - t_prev),
-        })
+        return edict({"pred_x_prev": pred_x_prev, "pred_x_0": pred_x_0})
 
     @torch.no_grad()
     def sample(
@@ -148,9 +90,6 @@ class FlowEulerSampler(Sampler):
         rescale_t: float = 1.0,
         verbose: bool = True,
         tqdm_desc: str = "Sampling",
-        record_trajectory: bool = False,
-        trajectory_device: Union[str, torch.device] = "cpu",
-        return_model_history: bool = True,
         **kwargs
     ):
         """
@@ -173,38 +112,16 @@ class FlowEulerSampler(Sampler):
             - 'pred_x_0': a list of prediction of x_0.
         """
         sample = noise
-        t_seq = self.timestep_schedule(steps, rescale_t)
+        t_seq = np.linspace(1, 0, steps + 1)
+        t_seq = rescale_t * t_seq / (1 + (rescale_t - 1) * t_seq)
+        t_seq = t_seq.tolist()
         t_pairs = list((t_seq[i], t_seq[i + 1]) for i in range(steps))
-        ret = edict({
-            "samples": None,
-            "pred_x_t": [],
-            "pred_x_0": [],
-            "trajectory": None,
-        })
-        if record_trajectory:
-            ret.trajectory = edict({
-                "times": list(t_seq),
-                "time_intervals": [
-                    float(t - t_prev) for t, t_prev in t_pairs
-                ],
-                "states": [
-                    self._snapshot_features(sample, trajectory_device)
-                ],
-                "velocities": [],
-            })
+        ret = edict({"samples": None, "pred_x_t": [], "pred_x_0": []})
         for t, t_prev in tqdm(t_pairs, desc=tqdm_desc, disable=not verbose):
             out = self.sample_once(model, sample, t, t_prev, cond, **kwargs)
             sample = out.pred_x_prev
-            if return_model_history:
-                ret.pred_x_t.append(out.pred_x_prev)
-                ret.pred_x_0.append(out.pred_x_0)
-            if record_trajectory:
-                ret.trajectory.velocities.append(
-                    self._snapshot_features(out.pred_v, trajectory_device)
-                )
-                ret.trajectory.states.append(
-                    self._snapshot_features(sample, trajectory_device)
-                )
+            ret.pred_x_t.append(out.pred_x_prev)
+            ret.pred_x_0.append(out.pred_x_0)
         ret.samples = sample
         return ret
 

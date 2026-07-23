@@ -20,31 +20,31 @@ import o_voxel
 # Constants & Defaults
 # ============================================================================
 
-MOGE_MODEL_NAME = "Ruicheng/moge-2-vitl"
-MODEL_PATH = "TencentARC/Pixal3D"
+MOGE_MODEL_NAME = "/home/nvme04/yyyan/download/model/moge-2-vitl/model.pt"
+MODEL_PATH = "/home/nvme04/yyyan/download/model/Pixal3D"
 
 IMAGE_COND_CONFIGS = {
     "ss": {
-        "model_name": "camenduru/dinov3-vitl16-pretrain-lvd1689m",
+        "model_name": "/home/nvme04/yyyan/download/model/dinov3-vitl16-pretrain-lvd1689m/facebook/dinov3-vitl16-pretrain-lvd1689m",
         "image_size": 512,
         "grid_resolution": 16,
     },
     "shape_512": {
-        "model_name": "camenduru/dinov3-vitl16-pretrain-lvd1689m",
+        "model_name": "/home/nvme04/yyyan/download/model/dinov3-vitl16-pretrain-lvd1689m/facebook/dinov3-vitl16-pretrain-lvd1689m",
         "image_size": 512,
         "grid_resolution": 32,
         "use_naf_upsample": True,
         "naf_target_size": 512,
     },
     "shape_1024": {
-        "model_name": "camenduru/dinov3-vitl16-pretrain-lvd1689m",
+        "model_name": "/home/nvme04/yyyan/download/model/dinov3-vitl16-pretrain-lvd1689m/facebook/dinov3-vitl16-pretrain-lvd1689m",
         "image_size": 1024,
         "grid_resolution": 64,
         "use_naf_upsample": True,
         "naf_target_size": 512,
     },
     "tex_1024": {
-        "model_name": "camenduru/dinov3-vitl16-pretrain-lvd1689m",
+        "model_name": "/home/nvme04/yyyan/download/model/dinov3-vitl16-pretrain-lvd1689m/facebook/dinov3-vitl16-pretrain-lvd1689m",
         "image_size": 1024,
         "grid_resolution": 64,
         "use_naf_upsample": True,
@@ -257,15 +257,23 @@ def run_inference(
     )
 
     mesh = mesh_list[0]
+    print(
+        f"[Decoder mesh] "
+        f"vertices={mesh.vertices.shape[0]:,}, "
+        f"faces={mesh.faces.shape[0]:,}"
+    )
 
     # Extract GLB
     print("[Inference] Extracting GLB...")
     glb = o_voxel.postprocess.to_glb(
-        vertices=mesh.vertices, faces=mesh.faces, attr_volume=mesh.attrs,
-        coords=mesh.coords, attr_layout=pipeline.pbr_attr_layout,
+        vertices=mesh.vertices, 
+        faces=mesh.faces, 
+        attr_volume=mesh.attrs,
+        coords=mesh.coords, 
+        attr_layout=pipeline.pbr_attr_layout,
         grid_size=res, aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
-        decimation_target=1000000, texture_size=4096,
-        remesh=True, remesh_band=1, remesh_project=0, use_tqdm=True,
+        decimation_target=1_000_000, texture_size=4096,
+        remesh=False, use_tqdm=True,verbose=False
     )
 
     # Apply rotation
@@ -279,14 +287,14 @@ def run_inference(
 
     # Export
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
-    glb.export(output_path, extension_webp=True)
+    glb.export(output_path, extension_webp=False)
     print(f"[Done] GLB saved to: {output_path}")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Pixal3D Inference: Image to GLB")
-    parser.add_argument("--image", type=str, required=True, help="Path to input image")
-    parser.add_argument("--output", type=str, default="./output.glb", help="Output GLB file path")
+    parser.add_argument("--image", type=str, default="/home/nvme04/yyyan/Pixal3D/assets/choose/0_img.png", help="Path to input image")
+    parser.add_argument("--output", type=str, default="./output_1024_8192.glb", help="Output GLB file path")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--fov", type=float, default=-1.0,
                         help="Manual camera FOV in radians (e.g. 0.2). "
@@ -296,7 +304,7 @@ if __name__ == "__main__":
     parser.add_argument("--low_vram", action="store_true",
                         help="Enable low-VRAM mode: models stay on CPU and are loaded to GPU on-demand per stage. "
                              "Reduces peak VRAM from ~18GB to ~10-12GB at the cost of slower inference.")
-    parser.add_argument("--resolution", type=int, default=-1,
+    parser.add_argument("--resolution", type=int, default=1024,
                         help="Pipeline resolution (1024 or 1536). Default: 1024 if --low_vram, else 1536.")
 
     args = parser.parse_args()
@@ -309,4 +317,5 @@ if __name__ == "__main__":
         model_path=args.model_path,
         low_vram=args.low_vram,
         resolution=args.resolution,
+        max_num_tokens=1_000_000
     )

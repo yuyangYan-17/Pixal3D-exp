@@ -176,6 +176,19 @@ class SparseResBlockUpsample3d(nn.Module):
             return self._forward(x)
 
 
+def print_gpu_mem(tag=""):
+    if torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated() / 1024**3
+        reserved = torch.cuda.memory_reserved() / 1024**3
+        max_allocated = torch.cuda.max_memory_allocated() / 1024**3
+        
+        print(
+            f"[GPU MEM] {tag} | "
+            f"allocated={allocated:.2f} GB | "
+            f"reserved={reserved:.2f} GB | "
+            f"max_allocated={max_allocated:.2f} GB"
+        )
+
 class SparseResBlockS2C3d(nn.Module):
     def __init__(
         self,
@@ -245,8 +258,10 @@ class SparseResBlockC2S3d(nn.Module):
         h = self.conv1(h)
         subdiv_binarized = subdiv.replace(subdiv.feats > 0) if subdiv is not None else None
         h = self.updown(h, subdiv_binarized)
-        x = self.updown(x, subdiv_binarized)
+        x = self.updown(x, subdiv_binarized)     
+        print_gpu_mem("After updown")
         h = h.replace(self.norm2(h.feats))
+        print_gpu_mem("After norm2")
         h = h.replace(F.silu(h.feats))
         h = self.conv2(h)
         h = h + self.skip_connection(x)
