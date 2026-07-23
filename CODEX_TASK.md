@@ -1,292 +1,350 @@
-# CODEX_TASK.md
+# CODEX TASK：基于高分辨率图像分块的 Texture Flow
 
-## 任务目标
+在现有 `pixal3d_directory_texture_eval.py`、`pixal3d/pipelines/pixal3d_image_to_3d.py`、图像投影模块及 sampler 代码基础上实现。只修改 texture 阶段，shape 生成流程暂时保持不变。
 
-在当前 Pixal3D 2048 推理实验代码基础上，继续进行 **training-free 高分辨率纹理增强实验**。
+## 一、修改前备份
 
-核心目标：
+开始修改前必须备份当前代码，不允许覆盖已有备份。
 
-- 主要优化最终输入视角渲染的 **PSNR**，目标是明显超过当前约 17 dB 的水平；
-- 同时记录 SSIM、LPIPS、运行时间、显存、mesh/texture 规模等辅助指标；
-- **texture 是主要优化对象，shape 只作为几何条件和辅助分支**；
-- 不使用法向量相关指标作为本阶段主要判断依据；
-- 使用 GPU 4 运行实验：
-  ```bash
-  CUDA_VISIBLE_DEVICES=4 HF_HUB_OFFLINE=1
-  ```
+1. 记录：
 
-不能假设一定能达到目标。每轮实验必须根据真实结果判断，并自主调整后续路线。
+   * `git status --short`
+   * 当前 commit hash
+   * `git diff`
+2. 对所有准备修改的文件创建带时间戳的副本，例如：
 
-仅供参考，生成当前版本的代码的提示词“修改pixal3d_directory_texture_eval.py及其相关文件
+   * `pixal3d_directory_texture_eval.py.bak_YYYYMMDD_before_hr_image_tile_texflow`
+   * `pixal3d_image_to_3d.py.bak_YYYYMMDD_before_hr_image_tile_texflow`
+3. 将备份文件列表和当前 commit 写入：
 
-先只考虑增强 2048 分辨率：按原流程完成 512 坐标系候选 `hr_coords`，将其重新量化到 128-grid，得到对应 2048 分辨率的固定稀疏坐标。然后在这些坐标上初始化 (N\times32) 随机特征，按照 Pixal3D 原始的 12 步、非线性时间映射、CFG interval 和 guidance rescale 完整执行一次全局 flow，得到一份对应 2048 高分辨率 base latent，同时保存全部时间状态、每一步实际用于 Euler 更新的最终 velocity 以及对应时间间隔。由于这些 velocity 已经包含 conditional/unconditional CFG、时间区间控制和 rescale，因此后续不需要 DDIM inversion，也不需要重新调用模型做反向 ODE 积分，而是可以利用保存的 velocity 对 Euler 更新进行代数逆运算，精确回退到选定的中间时间点；也可以直接读取当时保存的全局中间状态。获得统一的全局中间 latent 后，再依据三维坐标将其划分为 27 个相互重叠的 (64^3) 空间 patch（如果全空就跳过），例如 patch stride 取 32，使每个 patch 的空间尺度接近模型在 1024 分辨率下见过的 64-grid 输入，同时保持原始全局坐标、token 顺序和投影条件不变。第二遍重采样时，不让各 patch 独立完成全部 flow 后再拼接，而是在每一个 flow 时间步中，让所有 patch 分别计算 conditional 和 unconditional velocity prediction；前期先不加入小波，只验证 patch-wise prediction 经过重叠区域加权融合后是否能够近似原始全局 flow。考虑到原始pixal3d 的flow自带cfg与非线性时间映射，所以要patch单独推理时候也要对应上。把每一步的合并后的速度与之前保存的速度计算一个相似度。修改好后我来跑代码。
+   * `HR_IMAGE_TILE_BACKUP.md`
+4. 不执行 `git reset`、`git checkout -- .` 等可能丢失现有修改的操作。
 
-验证通过后，再将每个 patch 的 velocity 按三维坐标排列到空间网格上进行 3D 小波或其他空间低高频分解，而不是直接对无空间顺序的 (N\times32) feature 行序列做变换；低频部分一直保留 conditional prediction，以维持原有几何结构，高频部分使用 conditional 和 unconditional prediction 构造增强后的 CFG，从而主要修改局部高频几何特征。所有 patch 的引导 velocity 在重叠区域加权融合成唯一的全局 velocity，每个时间步只对全局 latent 更新一次，随后将更新后的 feature 与第一遍全局 flow 在同一时间点保存的 trajectory feature 做逐步衰减的 skip residual 融合，以限制 patch 上下文缺失造成的结构漂移。完成剩余 flow 步骤后，得到新的 128-grid 稀疏 shape latent，其坐标集合及 token 对齐关系始终不变，只更新对应的 (N\times32) feature，最后进行反归一化并使用设置为 2048 分辨率的 shape decoder 解码。
-”
-
----
-
-## 当前代码与已有路线
-
-当前 2048 shape 实验已经完成以下能力：
-
-1. 从 512 坐标候选重新量化到固定 128-grid。
-2. 在固定坐标上运行完整 12 步 global shape flow，并保存：
-   - 13 个 trajectory states；
-   - 12 个实际 Euler velocity；
-   - 非线性时间表和 interval。
-3. 从指定中间 step 恢复状态。
-4. 将 128-grid 划分成 27 个重叠 `64^3` local-coordinate patch。
-5. 每个时间步分别计算 patch velocity，tent merge 后只更新一次 global latent。
-6. 已实现 shape velocity 的一级 3D Haar frequency CFG：
-   - `LLL` 使用 conditional prediction；
-   - 其余七个高频子带使用：
-     \[
-     v_u+s_h(v_c-v_u)
-     \]
-7. 当前没有启用 HiWave skip residual。
-8. 配置、trace、render、postprocess cache 已按 experiment tag 隔离。
-9. Haar DWT/iDWT 和真实 sparse patch round-trip 已通过数值检查，wavelet 路径使用 FP32。
-
----
-
-## 已有实验结果
-
-同一输入、seed 42、studio light：
-
-| Shape HR 后六步配置 | PSNR | SSIM | LPIPS |
-|---|---:|---:|---:|
-| local original CFG | 17.2825 | 0.667071 | 0.218230 |
-| Haar：low=1, high=2 | 17.3507 | 0.668342 | 0.219087 |
-| conditional-only：low=1, high=1 | 17.3659 | 0.669138 | 0.219073 |
-
-初步结论：
-
-- shape-only Haar 路线工程实现正确；
-- 当前提升很小；
-- `high=1` 略优于 `high=2`，说明现有改善更可能来自削弱/取消原始强 CFG，而不是高频增强本身；
-- 继续只在 shape 上调参，预计难以把 PSNR 显著推高；
-- 后续应把主要精力转向 **texture flow、texture condition 和纹理生成路径**。
-
----
-
-## 建议的本轮主要任务（允许自助决策）
-
-### 1. 将 local patch / frequency guidance 扩展到 texture flow
-
-参考已经验证的 shape 实现，为 2048 texture flow 增加独立、可关闭的实验路径。
-
-基本要求：
-
-- texture 先完整运行原始 12 步 global flow并保存 trajectory；
-- 支持从中间 step 恢复；
-- 按同一固定 sparse coordinates 划分 27 个重叠 `64^3` local patch；
-- 每一步对所有 patch 预测 velocity，重叠区域融合后只更新一次 global texture latent；
-- texture patch 必须同步切片并对齐：
-  - texture latent；
-  - image `proj` condition；
-  - negative image condition；
-  - shape `concat_cond`；
-- conditional 和 unconditional texture 分支必须保留同一份 shape condition，只改变图像条件；
-- 支持 texture 的：
-  - original/local baseline；
-  - conditional-only；
-  - uniform CFG；
-  - 3D Haar frequency CFG；
-- shape 和 texture 的所有实验开关、strength、interval、rescale、start step 必须独立。
-
-不要把 texture latent channel 解释成最终 RGB/PBR 通道，也不要按 latent channel 人为分组。小波仍然只沿三维空间轴处理。
-
-### 2. 优先研究 texture，而不是继续堆叠 shape 复杂度
-
-初始阶段建议固定一个稳定的 shape 配置，例如：
-
-- shape local conditional-only；或
-- 当前最优的 shape 配置。
-
-然后依次研究：
-
-1. 原始 texture baseline；
-2. texture local patch baseline；
-3. texture conditional-only；
-4. texture uniform weak CFG；
-5. texture Haar：低频 conditional，高频弱 CFG；
-6. texture guidance interval / start step；
-7. shape + texture 联合配置。
-
-HiWave skip residual、`sym4`、更复杂边界处理可以根据实验结果再决定，不要求立即实现。
-
----
-
-## 自主实验与迭代要求
-
-Codex 可以根据实验结果自行决定下一轮参数和代码修改，但必须遵循：
-
-1. 先建立能解释因果的对照，不要同时修改过多变量。
-2. 单 seed smoke test 通过后，再扩大到多 seed。
-3. 不得覆盖已有 baseline；每个配置使用唯一 experiment tag 和独立输出目录。
-4. 任何新路径必须保留关闭开关，关闭时不得改变原始结果。
-5. 发现实现问题时先修复并做回归测试，再继续调参。
-6. 优先寻找能明显提高 PSNR 的 texture 侧方案，不要长期停留在只能带来 `0.01~0.08 dB` 的 shape 微调。
-7. 可以根据结果自主尝试：
-   - texture patch start step；
-   - original interval / all remaining；
-   - weak CFG strength；
-   - low/high 频率 strength；
-   - guidance rescale；
-   - texture trajectory residual；
-   - shape/texture 联合配置；
-   - 其他合理的 training-free 纹理增强或条件融合方式。
-8. 不要为了追求 PSNR 静默改变输入图像、相机、metric reference、render pipeline 或 metric 实现。任何评价协议变化必须单独记录并重新建立 baseline。
-
----
-
-## 每次实验必须记录
-
-在仓库根目录维护：
+## 二、目标流程
 
 ```text
-EXPERIMENT_LOG.md
+在 # ---- Stage 4: Texture (proj) ---- 之后：
+高分辨率原图(处理完前景与边缘扩展)
+    ├── resize 到正常 1024 输入
+    │       └── 完整执行一次原始 texture flow
+    │               └── 保存 13 个 latent states、
+    │                   12 个最终 Euler velocities 和时间间隔
+    │
+    └── 按图像空间切成多个 1024×1024 tile
+            └── 每个有效 tile 独立：
+                    重新运行 DINO
+                    重新运行 NAF
+                    三维找二维粗糙图找二维精细图，找到属于该 tile 的 shape_slat.coords
+                    构造该 tile 自己的 cond_tex
+                    在当前时间 t 上调用 texture flow
+                    得到该 tile 的最终 CFG velocity
 ```
 
-每次真实运行后追加一条，不得只记录成功实验。
-
-建议格式：
-
-```markdown
-## EXP-XXX：实验名
-
-- 日期：
-- Git commit / 代码版本：
-- GPU：4
-- 目标 / 假设：
-- 相对上一轮改动：
-- 完整命令：
-- 输入：
-- seeds：
-- experiment tag：
-- 输出目录：
-- 是否通过数值检查：
-- 是否 OOM / 异常：
-- PSNR：
-- SSIM：
-- LPIPS：
-- pipeline time：
-- texture/mesh 规模：
-- 关键 velocity / wavelet diagnostics：
-- 与 baseline 的差值：
-- 结果解释：
-- 当前结论：
-- 下一轮决策：
-```
-
-同时维护一个便于排序的：
+增强采样使用：
 
 ```text
-EXPERIMENT_RESULTS.csv
+前 6 步：原始全局 texture flow
+后 6 步：图像 tile 独立预测 velocity
+         → 重叠区域加权融合
+         → 得到唯一 global velocity
+         → 每个时间步只更新一次完整 texture latent
 ```
 
-至少包含：
+保存的 `global_state` 的flow相关数值，局部flow时候直接恢复指定时间点
+
+## 三、保留高分辨率原图
+
+当前预处理可能先把图像缩小。修改数据流，同时保留：
+
+* `global_image`：按照原预处理流程得到的正方形图像，供正常 1024 texture condition 使用；
+* `hr_image`：使用完全相同的前景 bbox、扩边、padding 和正方形坐标系，但保留原始高分辨率；
+* `foreground_mask_hr`：与 HR 正方形图严格对齐的 alpha/前景 mask；
+* 从 global square 到 HR square 的精确线性坐标变换。
+
+不能让 global 和 HR 分支分别重新抠图或重新计算 bbox。
+
+## 四、图像分块
+
+第一版使用无重叠规则分块：
 
 ```text
-experiment_id
-date
-commit
-image
-seed
-shape_mode
-texture_mode
-shape_start_step
-texture_start_step
-shape_strength
-texture_strength
-shape_interval
-texture_interval
-psnr
-ssim
-lpips
-status
-output_dir
-notes
+tile_size = 1024
+tile_stride = 1024
 ```
 
-对于多 seed 实验，记录每个 seed 的单独结果，并额外记录 mean/std。
+例如 4096×4096 图像得到 4×4 共 16 个 tile。
 
----
+根据 `foreground_mask_hr` 判断 tile 是否有效，不要根据 RGB 是否为黑色判断。纯背景 tile 直接跳过。
 
-## 当前基线
+保存每个 tile 的：
 
-首要对照至少保留：
+* tile 编号；
+* HR 图上的 `(x0, y0, x1, y1)`；
+* 前景占比；
+* 是否启用；
+* tile 图像；
+* 对应的 sparse token 数量。
+
+接口应允许以后修改 tile size、stride 和 overlap。
+
+## 五、从 shape_slat.coords 分配 token
+
+texture flow 的全局稀疏坐标始终使用：
+
+```python
+shape_slat.coords
+```
+
+坐标集合和全局 token 顺序不可改变。
+
+对全部 `shape_slat.coords` 使用 Pixal3D 当前相同的相机参数和坐标变换，投影到 global square 的二维归一化坐标，再线性映射到 HR square。
+
+对每个 tile，找到二维投影落入其 crop 范围且前景 mask 有效的 token，得到：
+
+```python
+tile_global_indices
+tile_coords = shape_slat.coords[tile_global_indices]
+```
+
+禁止根据二维像素反向生成新体素；只能从现有三维 shape_slat.coords 投影到二维后进行筛选。
+
+保存调试可视化：
+
+* 所有 coords 在 global image 上的投影；
+* 在 HR image 上的投影；
+* tile 边界；
+* 不同 tile 对应 token 的颜色；
+* 每个 tile 的 token 数量。
+
+## 六、每个 tile 独立重跑图像条件
+
+每个有效 tile 都必须独立调用 texture 图像条件模型，重新执行：
+
+* DINOv3；
+* NAF；
+* pixel-aligned projection。
+
+不能先提取整图 feature map 后直接裁 feature，也不能把局部 feature 预先写回一个全局 `cond_tex`。
+
+实现 tile-aware 的 `get_proj_cond_shape`，例如：
+
+```python
+tile_cond_tex = self.get_proj_cond_shape(
+    image_cond_model=self.image_cond_model_tex_1024,
+    image=[tile_image],
+    coords=tile_coords,
+    camera_angle_x=camera_angle_x,
+    distance=distance,
+    mesh_scale=mesh_scale,
+    grid_resolution_override=...,
+    projection_crop_box=tile_box_normalized,
+)
+```
+
+关键要求：
+
+现有三维点首先按全局相机投影到完整正方形图像。随后必须把完整图上的二维坐标变换为 tile 内部坐标，再从该 tile 的 DINO/NAF feature map 采样。
+
+不能把 crop 当成新的完整相机图像，然后仍使用原始投影坐标，否则三维 token 和局部图像内容会错位。
+
+保持该 tile 的：
+
+* `cond["global"]`；
+* `cond["proj"]`；
+* `neg_cond["global"]`；
+* `neg_cond["proj"]`
+
+均与 `tile_coords` 和 tile latent 的 token 顺序严格一致。
+
+第一版沿用原始 zero negative condition 和原始 texture CFG 语义。
+
+## 七、全局基线 trajectory
+
+先使用正常 resize 到 1024 的完整图像构造原始：
+
+```python
+global_cond_tex = self.get_proj_cond_shape(...)
+```
+
+在全部 `shape_slat.coords` 上完整执行一次原始 12-step texture flow，并保存：
+
+* `states[0:13]`；
+* `velocities[0:12]`；
+* 原始和非线性映射后的时间；
+* 每步 Euler interval；
+* 每步最终实际用于更新的 velocity；
+* CFG strength、interval、rescale 等参数。
+
+这里的 velocity 必须是完成 conditional/unconditional CFG、guidance interval 和 guidance rescale 后的最终 velocity。
+
+保存全局结果作为 baseline，并确保关闭新功能时输出与当前代码一致。
+
+## 八、后六步 tile texture flow
+
+从：
+
+```python
+x_global = saved_global_states[6]
+```
+
+开始执行步骤 6～11。
+
+每个时间步 `t_i`：
+
+1. 遍历所有有效 tile；
+2. 使用 `tile_global_indices` 从当前完整 texture latent 中提取 tile latent：
+
+   ```python
+   x_tile = x_global[tile_global_indices]
+   ```
+3. 同步切出与 texture flow 对齐的 shape condition；
+4. 使用该 tile 自己重新运行 DINO/NAF 得到的 `tile_cond_tex`；
+5. 使用与原始 Pixal3D 完全相同的：
+
+   * 非线性时间映射；
+   * conditional/unconditional forward；
+   * CFG interval；
+   * guidance strength；
+   * guidance rescale；
+   * velocity/x0 转换；
+6. 得到该 tile 在当前 `t_i` 上最终用于 Euler 更新的：
+
+   ```python
+   v_tile
+   ```
+7. 使用全局索引把 `v_tile` scatter 回完整 token 空间；
+8. 多个 tile 覆盖同一 token 时进行加权平均；
+9. 得到唯一的：
+
+   ```python
+   v_merged_global
+   ```
+10. 对完整 texture latent 只执行一次：
+
+```python
+x_global = x_global - dt_i * v_merged_global
+```
+
+禁止让每个 tile 独立完成后六步以后再拼 latent。
+
+禁止修改 `shape_slat.coords`、全局 token 数量或 token 顺序。
+
+## 九、未覆盖 token 的处理
+
+代码逻辑是三维查二维，二维特征图是稠密的，肯定有对应点，查不到说明代码错了，报错中断。
+
+## 十、重叠融合
+
+即使第一版 stride 等于 tile size，也把融合逻辑写成支持重叠 tile。
+
+每个 tile 使用二维中心权重或 separable tent weight。对 token 的融合为：
+
+```python
+velocity_sum[index] += weight * v_tile
+weight_sum[index] += weight
+```
+
+最终：
+
+```python
+v_local = velocity_sum / weight_sum.clamp_min(eps)
+```
+
+对于 `weight_sum == 0` 的 token，使用指定的 global fallback velocity。
+
+## 十一、诊断与保存
+
+每个后半程步骤保存：
+
+* 当前 step、原始 t、映射后的 t 和 dt；
+* 有效 tile 数；
+* 各 tile token 数；
+* 被局部 tile 覆盖的全局 token 比例；
+* overlap token 比例；
+* `v_merged_global` 与保存的 global baseline velocity：
+
+  * cosine similarity；
+  * mean token cosine；
+  * MSE；
+  * relative L2；
+  * norm ratio；
+* 每个 tile velocity 的 norm；
+* 未覆盖 token 数；
+* global fallback 模式；
+* 峰值显存和运行时间。
+
+保存最终：
+
+* 全局 baseline texture latent；
+* tile-enhanced texture latent；
+* flow trace；
+* tile metadata；
+* projection 可视化；
+* 完整运行配置。
+
+将关键信息写入当前实验日志格式，但不要伪造实验指标；代码修改完成后只记录“待用户运行”。
+
+## 十二、CLI
+
+至少增加：
 
 ```text
-original_cfg_step6
-haar_s1_original_interval_rescale_off_step6
-haar_s2_original_interval_rescale_off_step6
+--hr-image-tile-texture-flow
+--hr-image-tile-size 1024
+--hr-image-tile-stride 1024
+--hr-image-tile-start-step 6
+--hr-image-tile-min-foreground-ratio
+--hr-image-tile-fallback saved_global|current_global
+--hr-image-tile-weight tent|uniform
+--hr-image-tile-save-debug
 ```
 
-当前 seed 42 的参考值：
+默认关闭新功能。关闭时必须完全走当前 pipeline。
+
+开始 step 的定义要清楚：
 
 ```text
-Original local CFG:
-PSNR  = 17.2825
-SSIM  = 0.667071
-LPIPS = 0.218230
-
-Shape conditional-only:
-PSNR  = 17.3659
-SSIM  = 0.669138
-LPIPS = 0.219073
+start_step=6 表示 states[6] 作为起点，
+执行 velocity steps 6,7,8,9,10,11。
 ```
 
-后续所有“提升”必须明确说明相对于哪个 baseline。
+## 十三、实现约束
 
----
+* 暂时不要修改 sparse structure flow；
+* 暂时不要修改 shape LR 或 shape HR flow；
+* 暂时不加入 Haar、HiWave frequency CFG 或 skip residual；
+* 暂时不训练模型；
+* 不改变模型权重和通道维度；
+* 不改变 texture decoder；
+* 不改变相机估计、渲染和指标计算；
+* tile 图像必须真正重新运行 DINO 和 NAF；
+* 所有 image condition、texture latent、shape condition、coords 的 token 顺序必须显式断言一致；
+* 空 tile 必须跳过；
+* 尽量批量处理 tile，但优先保证语义正确和显存安全；
+* 不删除或破坏当前已有的 shape/texture patch-flow 实验代码。
 
-## 运行与安全要求
+## 十四、完成标准
 
-默认命令前缀：
+修改完成后先不要运行完整生成实验，只进行：
 
-```bash
-CUDA_VISIBLE_DEVICES=4 HF_HUB_OFFLINE=1 \
-python pixal3d_directory_texture_eval.py ...
-```
+1. Python 语法检查；
+2. import 检查；
+3. 小规模 synthetic coordinate 测试；
+4. global-to-HR-to-tile 坐标映射 round-trip 测试；
+5. scatter/merge token 顺序测试；
+6. overlap velocity 融合测试；
+7. 关闭功能时配置回归检查。
 
-要求：
+最后给出：
 
-- 首次新代码路径使用单图、单 seed、`--fail-fast`；
-- 先确认 trace、experiment tag、cache、render 和 metrics 对应同一配置；
-- 检查 NaN、Inf、round-trip error、token/coords 对齐和 OOM；
-- 每轮修改前保留备份或提交 Git；
-- 不删除已有实验结果；
-- 大规模实验前先估算磁盘占用；
-- 失败实验也必须写入日志，并说明失败阶段。
+* 修改文件列表；
+* 备份文件列表；
+* 主要数据流；
+* 新增 CLI；
+* 用户应运行的完整命令；
+* 预计显存热点；
+* 尚未验证的风险。
 
----
+最重要的验证目标是：
 
-## 最终交付
-
-持续迭代直到出现以下任一情况：
-
-1. 找到明显优于当前约 17 dB baseline 的稳定 texture/shape 联合配置；
-2. 多轮合理尝试后确认当前路线收益有限，并给出证据和下一条建议路线；
-3. 出现必须由用户决定的重大方法分叉。
-
-每个阶段结束时更新：
-
-```text
-EXPERIMENT_LOG.md
-EXPERIMENT_RESULTS.csv
-BEST_CONFIG.md
-```
-
-`BEST_CONFIG.md` 应包含：
-
-- 当前最佳配置；
-- 完整执行命令；
-- 单 seed 和多 seed 结果；
-- 相对 baseline 提升；
-- 主要方法解释；
-- 已知问题；
-- 下一步建议。
-
-执行过程中自行做实验、读取日志、比较结果、修改代码并继续迭代，不必在每个小步骤等待用户确认。
+> 高分辨率图像 tile 必须分别重新运行 DINO、NAF 和 texture-flow model；最终融合的是每个 tile 在相同时间步预测出的 velocity，而不是预先融合图像特征。

@@ -1067,7 +1067,6 @@ class Pixal3DGenerator:
         postprocess_cache_dir: Optional[Path] = None,
         shape_flow_trace_path: Optional[Path] = None,
         texture_flow_trace_path: Optional[Path] = None,
-        hr_texture_context: Optional[Mapping[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Generate one textured model and write only a temporary Blender asset.
 
@@ -1123,31 +1122,6 @@ class Pixal3DGenerator:
                 self.args.texture_skip_residual_mode
             ),
             flow_experiment_tag=str(self.args.experiment_tag),
-            hr_texture_context=hr_texture_context,
-            hr_image_tile_texture_flow=bool(
-                self.args.hr_image_tile_texture_flow
-            ),
-            hr_image_tile_size=int(self.args.hr_image_tile_size),
-            hr_image_tile_stride=int(self.args.hr_image_tile_stride),
-            hr_image_tile_start_step=int(
-                self.args.hr_image_tile_start_step
-            ),
-            hr_image_tile_min_foreground_ratio=float(
-                self.args.hr_image_tile_min_foreground_ratio
-            ),
-            hr_image_tile_fallback=str(
-                self.args.hr_image_tile_fallback
-            ),
-            hr_image_tile_weight=str(self.args.hr_image_tile_weight),
-            hr_image_tile_save_debug=bool(
-                self.args.hr_image_tile_save_debug
-            ),
-            hr_image_tile_debug_dir=(
-                Path(texture_flow_trace_path).parent
-                / "hr_image_tile_debug"
-                if texture_flow_trace_path is not None
-                else None
-            ),
         )
         if torch.cuda.is_available():
             torch.cuda.synchronize()
@@ -1195,26 +1169,15 @@ class Pixal3DGenerator:
                 "patch_coordinate_mode"
             )
             expected_texture_coordinate_mode = (
-                "image_tile_global_subset"
-                if self.args.hr_image_tile_texture_flow
-                else (
-                    None
-                    if self.args.texture_mode == "global_original"
-                    else "local"
-                )
+                None if self.args.texture_mode == "global_original" else "local"
             )
             if texture_coordinate_mode != expected_texture_coordinate_mode:
                 raise RuntimeError(
                     "2048 texture flow reported an unexpected coordinate mode"
                 )
-            expected_texture_guidance_mode = (
-                "hr_image_tile_velocity_flow"
-                if self.args.hr_image_tile_texture_flow
-                else self.args.texture_mode
-            )
             if (
                 texture_flow_diagnostics.get("patch_guidance_mode")
-                != expected_texture_guidance_mode
+                != self.args.texture_mode
             ):
                 raise RuntimeError(
                     "2048 texture flow reported an unexpected guidance mode"
@@ -1227,27 +1190,6 @@ class Pixal3DGenerator:
                 raise RuntimeError(
                     "Texture CFG branches did not share shape concat_cond"
                 )
-            if self.args.hr_image_tile_texture_flow:
-                if not texture_flow_diagnostics.get(
-                    "dino_per_active_tile"
-                ):
-                    raise RuntimeError(
-                        "HR image tiles did not independently rerun DINOv3"
-                    )
-                if not texture_flow_diagnostics.get(
-                    "naf_per_active_tile"
-                ):
-                    raise RuntimeError(
-                        "HR image tiles did not independently rerun NAF"
-                    )
-                if texture_flow_diagnostics.get("feature_fusion"):
-                    raise RuntimeError(
-                        "HR image-tile path unexpectedly fused image features"
-                    )
-                if not texture_flow_diagnostics.get("velocity_fusion"):
-                    raise RuntimeError(
-                        "HR image-tile path did not fuse per-step velocities"
-                    )
 
         # Save scalar metadata before deleting the large generation objects.
         decoder_vertices = int(mesh.vertices.shape[0])
@@ -1592,33 +1534,6 @@ class Pixal3DGenerator:
             "shape_flow_diagnostics": shape_flow_diagnostics,
             "texture_flow_diagnostics": texture_flow_diagnostics,
         }
-        if self.args.hr_image_tile_texture_flow:
-            metadata.update(
-                {
-                    "hr_image_tile_texture_flow": True,
-                    "hr_image_tile_size": int(
-                        self.args.hr_image_tile_size
-                    ),
-                    "hr_image_tile_stride": int(
-                        self.args.hr_image_tile_stride
-                    ),
-                    "hr_image_tile_start_step": int(
-                        self.args.hr_image_tile_start_step
-                    ),
-                    "hr_image_tile_min_foreground_ratio": float(
-                        self.args.hr_image_tile_min_foreground_ratio
-                    ),
-                    "hr_image_tile_fallback": str(
-                        self.args.hr_image_tile_fallback
-                    ),
-                    "hr_image_tile_weight": str(
-                        self.args.hr_image_tile_weight
-                    ),
-                    "hr_image_tile_save_debug": bool(
-                        self.args.hr_image_tile_save_debug
-                    ),
-                }
-            )
 
         del glb_scene
 
@@ -2375,18 +2290,7 @@ def flow_experiment_tag(args: argparse.Namespace) -> str:
         args.texture_rescale,
         args.texture_wavelet_family,
     )
-    tag = f"{shape_tag}__{texture_tag}"
-    if args.hr_image_tile_texture_flow:
-        tag += (
-            "__hrtile"
-            f"-size{int(args.hr_image_tile_size)}"
-            f"-stride{int(args.hr_image_tile_stride)}"
-            f"-step{int(args.hr_image_tile_start_step)}"
-            f"-minfg{_float_tag(args.hr_image_tile_min_foreground_ratio)}"
-            f"-fallback{args.hr_image_tile_fallback}"
-            f"-weight{args.hr_image_tile_weight}"
-        )
-    return tag
+    return f"{shape_tag}__{texture_tag}"
 
 
 def flow_config_matches(
@@ -2415,15 +2319,7 @@ def flow_config_matches(
             and metadata.get("shape_skip_residual_mode")
             == args.shape_skip_residual_mode
             and metadata.get("texture_patch_coordinate_mode")
-            == (
-                "image_tile_global_subset"
-                if args.hr_image_tile_texture_flow
-                else (
-                    None
-                    if args.texture_mode == "global_original"
-                    else "local"
-                )
-            )
+            == (None if args.texture_mode == "global_original" else "local")
             and int(metadata.get("texture_start_step", -1))
             == int(args.texture_start_step)
             and metadata.get("texture_start_source")
@@ -2439,34 +2335,7 @@ def flow_config_matches(
             and metadata.get("texture_skip_residual_mode")
             == args.texture_skip_residual_mode
         )
-        if not common_matches:
-            return False
-        if not args.hr_image_tile_texture_flow:
-            return not bool(
-                metadata.get("hr_image_tile_texture_flow", False)
-            )
-        return bool(
-            metadata.get("hr_image_tile_texture_flow")
-            and int(metadata.get("hr_image_tile_size", -1))
-            == int(args.hr_image_tile_size)
-            and int(metadata.get("hr_image_tile_stride", -1))
-            == int(args.hr_image_tile_stride)
-            and int(metadata.get("hr_image_tile_start_step", -1))
-            == int(args.hr_image_tile_start_step)
-            and float(
-                metadata.get(
-                    "hr_image_tile_min_foreground_ratio",
-                    float("nan"),
-                )
-            )
-            == float(args.hr_image_tile_min_foreground_ratio)
-            and metadata.get("hr_image_tile_fallback")
-            == args.hr_image_tile_fallback
-            and metadata.get("hr_image_tile_weight")
-            == args.hr_image_tile_weight
-            and bool(metadata.get("hr_image_tile_save_debug"))
-            == bool(args.hr_image_tile_save_debug)
-        )
+        return common_matches
     except (TypeError, ValueError, OverflowError):
         return False
 
@@ -2518,14 +2387,6 @@ def selected_generation_fields(
         "texture_wavelet_family",
         "texture_wavelet_compute_dtype",
         "texture_skip_residual_mode",
-        "hr_image_tile_texture_flow",
-        "hr_image_tile_size",
-        "hr_image_tile_stride",
-        "hr_image_tile_start_step",
-        "hr_image_tile_min_foreground_ratio",
-        "hr_image_tile_fallback",
-        "hr_image_tile_weight",
-        "hr_image_tile_save_debug",
         "shape_flow_diagnostics",
         "texture_flow_diagnostics",
     )
@@ -2671,65 +2532,6 @@ def parse_args() -> argparse.Namespace:
         choices=("off", "hiwave_reserved"),
         default="off",
     )
-    parser.add_argument(
-        "--hr-image-tile-texture-flow",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help=(
-            "Run independent DINOv3/NAF conditions for HR image tiles and "
-            "merge their texture velocities at each latter Euler step."
-        ),
-    )
-    parser.add_argument(
-        "--hr-image-tile-size",
-        type=int,
-        default=1024,
-        help="Square HR image tile size in pixels.",
-    )
-    parser.add_argument(
-        "--hr-image-tile-stride",
-        type=int,
-        default=1024,
-        help="HR image tile stride; values below tile size enable overlap.",
-    )
-    parser.add_argument(
-        "--hr-image-tile-start-step",
-        type=int,
-        default=6,
-        help=(
-            "Restore states[N], then execute texture velocity steps N..11; "
-            "for example N=6 executes steps 6,7,8,9,10,11."
-        ),
-    )
-    parser.add_argument(
-        "--hr-image-tile-min-foreground-ratio",
-        type=float,
-        default=0.0,
-        help=(
-            "Minimum alpha-mask foreground fraction for a tile; pure "
-            "background tiles are always skipped."
-        ),
-    )
-    parser.add_argument(
-        "--hr-image-tile-fallback",
-        choices=("saved_global", "current_global"),
-        default="saved_global",
-        help=(
-            "Velocity used for tokens not covered by an active image tile."
-        ),
-    )
-    parser.add_argument(
-        "--hr-image-tile-weight",
-        choices=("tent", "uniform"),
-        default="tent",
-        help="Token weighting used when image tiles overlap.",
-    )
-    parser.add_argument(
-        "--hr-image-tile-save-debug",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Save HR tile crops, mask, projection overlays, and metadata.",
-    )
 
     parser.add_argument(
         "--decimation-target",
@@ -2846,38 +2648,6 @@ def parse_args() -> argparse.Namespace:
             parser.error(
                 f"--{stage}-skip-residual-mode must remain off"
             )
-    if args.hr_image_tile_size <= 0:
-        parser.error("--hr-image-tile-size must be positive")
-    if (
-        args.hr_image_tile_stride <= 0
-        or args.hr_image_tile_stride > args.hr_image_tile_size
-    ):
-        parser.error(
-            "--hr-image-tile-stride must be positive and no greater than "
-            "--hr-image-tile-size"
-        )
-    if not 0 <= args.hr_image_tile_start_step <= TEXTURE_SAMPLER["steps"]:
-        parser.error(
-            "--hr-image-tile-start-step must lie in "
-            f"[0, {TEXTURE_SAMPLER['steps']}]"
-        )
-    if (
-        not math.isfinite(args.hr_image_tile_min_foreground_ratio)
-        or not 0.0
-        <= args.hr_image_tile_min_foreground_ratio
-        <= 1.0
-    ):
-        parser.error(
-            "--hr-image-tile-min-foreground-ratio must lie in [0, 1]"
-        )
-    if (
-        args.hr_image_tile_texture_flow
-        and args.texture_mode != "global_original"
-    ):
-        parser.error(
-            "--hr-image-tile-texture-flow cannot be combined with a local "
-            "--texture-mode; keep --texture-mode global_original"
-        )
     if args.decimation_target <= 0:
         parser.error("--decimation-target must be positive")
     if args.texture_size <= 0:
@@ -2969,34 +2739,7 @@ def main() -> int:
                     source_copy = source.convert("RGBA")
                 source_copy.save(image_output_dir / "input_original.png")
 
-                hr_texture_context: Optional[Dict[str, Any]] = None
-                if args.hr_image_tile_texture_flow:
-                    hr_texture_context = (
-                        pipeline.preprocess_image_with_hr(source_copy)
-                    )
-                    condition_image = hr_texture_context["global_image"]
-                    hr_image_path = (
-                        image_output_dir / "input_preprocessed_hr.png"
-                    )
-                    foreground_mask_hr_path = (
-                        image_output_dir / "foreground_mask_hr.png"
-                    )
-                    global_to_hr_transform_path = (
-                        image_output_dir / "global_to_hr_transform.json"
-                    )
-                    hr_texture_context["hr_image"].save(hr_image_path)
-                    hr_texture_context["foreground_mask_hr"].save(
-                        foreground_mask_hr_path
-                    )
-                    atomic_json(
-                        global_to_hr_transform_path,
-                        hr_texture_context["global_to_hr_transform"],
-                    )
-                else:
-                    condition_image = pipeline.preprocess_image(source_copy)
-                    hr_image_path = None
-                    foreground_mask_hr_path = None
-                    global_to_hr_transform_path = None
+                condition_image = pipeline.preprocess_image(source_copy)
                 condition_path = (
                     image_output_dir / "input_preprocessed_rgba.png"
                 )
@@ -3069,21 +2812,6 @@ def main() -> int:
                         image_output_dir / "input_original.png"
                     ),
                     "condition_image": str(condition_path),
-                    "hr_condition_image": (
-                        str(hr_image_path)
-                        if hr_image_path is not None
-                        else None
-                    ),
-                    "foreground_mask_hr": (
-                        str(foreground_mask_hr_path)
-                        if foreground_mask_hr_path is not None
-                        else None
-                    ),
-                    "global_to_hr_transform": (
-                        str(global_to_hr_transform_path)
-                        if global_to_hr_transform_path is not None
-                        else None
-                    ),
                     "reference_image": str(reference_path),
                     "camera": camera_record,
                 }
@@ -3200,7 +2928,6 @@ def main() -> int:
                                 texture_flow_trace_path=paths[
                                     "texture_flow_trace"
                                 ],
-                                hr_texture_context=hr_texture_context,
                             )
                             atomic_json(paths["generation"], metadata)
                             generation_by_key[key] = metadata
@@ -3261,14 +2988,9 @@ def main() -> int:
                                     args.shape_skip_residual_mode
                                 ),
                                 "texture_patch_coordinate_mode": (
-                                    "image_tile_global_subset"
-                                    if args.hr_image_tile_texture_flow
-                                    else (
-                                        None
-                                        if args.texture_mode
-                                        == "global_original"
-                                        else "local"
-                                    )
+                                    None
+                                    if args.texture_mode == "global_original"
+                                    else "local"
                                 ),
                                 "texture_start_step": int(
                                     args.texture_start_step
@@ -3296,33 +3018,6 @@ def main() -> int:
                                 "error": f"{type(exc).__name__}: {exc}",
                                 "traceback": traceback.format_exc(),
                             }
-                            if args.hr_image_tile_texture_flow:
-                                error_record.update(
-                                    {
-                                        "hr_image_tile_texture_flow": True,
-                                        "hr_image_tile_size": int(
-                                            args.hr_image_tile_size
-                                        ),
-                                        "hr_image_tile_stride": int(
-                                            args.hr_image_tile_stride
-                                        ),
-                                        "hr_image_tile_start_step": int(
-                                            args.hr_image_tile_start_step
-                                        ),
-                                        "hr_image_tile_min_foreground_ratio": float(
-                                            args.hr_image_tile_min_foreground_ratio
-                                        ),
-                                        "hr_image_tile_fallback": str(
-                                            args.hr_image_tile_fallback
-                                        ),
-                                        "hr_image_tile_weight": str(
-                                            args.hr_image_tile_weight
-                                        ),
-                                        "hr_image_tile_save_debug": bool(
-                                            args.hr_image_tile_save_debug
-                                        ),
-                                    }
-                                )
                             atomic_json(paths["generation"], error_record)
                             generation_by_key[key] = error_record
                             generation_records.append(
