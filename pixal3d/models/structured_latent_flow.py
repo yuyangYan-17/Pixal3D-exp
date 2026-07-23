@@ -225,16 +225,36 @@ class SLatFlowModel(nn.Module):
             
         # Handle different conditioning modes
         if self.image_attn_mode == 'proj':
-            if isinstance(cond, dict):
+            is_multi_tile = isinstance(cond, dict) and (
+                cond.get("mode") == "multi_tile_paired"
+                or "global_bank" in cond
+            )
+            if is_multi_tile:
+                global_bank = manual_cast(cond["global_bank"], self.dtype)
+                proj_cond = manual_cast(cond["proj"], self.dtype)
+                # IDs must remain integers; weights follow the model dtype.
+                cond = {
+                    **cond,
+                    "mode": "multi_tile_paired",
+                    "global_bank": global_bank,
+                    "proj": proj_cond,
+                    "tile_ids": cond["tile_ids"],
+                    # Membership normalization is a strict float32 invariant;
+                    # only the weighted attention contribution is cast to the
+                    # hidden dtype inside SparseProjectAttention.
+                    "tile_weights": cond["tile_weights"].to(torch.float32),
+                }
+            elif isinstance(cond, dict):
                 global_cond = cond['global']
                 proj_cond = cond['proj']
             else:
                 global_cond, proj_cond = cond
-            if isinstance(global_cond, list):
-                global_cond = sp.VarLenTensor.from_tensor_list(global_cond)
-            global_cond = manual_cast(global_cond, self.dtype)
-            proj_cond = manual_cast(proj_cond, self.dtype)
-            cond = (global_cond, proj_cond)
+            if not is_multi_tile:
+                if isinstance(global_cond, list):
+                    global_cond = sp.VarLenTensor.from_tensor_list(global_cond)
+                global_cond = manual_cast(global_cond, self.dtype)
+                proj_cond = manual_cast(proj_cond, self.dtype)
+                cond = (global_cond, proj_cond)
         elif self.image_attn_mode == 'gated_proj':
             global_cond = cond['global']
             if isinstance(global_cond, list):

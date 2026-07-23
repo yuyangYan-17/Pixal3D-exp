@@ -292,3 +292,238 @@ Evaluation protocol is fixed across the entries below: input `assets/choose/0_im
 - Key diagnostics to inspect: active tile/token counts, covered/overlap/uncovered ratios, per-tile velocity norms, merged-vs-global velocity cosine/MSE/relative-L2/norm ratio, fallback use, DINOv3/NAF per-tile flags, step runtime, and CUDA peaks
 - Current conclusion: implementation complete; full model generation intentionally not run
 - Next decision: user runs the command above, checks `texture_flow_2048_trace.pt` and `hr_image_tile_debug/`, then records real metrics or failures here
+
+## EXP-013: Canonical preprocessing + clean global control
+
+### Goal
+
+Isolate the effect of the single canonical high-quality preprocessing pyramid. No multi-tile texture condition or second texture pass is enabled. Shape `start_step=12` also supplies a real saved-state identity check.
+
+### Code
+
+- Date: 2026-07-24
+- Base commit: `cfe73ac`, dirty working tree
+- Pipeline / sparse project attention / structured flow / evaluator SHA-256 prefixes: `ffb4e9a7a526`, `54059f0c07fc`, `e8dd94ed23b9`, `31314f102f41`
+- Main modified files: `pixal3d/pipelines/pixal3d_image_to_3d.py`, `pixal3d/modules/sparse/attention/proj_attention.py`, `pixal3d/models/structured_latent_flow.py`, `pixal3d_directory_texture_eval.py`
+
+### Configuration
+
+```bash
+CUDA_VISIBLE_DEVICES=4 HF_HUB_OFFLINE=1 \
+python pixal3d_directory_texture_eval.py \
+  --image-dir assets/choose \
+  --output-dir outputs/pixal3d_2048_canonical_global_control \
+  --resolutions 2048 \
+  --seeds 42 \
+  --lights studio \
+  --shape-start-step 12 \
+  --texture-mode global_original \
+  --no-texture-multitile-3d-patch-flow \
+  --render-resolution 2048 \
+  --metric-resolution 1024 \
+  --fail-fast
+```
+
+### Preprocessing
+
+- Source: `assets/choose/0_img.png`
+- Alpha source: existing RGBA alpha; rembg calls: 0
+- Source foreground bbox: `(115, 414, 3897, 3867)`
+- Source square extent: `(-75, 60, 4086, 4221)`
+- Padding `(left,right,top,bottom)`: `(75, 0, 0, 125)`
+- Canonical outputs: exactly 4096, 1024, and 512; 1024/512 directly resized from 4096
+
+### 2D Condition Diagnostics
+
+Not applicable: the multi-tile flag was disabled.
+
+### 3D Flow Diagnostics
+
+- Shape fixed grid: 128; tokens: 59,234
+- Shape identity: `states[12]` restored, zero model steps, max/mean algebraic identity error `0 / 0`
+- Texture: unchanged 12-step global trajectory, 13 saved states and 12 velocities
+
+### Metrics
+
+- PSNR: `17.3863170053`
+- SSIM: `0.6702985168`
+- LPIPS: `0.2171153277`
+- Pipeline: `158.142 s`
+- Peak CUDA allocated/reserved: `36,414,627,328 / 45,925,531,648` bytes
+- Geometry: 59,234 latent tokens; 16,020,838 decoder vertices; 31,974,354 faces
+
+### Visual Findings
+
+The rendered turtle is coherent, with stable global color and no patch seams because no texture patch pass ran. The saved control comparison panel displayed a viewer-side black reference half, but metrics used `metric_reference_rgb.png`; the rendered half itself is valid.
+
+### Conclusion
+
+Canonical preprocessing improves over the task's historical clean global baseline (`17.1593 / 0.666374 / 0.218942`) by `+0.2270 dB / +0.003925 / -0.001827`. This is the correct same-preprocessing control for EXP-014.
+
+### Next Action
+
+Run paired multi-tile 3D patch flow from texture step 6 with every other setting fixed.
+
+## EXP-014: Paired multi-tile block fusion + 3D patch texture flow, step 6
+
+### Goal
+
+Test whether independently extracted overlapping 4K tile global/proj pairs recover local texture while preserving full 64³ 3D patch self-attention and strict no-fallback coverage.
+
+### Code
+
+Same working tree as EXP-013. The first attempt correctly extracted all conditions but stopped before its first patch prediction because model-dtype conversion changed float32 normalized weights to fp16. The implementation was corrected to preserve float32 membership weights through validation/accumulation and cast only attention contributions; the combined suite then passed 22 tests before this successful retry.
+
+### Configuration
+
+```bash
+CUDA_VISIBLE_DEVICES=4 HF_HUB_OFFLINE=1 \
+python pixal3d_directory_texture_eval.py \
+  --image-dir assets/choose \
+  --output-dir outputs/pixal3d_2048_multitile_paired_3dpatch_step6 \
+  --resolutions 2048 \
+  --seeds 42 \
+  --lights studio \
+  --shape-start-step 12 \
+  --texture-mode global_original \
+  --texture-multitile-3d-patch-flow \
+  --texture-multitile-start-step 6 \
+  --texture-canonical-image-size 4096 \
+  --texture-image-tile-size 1024 \
+  --texture-image-tile-stride 512 \
+  --texture-3d-patch-size 64 \
+  --texture-3d-patch-stride 32 \
+  --texture-multitile-global-mode paired_block_fusion \
+  --texture-multitile-save-debug \
+  --render-resolution 2048 \
+  --metric-resolution 1024 \
+  --fail-fast
+```
+
+### Preprocessing
+
+Identical to EXP-013: existing RGBA alpha, rembg calls 0, source bbox `(115,414,3897,3867)`, square `(-75,60,4086,4221)`, padding `(75,0,0,125)`, canonical 4096/1024/512.
+
+### 2D Condition Diagnostics
+
+- Fixed layout: 49 tiles, 1024 size, stride 512; 48 tiles had token membership
+- Tokens: 59,234
+- Membership min/max: 1 / 4
+- Membership histogram: `{1: 1, 2: 4,694, 4: 54,539}`
+- Weight-sum min/max: `0.99999988 / 1.00000012`
+- Every active crop independently ran DINO and NAF; extraction was about `0.57–0.62 s/tile`
+- Global bank: `[48,5,1024]`; fused proj: `[59234,2048]`
+- Debug artifacts include global bank, IDs, weights, fused proj, and optional raw slot proj
+
+### 3D Flow Diagnostics
+
+- Fixed 128 grid, 64³ patches, stride 32, 27 patches
+- Patch coverage min/max: 2 / 8; histogram `{2: 8,025, 4: 33,720, 8: 17,489}`
+- Local coordinate range: `[0,63]`
+- Every step read one immutable `x_step_start`, merged all patch velocities, and made one global Euler update
+- No global velocity fallback exists or ran
+
+| Step | cosine vs global | relative L2 | MSE | seconds |
+|---:|---:|---:|---:|---:|
+| 6 | 0.99079573 | 0.13578466 | 0.02404319 | 31.077 |
+| 7 | 0.98944414 | 0.14532241 | 0.02605185 | 30.896 |
+| 8 | 0.98723418 | 0.15963548 | 0.02955591 | 30.881 |
+| 9 | 0.98378837 | 0.17965209 | 0.03439710 | 31.004 |
+| 10 | 0.97924823 | 0.20298506 | 0.03934061 | 30.996 |
+| 11 | 0.97582603 | 0.21897635 | 0.03950640 | 30.991 |
+
+### Metrics
+
+- PSNR: `17.0416468268`
+- SSIM: `0.6577093005`
+- LPIPS: `0.2198133171`
+- Pipeline: `375.663 s`
+- Peak CUDA allocated/reserved: `36,414,627,840 / 45,946,503,168` bytes
+- Material bake: `372.266 s`
+- Geometry is identical to EXP-013: 59,234 tokens, 16,020,838 vertices, 31,974,354 faces
+
+### Visual Findings
+
+The result is coherent with no obvious axis-aligned 2D tile seam, texture collapse, or geometry change. The head eye/red/blue markings and shell remain recognizable, but the render does not show a convincing fine-detail recovery relative to the canonical control; global shell coloring is slightly shifted and perceptual metrics regress.
+
+### Conclusion
+
+Against the canonical global control, paired step 6 changes PSNR/SSIM/LPIPS by `-0.344670 dB / -0.012589 / +0.002698` (worse). Against the historical legacy 2D image-tile step-6 result (`16.9282 / 0.653563 / 0.225339`), it is `+0.113447 dB / +0.004146 / -0.005526` (better), but it does not beat clean global. The structural defects of the old token-subset/fallback path are removed; the remaining issue is likely inference-time condition distribution shift or applying local globals too early.
+
+### Next Action
+
+Run the conservative paired experiment at `--texture-multitile-start-step 10`. This directly tests whether tile-dependent global/proj context is useful only for the last two detail steps. Vectorize membership attention before larger sweeps; the reference grouped implementation costs about 31 seconds per paired texture step.
+
+## EXP-015: Paired multi-tile block fusion + 3D patch texture flow, step 10
+
+### Goal
+
+Test the task's conservative hypothesis: use the canonical global trajectory through step 9, then apply paired tile-dependent context only for the last two texture-detail steps.
+
+### Code
+
+Same verified working tree and condition format as EXP-014.
+
+### Configuration
+
+```bash
+CUDA_VISIBLE_DEVICES=4 HF_HUB_OFFLINE=1 \
+python pixal3d_directory_texture_eval.py \
+  --image-dir assets/choose \
+  --output-dir outputs/pixal3d_2048_multitile_paired_3dpatch_step10 \
+  --resolutions 2048 \
+  --seeds 42 \
+  --lights studio \
+  --shape-start-step 12 \
+  --texture-mode global_original \
+  --texture-multitile-3d-patch-flow \
+  --texture-multitile-start-step 10 \
+  --texture-canonical-image-size 4096 \
+  --texture-image-tile-size 1024 \
+  --texture-image-tile-stride 512 \
+  --texture-3d-patch-size 64 \
+  --texture-3d-patch-stride 32 \
+  --texture-multitile-global-mode paired_block_fusion \
+  --texture-multitile-save-debug \
+  --render-resolution 2048 \
+  --metric-resolution 1024 \
+  --fail-fast
+```
+
+### Preprocessing
+
+Identical to EXP-013/014: one RGBA-alpha preprocessing operation, rembg calls 0, source bbox `(115,414,3897,3867)`, square `(-75,60,4086,4221)`, padding `(75,0,0,125)`, canonical 4096/1024/512.
+
+### 2D Condition Diagnostics
+
+Identical token projection and assignment to EXP-014: fixed 49-tile layout, 48 used tiles, 59,234 tokens, membership histogram `{1:1, 2:4694, 4:54539}`, normalized float32 weight sums within `[0.99999988,1.00000012]`.
+
+### 3D Flow Diagnostics
+
+- 27 fixed 64³ patches, stride 32; coverage `{2:8025, 4:33720, 8:17489}`
+- No uncovered token and no velocity fallback
+- Step 10: cosine `0.99361449`, relative L2 `0.11331707`, MSE `0.01226053`, `31.416 s`
+- Step 11: cosine `0.99498975`, relative L2 `0.10062289`, MSE `0.00834188`, `31.387 s`
+- One synchronized global update per step
+
+### Metrics
+
+- PSNR: `17.3391828638`
+- SSIM: `0.6688802838`
+- LPIPS: `0.2155238390`
+- Pipeline: `254.381 s`
+- Peak CUDA allocated/reserved: `36,414,627,840 / 45,946,503,168` bytes
+- Material bake: `410.247 s`
+- Geometry unchanged: 59,234 latent tokens; 16,020,838 vertices; 31,974,354 faces
+
+### Visual Findings
+
+The late-only result remains coherent with no visible tile seam or geometry change. It stays much closer to the global control in global shell color/structure than EXP-014 while retaining the recognizable eye, neck, and shell markings.
+
+### Conclusion
+
+Versus canonical global, step 10 changes PSNR/SSIM/LPIPS by `-0.047134 dB / -0.001418 / -0.001591`: small PSNR/SSIM regressions but a perceptual LPIPS improvement. Versus step 6 it improves by `+0.297536 dB / +0.011171 / -0.004289`. This supports the hypothesis that paired crop context is safer as a last-two-step detail correction, but it still does not strictly dominate the canonical control on all metrics.
+
+### Next Action
+
+Treat step 10 as the paired-path candidate. Before multi-seed evaluation, implement and validate vectorized membership cross-attention, and add ROI/tile-boundary metrics to determine whether the LPIPS gain corresponds to useful head/shell detail rather than global color shift.

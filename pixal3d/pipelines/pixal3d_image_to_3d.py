@@ -146,232 +146,417 @@ class Pixal3DImageTo3DPipeline(Pipeline):
             if self.rembg_model is not None:
                 self.rembg_model.to(device)
 
-    def preprocess_image(self, input: Image.Image, bg_color: tuple = (0, 0, 0)) -> Image.Image:
-        """
-        Preprocess the input image.
-
-        Args:
-            input: Input image (RGB or RGBA).
-            bg_color: Background color (R, G, B) in 0~255. Default black (0,0,0).
-        """
-        # if has alpha channel, use it directly; otherwise, remove background
-        has_alpha = False
-        if input.mode == 'RGBA':
-            alpha = np.array(input)[:, :, 3]
-            if not np.all(alpha == 255):
-                has_alpha = True
-        max_size = max(input.size)
-        scale = min(1, 1024 / max_size)
-        if scale < 1:
-            input = input.resize((int(input.width * scale), int(input.height * scale)), Image.Resampling.LANCZOS)
-        if has_alpha:
-            output = input
-        else:
-            input = input.convert('RGB')
-            if self.low_vram:
-                self.rembg_model.to(self.device)
-            output = self.rembg_model(input)
-            if self.low_vram:
-                self.rembg_model.cpu()
-        output_np = np.array(output)
-        alpha = output_np[:, :, 3]
-        bbox = np.argwhere(alpha > 0.8 * 255)
-        bbox = np.min(bbox[:, 1]), np.min(bbox[:, 0]), np.max(bbox[:, 1]), np.max(bbox[:, 0])
-        center = (bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2
-        size = max(bbox[2] - bbox[0], bbox[3] - bbox[1])
-        size = int(size * 1.1)
-        bbox = center[0] - size // 2, center[1] - size // 2, center[0] + size // 2, center[1] + size // 2
-        output = output.crop(bbox)  # type: ignore
-        output = np.array(output).astype(np.float32) / 255
-        rgb = output[:, :, :3]
-        a = output[:, :, 3:4]
-        bg = np.array(bg_color, dtype=np.float32) / 255.0
-        output = rgb * a + bg * (1.0 - a)
-        output = Image.fromarray((np.clip(output, 0, 1) * 255).astype(np.uint8))
-        return output
-
-    def preprocess_image_with_hr(
+    def preprocess_canonical_images(
         self,
         input: Image.Image,
         bg_color: tuple = (0, 0, 0),
     ) -> Dict[str, Any]:
-        """Create aligned global and high-resolution texture inputs.
-
-        The foreground model and bounding box are evaluated exactly once on
-        the same at-most-1024 image used by :meth:`preprocess_image`.  That
-        matte and crop coordinate system are then lifted back to the original
-        source resolution.  The returned ``global_image`` therefore follows
-        the existing preprocessing semantics, while ``hr_image`` retains the
-        source detail without independently re-segmenting or re-cropping it.
-        """
+        """Run segmentation/cropping once and create the canonical pyramid."""
         source = input.copy()
         source_size = (int(source.width), int(source.height))
-        has_alpha = False
-        if source.mode == "RGBA":
-            source_alpha = np.array(source)[:, :, 3]
-            if not np.all(source_alpha == 255):
-                has_alpha = True
-
-        max_size = max(source.size)
-        resize_scale = min(1.0, 1024.0 / float(max_size))
-        resized_size = (
-            int(source.width * resize_scale),
-            int(source.height * resize_scale),
+        source_alpha = (
+            np.asarray(source.getchannel("A"))
+            if source.mode == "RGBA"
+            else None
         )
-        resized_input = source
-        if resize_scale < 1.0:
-            resized_input = source.resize(
-                resized_size,
-                Image.Resampling.LANCZOS,
-            )
-
+        has_alpha = source_alpha is not None and not np.all(source_alpha == 255)
+        max_size = max(source.size)
+        proxy_scale = min(1.0, 1024.0 / float(max_size))
+        proxy_size = (
+            max(1, int(round(source.width * proxy_scale))),
+            max(1, int(round(source.height * proxy_scale))),
+        )
+        rembg_calls = 0
         if has_alpha:
-            foreground_rgba = resized_input.convert("RGBA")
+            alpha_source = source.getchannel("A")
+            alpha_proxy = alpha_source.resize(
+                proxy_size, Image.Resampling.LANCZOS
+            )
+            alpha_kind = "rgba"
         else:
-            foreground_rgb = resized_input.convert("RGB")
+            proxy_rgb = source.convert("RGB").resize(
+                proxy_size, Image.Resampling.LANCZOS
+            )
             if self.low_vram:
                 self.rembg_model.to(self.device)
-            foreground_rgba = self.rembg_model(foreground_rgb)
+            segmented = self.rembg_model(proxy_rgb).convert("RGBA")
+            rembg_calls = 1
             if self.low_vram:
                 self.rembg_model.cpu()
-            foreground_rgba = foreground_rgba.convert("RGBA")
-
-        foreground_np = np.array(foreground_rgba)
-        alpha = foreground_np[:, :, 3]
-        foreground_pixels = np.argwhere(alpha > 0.8 * 255)
-        if foreground_pixels.size == 0:
-            raise ValueError(
-                "Foreground preprocessing produced an empty alpha mask"
+            alpha_proxy = segmented.getchannel("A")
+            alpha_source = alpha_proxy.resize(
+                source_size, Image.Resampling.LANCZOS
             )
-        foreground_bbox = (
+            alpha_kind = "rembg"
+
+        alpha_np = np.asarray(alpha_source)
+        foreground_pixels = np.argwhere(alpha_np > 0.8 * 255)
+        if foreground_pixels.size == 0:
+            raise ValueError("Foreground preprocessing produced an empty alpha mask")
+        # Right/bottom are exclusive pixel edges.
+        foreground_bbox_source = (
             int(np.min(foreground_pixels[:, 1])),
             int(np.min(foreground_pixels[:, 0])),
-            int(np.max(foreground_pixels[:, 1])),
-            int(np.max(foreground_pixels[:, 0])),
+            int(np.max(foreground_pixels[:, 1])) + 1,
+            int(np.max(foreground_pixels[:, 0])) + 1,
         )
         center = (
-            (foreground_bbox[0] + foreground_bbox[2]) / 2,
-            (foreground_bbox[1] + foreground_bbox[3]) / 2,
+            (foreground_bbox_source[0] + foreground_bbox_source[2]) / 2.0,
+            (foreground_bbox_source[1] + foreground_bbox_source[3]) / 2.0,
         )
-        square_size = max(
-            foreground_bbox[2] - foreground_bbox[0],
-            foreground_bbox[3] - foreground_bbox[1],
+        side = max(
+            foreground_bbox_source[2] - foreground_bbox_source[0],
+            foreground_bbox_source[3] - foreground_bbox_source[1],
         )
-        square_size = int(square_size * 1.1)
-        crop_box_float = (
-            center[0] - square_size // 2,
-            center[1] - square_size // 2,
-            center[0] + square_size // 2,
-            center[1] + square_size // 2,
+        side = max(1, int(math.ceil(side * 1.1)))
+        left = int(math.floor(center[0] - side / 2.0))
+        top = int(math.floor(center[1] - side / 2.0))
+        square_extent = (left, top, left + side, top + side)
+        padding = (
+            max(0, -left),
+            max(0, left + side - source.width),
+            max(0, -top),
+            max(0, top + side - source.height),
         )
-        # Pillow rounds crop coordinates before applying them. Record those
-        # exact integer edges so the HR lift uses the identical square.
-        crop_box = tuple(int(round(value)) for value in crop_box_float)
-        global_rgba = foreground_rgba.crop(crop_box_float)
-        if global_rgba.width != global_rgba.height:
-            raise RuntimeError(
-                "Foreground crop unexpectedly produced a non-square canvas: "
-                f"{global_rgba.size}"
-            )
-
-        global_array = np.asarray(global_rgba).astype(np.float32) / 255.0
-        global_rgb = global_array[:, :, :3]
-        global_alpha = global_array[:, :, 3:4]
-        background = np.asarray(bg_color, dtype=np.float32) / 255.0
-        global_composited = (
-            global_rgb * global_alpha
-            + background * (1.0 - global_alpha)
-        )
-        global_image = Image.fromarray(
-            (np.clip(global_composited, 0, 1) * 255).astype(np.uint8)
-        )
-
         source_rgba = source.convert("RGBA")
-        if not has_alpha:
-            # Lift the one and only rembg matte to source resolution. The
-            # original RGB is retained; rembg is not called again.
-            lifted_alpha = foreground_rgba.getchannel("A").resize(
-                source_size,
-                Image.Resampling.LANCZOS,
-            )
-            source_rgba.putalpha(lifted_alpha)
-
-        resized_width, resized_height = foreground_rgba.size
-        source_per_resized_x = source.width / float(resized_width)
-        source_per_resized_y = source.height / float(resized_height)
-        source_extent = (
-            crop_box[0] * source_per_resized_x,
-            crop_box[1] * source_per_resized_y,
-            crop_box[2] * source_per_resized_x,
-            crop_box[3] * source_per_resized_y,
+        source_rgba.putalpha(alpha_source)
+        square_rgba = source_rgba.crop(square_extent)
+        if square_rgba.size != (side, side):
+            raise RuntimeError("canonical source crop is not square")
+        square_array = np.asarray(square_rgba).astype(np.float32) / 255.0
+        background = np.asarray(bg_color, dtype=np.float32) / 255.0
+        composited = (
+            square_array[:, :, :3] * square_array[:, :, 3:4]
+            + background * (1.0 - square_array[:, :, 3:4])
         )
-        global_square_size = int(global_rgba.width)
-        hr_square_size = max(
-            1,
-            int(
-                math.ceil(
-                    global_square_size
-                    * max(source_per_resized_x, source_per_resized_y)
-                )
-            ),
+        source_square = Image.fromarray(
+            (np.clip(composited, 0, 1) * 255).astype(np.uint8), mode="RGB"
         )
-        hr_rgba = source_rgba.transform(
-            (hr_square_size, hr_square_size),
-            Image.Transform.EXTENT,
-            source_extent,
-            resample=Image.Resampling.BICUBIC,
-            fillcolor=(0, 0, 0, 0),
+        image_4096 = source_square.resize(
+            (4096, 4096), Image.Resampling.LANCZOS
         )
-        hr_array = np.asarray(hr_rgba).astype(np.float32) / 255.0
-        hr_rgb = hr_array[:, :, :3]
-        hr_alpha = hr_array[:, :, 3:4]
-        hr_composited = hr_rgb * hr_alpha + background * (1.0 - hr_alpha)
-        hr_image = Image.fromarray(
-            (np.clip(hr_composited, 0, 1) * 255).astype(np.uint8)
+        image_1024 = image_4096.resize(
+            (1024, 1024), Image.Resampling.LANCZOS
         )
-        foreground_mask_hr = Image.fromarray(
-            (
-                (hr_array[:, :, 3] > 0.8).astype(np.uint8)
-                * 255
-            ),
-            mode="L",
+        image_512 = image_4096.resize(
+            (512, 512), Image.Resampling.LANCZOS
         )
-
-        global_to_hr_x = hr_square_size / float(global_image.width)
-        global_to_hr_y = hr_square_size / float(global_image.height)
-        transform = {
-            "convention": (
-                "pixel-edge homogeneous coordinates; "
-                "x_hr=sx*x_global, y_hr=sy*y_global"
-            ),
-            "global_size": [int(global_image.width), int(global_image.height)],
-            "hr_size": [int(hr_image.width), int(hr_image.height)],
-            "global_to_hr_matrix": [
-                [float(global_to_hr_x), 0.0, 0.0],
-                [0.0, float(global_to_hr_y), 0.0],
-                [0.0, 0.0, 1.0],
-            ],
-            "hr_to_global_matrix": [
-                [float(1.0 / global_to_hr_x), 0.0, 0.0],
-                [0.0, float(1.0 / global_to_hr_y), 0.0],
-                [0.0, 0.0, 1.0],
-            ],
-            "source_size": [int(source.width), int(source.height)],
-            "rembg_input_size": [
-                int(foreground_rgba.width),
-                int(foreground_rgba.height),
-            ],
-            "rembg_resize_scale_requested": float(resize_scale),
-            "foreground_bbox_rembg": list(foreground_bbox),
-            "square_crop_box_rembg": list(crop_box),
-            "square_source_extent": [float(value) for value in source_extent],
+        foreground_mask_4096 = square_rgba.getchannel("A").resize(
+            (4096, 4096), Image.Resampling.LANCZOS
+        )
+        metadata = {
+            "version": "canonical_v1",
+            "source_size": list(source_size),
+            "alpha_source": alpha_kind,
+            "rembg_calls": rembg_calls,
+            "rembg_input": list(proxy_size) if rembg_calls else None,
+            "foreground_bbox_source": list(foreground_bbox_source),
+            "square_extent_source": list(square_extent),
+            "padding": {
+                "left": padding[0], "right": padding[1],
+                "top": padding[2], "bottom": padding[3],
+            },
+            "source_square_size": [side, side],
         }
+        print(
+            "[canonical-preprocess] "
+            f"alpha_source={alpha_kind} rembg_calls={rembg_calls} "
+            f"rembg_input={metadata['rembg_input']} "
+            f"foreground_bbox_source={foreground_bbox_source} "
+            f"square_extent_source={square_extent} padding={padding} "
+            "image_4096=4096x4096 image_1024=1024x1024 image_512=512x512"
+        )
+        canonical = {
+            "image_4096": image_4096,
+            "image_1024": image_1024,
+            "image_512": image_512,
+            "foreground_mask_4096": foreground_mask_4096,
+            "source_square_rgba": square_rgba,
+            "source_square_black_rgb": source_square,
+            "metadata": metadata,
+        }
+        # Read-only aliases keep the explicitly legacy 2D tile experiment
+        # runnable without another preprocessing operation.
+        canonical.update(
+            {
+                "global_image": image_1024,
+                "hr_image": image_4096,
+                "foreground_mask_hr": foreground_mask_4096,
+                "global_to_hr_transform": {
+                    "convention": "canonical pixel-edge coordinates",
+                    "global_size": [1024, 1024],
+                    "hr_size": [4096, 4096],
+                    "global_to_hr_matrix": [
+                        [4.0, 0.0, 0.0],
+                        [0.0, 4.0, 0.0],
+                        [0.0, 0.0, 1.0],
+                    ],
+                    "hr_to_global_matrix": [
+                        [0.25, 0.0, 0.0],
+                        [0.0, 0.25, 0.0],
+                        [0.0, 0.0, 1.0],
+                    ],
+                },
+            }
+        )
+        return canonical
+
+    def preprocess_image(
+        self, input: Image.Image, bg_color: tuple = (0, 0, 0)
+    ) -> Image.Image:
+        """Compatibility wrapper returning the canonical 1024 image."""
+        return self.preprocess_canonical_images(input, bg_color)["image_1024"]
+
+    def preprocess_image_with_hr(
+        self, input: Image.Image, bg_color: tuple = (0, 0, 0)
+    ) -> Dict[str, Any]:
+        """Compatibility wrapper for the former shared HR bundle."""
+        canonical = self.preprocess_canonical_images(input, bg_color)
         return {
-            "global_image": global_image,
-            "hr_image": hr_image,
-            "foreground_mask_hr": foreground_mask_hr,
-            "global_to_hr_transform": transform,
+            **canonical,
+            "global_image": canonical["image_1024"],
+            "hr_image": canonical["image_4096"],
+            "foreground_mask_hr": canonical["foreground_mask_4096"],
+            "global_to_hr_transform": {
+                "convention": "canonical normalized image coordinates",
+                "global_size": [1024, 1024],
+                "hr_size": [4096, 4096],
+                "global_to_hr_matrix": [[4.0, 0.0, 0.0], [0.0, 4.0, 0.0], [0.0, 0.0, 1.0]],
+                "hr_to_global_matrix": [[0.25, 0.0, 0.0], [0.0, 0.25, 0.0], [0.0, 0.0, 1.0]],
+            },
         }
+
+    @staticmethod
+    def build_texture_image_tile_layout(
+        canonical_size: int = 4096,
+        tile_size: int = 1024,
+        tile_stride: int = 512,
+    ) -> List[Tuple[int, int, int, int]]:
+        """Return only complete, in-bounds image tiles in row-major order."""
+        if canonical_size <= 0 or tile_size <= 0 or tile_stride <= 0:
+            raise ValueError("canonical/tile sizes and stride must be positive")
+        if tile_size > canonical_size:
+            raise ValueError("tile_size cannot exceed canonical_size")
+        starts = list(range(0, canonical_size - tile_size + 1, tile_stride))
+        if not starts or starts[-1] != canonical_size - tile_size:
+            raise ValueError(
+                "tile layout must land exactly on the final canonical edge"
+            )
+        return [
+            (x0, y0, x0 + tile_size, y0 + tile_size)
+            for y0 in starts
+            for x0 in starts
+        ]
+
+    @staticmethod
+    def assign_texture_tiles(
+        raw_uv: torch.Tensor,
+        boxes: Sequence[Sequence[int]],
+        canonical_size: int = 4096,
+        max_memberships: int = 4,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Assign finite pixel-space projections to overlapping image tiles."""
+        if raw_uv.ndim != 2 or raw_uv.shape[1] != 2:
+            raise ValueError("raw_uv must have shape [N, 2]")
+        if not torch.isfinite(raw_uv).all():
+            raise RuntimeError("non-finite projected UV cannot be assigned")
+        if max_memberships != 4:
+            raise ValueError("the first paired condition format requires M=4")
+        assignment_uv = raw_uv.clamp(0.0, float(canonical_size))
+        if not torch.isfinite(assignment_uv).all():
+            raise RuntimeError("clamped assignment UV is non-finite")
+        n = raw_uv.shape[0]
+        tile_ids = torch.full(
+            (n, max_memberships), -1, dtype=torch.long, device=raw_uv.device
+        )
+        tile_weights = torch.zeros(
+            (n, max_memberships), dtype=torch.float32, device=raw_uv.device
+        )
+        counts = torch.zeros(n, dtype=torch.long, device=raw_uv.device)
+        for tile_id, box in enumerate(boxes):
+            x0, y0, x1, y1 = (float(value) for value in box)
+            # Half-open membership, except that the canonical maximum belongs
+            # to the last row/column.
+            in_x = (assignment_uv[:, 0] >= x0) & (
+                (assignment_uv[:, 0] < x1)
+                | ((x1 == canonical_size) & (assignment_uv[:, 0] == x1))
+            )
+            in_y = (assignment_uv[:, 1] >= y0) & (
+                (assignment_uv[:, 1] < y1)
+                | ((y1 == canonical_size) & (assignment_uv[:, 1] == y1))
+            )
+            rows = torch.where(in_x & in_y)[0]
+            if rows.numel() == 0:
+                continue
+            slots = counts[rows]
+            if torch.any(slots >= max_memberships):
+                raise RuntimeError("a token belongs to more than four image tiles")
+            tile_ids[rows, slots] = tile_id
+            local_x = (assignment_uv[rows, 0] - x0) / (x1 - x0)
+            local_y = (assignment_uv[rows, 1] - y0) / (y1 - y0)
+            weight = (
+                (1.0 - (2.0 * local_x - 1.0).abs())
+                * (1.0 - (2.0 * local_y - 1.0).abs())
+            ).clamp_min(1e-3)
+            tile_weights[rows, slots] = weight.float()
+            counts[rows] += 1
+        if torch.any(counts < 1) or torch.any(counts > 4):
+            bad = torch.where((counts < 1) | (counts > 4))[0].tolist()
+            raise RuntimeError(f"invalid image tile coverage for token rows {bad[:16]}")
+        tile_weights /= tile_weights.sum(dim=1, keepdim=True)
+        if (
+            not torch.isfinite(tile_weights).all()
+            or torch.any(tile_weights < 0)
+            or not torch.allclose(
+                tile_weights.sum(1),
+                torch.ones(n, device=raw_uv.device),
+                atol=1e-6,
+                rtol=1e-6,
+            )
+        ):
+            raise RuntimeError("image tile weights failed normalization")
+        sorted_ids = tile_ids.masked_fill(tile_ids < 0, len(boxes)).sort(1).values
+        if torch.any(
+            (sorted_ids[:, 1:] == sorted_ids[:, :-1])
+            & (sorted_ids[:, 1:] < len(boxes))
+        ):
+            raise RuntimeError("duplicate image tile membership")
+        return tile_ids, tile_weights, assignment_uv
+
+    @staticmethod
+    def fuse_texture_slot_proj(
+        slot_proj: torch.Tensor,
+        tile_weights: torch.Tensor,
+        tile_ids: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if slot_proj.ndim != 3 or tile_weights.shape != slot_proj.shape[:2]:
+            raise ValueError("slot_proj and tile_weights are not aligned")
+        if tile_ids is not None:
+            if tile_ids.shape != tile_weights.shape:
+                raise ValueError("tile_ids and weights are not aligned")
+            if torch.any(slot_proj[tile_ids < 0] != 0):
+                raise ValueError("invalid projected-feature slots must be zero")
+        fused = (slot_proj * tile_weights[..., None].to(slot_proj.dtype)).sum(1)
+        if not torch.isfinite(fused).all():
+            raise RuntimeError("fused projected features are non-finite")
+        return fused
+
+    @staticmethod
+    def make_multitile_negative_condition(
+        condition: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        projection = condition["proj"]
+        if not isinstance(projection, SparseTensor):
+            raise TypeError("paired condition proj must be a SparseTensor")
+        return {
+            "mode": "multi_tile_paired",
+            "global_bank": torch.zeros_like(condition["global_bank"]),
+            "proj": projection.replace(torch.zeros_like(projection.feats)),
+            "tile_ids": condition["tile_ids"],
+            "tile_weights": condition["tile_weights"],
+        }
+
+    @staticmethod
+    def build_texture_3d_patches(
+        global_coords: torch.Tensor,
+        grid_size: int = 128,
+        patch_size: int = 64,
+        patch_stride: int = 32,
+    ) -> Tuple[List[Dict[str, Any]], torch.Tensor]:
+        if global_coords.ndim != 2 or global_coords.shape[1] != 4:
+            raise ValueError("global_coords must have shape [N, 4]")
+        if torch.any(global_coords[:, 1:] < 0) or torch.any(
+            global_coords[:, 1:] >= grid_size
+        ):
+            raise ValueError("global coordinates lie outside the requested grid")
+        starts = list(range(0, grid_size - patch_size + 1, patch_stride))
+        if not starts or starts[-1] != grid_size - patch_size:
+            raise ValueError("3D patch layout must land on the final grid edge")
+        patches: List[Dict[str, Any]] = []
+        coverage = torch.zeros(
+            global_coords.shape[0], dtype=torch.int32, device=global_coords.device
+        )
+        xyz = global_coords[:, 1:]
+        for sx in starts:
+            for sy in starts:
+                for sz in starts:
+                    mask = (
+                        (xyz[:, 0] >= sx) & (xyz[:, 0] < sx + patch_size)
+                        & (xyz[:, 1] >= sy) & (xyz[:, 1] < sy + patch_size)
+                        & (xyz[:, 2] >= sz) & (xyz[:, 2] < sz + patch_size)
+                    )
+                    indices = torch.where(mask)[0]
+                    local_coords = global_coords[indices].clone()
+                    local_coords[:, 1:] -= torch.tensor(
+                        [sx, sy, sz],
+                        device=local_coords.device,
+                        dtype=local_coords.dtype,
+                    )
+                    if indices.numel() and (
+                        local_coords[:, 1:].amin() < 0
+                        or local_coords[:, 1:].amax() >= patch_size
+                    ):
+                        raise RuntimeError("3D patch local coordinates are invalid")
+                    coverage.index_add_(
+                        0, indices, torch.ones_like(indices, dtype=torch.int32)
+                    )
+                    patches.append(
+                        {
+                            "start": (sx, sy, sz),
+                            "global_indices": indices,
+                            "local_coords": local_coords,
+                        }
+                    )
+        if torch.any(coverage < 1) or torch.any(coverage > 8):
+            raise RuntimeError("strict 3D patch coverage failed")
+        return patches, coverage
+
+    @staticmethod
+    def texture_3d_patch_weights(
+        local_coords: torch.Tensor,
+        patch_size: int = 64,
+        eps: float = 1e-3,
+    ) -> torch.Tensor:
+        xyz = local_coords[:, 1:].to(torch.float32)
+        normalized = xyz / float(patch_size - 1)
+        axes = (1.0 - (2.0 * normalized - 1.0).abs()).clamp_min(eps)
+        return axes.prod(dim=1)
+
+    @staticmethod
+    def merge_texture_3d_patch_velocities(
+        token_count: int,
+        patch_results: Sequence[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+        channels: int,
+        device: torch.device,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        velocity_sum = torch.zeros(token_count, channels, device=device)
+        weight_sum = torch.zeros(token_count, 1, device=device)
+        coverage = torch.zeros(token_count, dtype=torch.int32, device=device)
+        for indices, velocity, weights in patch_results:
+            if velocity.shape != (indices.numel(), channels):
+                raise ValueError("patch velocity is not aligned with indices")
+            velocity_sum.index_add_(
+                0, indices, velocity.float() * weights[:, None].float()
+            )
+            weight_sum.index_add_(0, indices, weights[:, None].float())
+            coverage.index_add_(
+                0, indices, torch.ones_like(indices, dtype=torch.int32)
+            )
+        if (
+            torch.any(coverage < 1)
+            or torch.any(weight_sum <= 0)
+            or not torch.isfinite(velocity_sum).all()
+            or not torch.isfinite(weight_sum).all()
+        ):
+            bad = torch.where((coverage < 1) | (weight_sum[:, 0] <= 0))[0]
+            raise RuntimeError(
+                "strict patch velocity coverage failed for rows "
+                f"{bad[:16].tolist()}"
+            )
+        merged = velocity_sum / weight_sum
+        if not torch.isfinite(merged).all():
+            raise RuntimeError("merged patch velocity is non-finite")
+        return merged, coverage
 
     # =========================================================================
     # Proj mode condition building
@@ -2661,6 +2846,347 @@ class Pixal3DImageTo3DPipeline(Pipeline):
         return patch_state, trace_patch, diagnostics
 
     @torch.no_grad()
+    @torch.no_grad()
+    def _prepare_multitile_paired_condition(
+        self,
+        image_4096: Image.Image,
+        foreground_mask_4096: Image.Image,
+        global_coords: torch.Tensor,
+        projected_full_norm: torch.Tensor,
+        camera_angle_x: float,
+        distance: float,
+        mesh_scale: float,
+        grid_resolution: int = 128,
+        tile_size: int = 1024,
+        tile_stride: int = 512,
+        save_slot_proj: bool = False,
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        """Extract matched global/proj conditions for every used image tile."""
+        if image_4096.size != (4096, 4096):
+            raise ValueError("paired multi-tile extraction requires canonical 4096")
+        boxes = self.build_texture_image_tile_layout(
+            4096, tile_size, tile_stride
+        )
+        raw_uv = projected_full_norm.to(global_coords.device) * 4096.0
+        tile_ids_layout, tile_weights, assignment_uv = self.assign_texture_tiles(
+            raw_uv, boxes, canonical_size=4096
+        )
+        fused_proj: Optional[torch.Tensor] = None
+        slot_proj = None
+        global_bank_parts: List[torch.Tensor] = []
+        layout_to_bank: Dict[int, int] = {}
+        records: List[Dict[str, Any]] = []
+        extraction_started = time.perf_counter()
+        for layout_tile_id in torch.unique(
+            tile_ids_layout[tile_ids_layout >= 0], sorted=True
+        ).tolist():
+            bank_id = len(global_bank_parts)
+            layout_to_bank[int(layout_tile_id)] = bank_id
+            rows, slots = torch.where(tile_ids_layout == int(layout_tile_id))
+            x0, y0, x1, y1 = boxes[int(layout_tile_id)]
+            tile_image = image_4096.crop((x0, y0, x1, y1)).convert("RGB")
+            if tile_image.size != (tile_size, tile_size):
+                raise RuntimeError("canonical image tile has an invalid size")
+            started = time.perf_counter()
+            tile_condition = self.get_proj_cond_shape(
+                image_cond_model=self.image_cond_model_tex_1024,
+                image=[tile_image],
+                coords=global_coords[rows],
+                camera_angle_x=camera_angle_x,
+                distance=distance,
+                mesh_scale=mesh_scale,
+                grid_resolution_override=grid_resolution,
+                projection_crop_box=(
+                    x0 / 4096.0, y0 / 4096.0,
+                    x1 / 4096.0, y1 / 4096.0,
+                ),
+            )["cond"]
+            tile_global = tile_condition["global"]
+            tile_proj = tile_condition["proj"].feats
+            if tile_global.shape[0] != 1 or tile_proj.shape[0] != rows.numel():
+                raise RuntimeError("tile global/proj extraction is not row aligned")
+            if fused_proj is None:
+                fused_proj = torch.zeros(
+                    global_coords.shape[0],
+                    tile_proj.shape[1],
+                    device=tile_proj.device,
+                    dtype=tile_proj.dtype,
+                )
+                if save_slot_proj:
+                    slot_proj = torch.zeros(
+                        global_coords.shape[0],
+                        4,
+                        tile_proj.shape[1],
+                        device="cpu",
+                        dtype=tile_proj.dtype,
+                    )
+            weights = tile_weights[rows, slots].to(
+                device=tile_proj.device, dtype=tile_proj.dtype
+            )
+            fused_proj.index_add_(0, rows, tile_proj * weights[:, None])
+            if slot_proj is not None:
+                slot_proj[rows.cpu(), slots.cpu()] = tile_proj.detach().cpu()
+            global_bank_parts.append(tile_global[0])
+            foreground_ratio = float(
+                (np.asarray(foreground_mask_4096.crop((x0, y0, x1, y1))) > 0)
+                .mean()
+            )
+            seconds = time.perf_counter() - started
+            records.append(
+                {
+                    "layout_tile_id": int(layout_tile_id),
+                    "bank_tile_id": bank_id,
+                    "box": [x0, y0, x1, y1],
+                    "token_count": int(rows.numel()),
+                    "foreground_ratio": foreground_ratio,
+                    "global_shape": list(tile_global.shape),
+                    "proj_shape": list(tile_proj.shape),
+                    "seconds": seconds,
+                }
+            )
+            print(
+                f"[texture-tile-cond] tile={layout_tile_id:03d} "
+                f"box={(x0, y0, x1, y1)} tokens={rows.numel():,} "
+                f"foreground_ratio={foreground_ratio:.6f} "
+                f"global_shape={tuple(tile_global.shape)} "
+                f"proj_shape={tuple(tile_proj.shape)} seconds={seconds:.3f}"
+            )
+        if fused_proj is None:
+            raise RuntimeError("no image tile condition was extracted")
+        tile_ids = tile_ids_layout.clone()
+        for layout_id, bank_id in layout_to_bank.items():
+            tile_ids[tile_ids_layout == layout_id] = bank_id
+        global_bank = torch.stack(global_bank_parts, dim=0)
+        condition = {
+            "mode": "multi_tile_paired",
+            "global_bank": global_bank,
+            "proj": SparseTensor(feats=fused_proj, coords=global_coords),
+            "tile_ids": tile_ids,
+            "tile_weights": tile_weights.to(fused_proj.device),
+        }
+        counts = (tile_ids >= 0).sum(1)
+        histogram = {
+            int(value): int((counts == value).sum().item())
+            for value in torch.unique(counts).tolist()
+        }
+        summary = {
+            "canonical_size": 4096,
+            "tile_size": tile_size,
+            "tile_stride": tile_stride,
+            "tile_count": len(boxes),
+            "active_tile_count": len(global_bank_parts),
+            "token_count": int(global_coords.shape[0]),
+            "membership_min": int(counts.min().item()),
+            "membership_max": int(counts.max().item()),
+            "membership_histogram": histogram,
+            "weight_sum_min": float(tile_weights.sum(1).min().item()),
+            "weight_sum_max": float(tile_weights.sum(1).max().item()),
+            "raw_uv": raw_uv.detach().cpu(),
+            "assignment_uv": assignment_uv.detach().cpu(),
+            "boxes": boxes,
+            "tiles": records,
+            "slot_proj": slot_proj,
+            "seconds": time.perf_counter() - extraction_started,
+        }
+        print(
+            "[texture-image-tiles] canonical=4096x4096 "
+            f"tile={tile_size} stride={tile_stride} count={len(boxes)} "
+            f"active_tiles={len(global_bank_parts)} tokens={global_coords.shape[0]:,} "
+            f"membership_min={summary['membership_min']} "
+            f"membership_max={summary['membership_max']} "
+            f"membership_histogram={histogram} "
+            f"weight_sum_min={summary['weight_sum_min']:.8f} "
+            f"weight_sum_max={summary['weight_sum_max']:.8f}"
+        )
+        return condition, summary
+
+    @torch.no_grad()
+    def _run_multitile_3d_patch_texture_flow(
+        self,
+        flow_model: nn.Module,
+        sampler: Any,
+        global_noise: SparseTensor,
+        shape_concat_cond: SparseTensor,
+        sampler_params: Mapping[str, Any],
+        global_flow: Any,
+        condition: Mapping[str, Any],
+        start_step: int,
+        patch_size: int = 64,
+        patch_stride: int = 32,
+    ) -> Tuple[SparseTensor, Dict[str, Any], Dict[str, Any]]:
+        trajectory = global_flow.trajectory
+        if trajectory is None:
+            raise RuntimeError("global texture trajectory was not recorded")
+        num_steps = len(trajectory.velocities)
+        if len(trajectory.states) != num_steps + 1:
+            raise RuntimeError("global texture trajectory is incomplete")
+        if not 0 <= start_step <= num_steps:
+            raise ValueError("multi-tile start step is outside the trajectory")
+        selected_state = trajectory.states[start_step].to(
+            device=global_noise.device, dtype=global_noise.dtype, copy=True
+        )
+        x_global = global_noise.replace(selected_state)
+        if start_step == num_steps:
+            return x_global, {
+                "enabled": True,
+                "status": "identity_start_step_final",
+                "mode": "multi_tile_paired_3d_patch_flow",
+                "start_step": start_step,
+                "steps": [],
+                "final_state": selected_state.detach().cpu(),
+            }, {"identity": True, "patch_flow_calls": 0}
+        patches, static_coverage = self.build_texture_3d_patches(
+            global_noise.coords, 128, patch_size, patch_stride
+        )
+        coverage_histogram = {
+            int(value): int((static_coverage == value).sum().item())
+            for value in torch.unique(static_coverage).tolist()
+        }
+        print(
+            "[texture-3d-patches] grid=128 "
+            f"patch={patch_size} stride={patch_stride} count={len(patches)} "
+            f"tokens={global_noise.feats.shape[0]:,} "
+            f"coverage_min={static_coverage.min().item()} "
+            f"coverage_max={static_coverage.max().item()} "
+            f"coverage_histogram={coverage_histogram}"
+        )
+        prediction_kwargs = {
+            key: value for key, value in sampler_params.items()
+            if key not in {
+                "steps", "rescale_t", "verbose", "tqdm_desc",
+                "record_trajectory", "trajectory_device",
+                "return_model_history",
+            }
+        }
+        raw_times = np.linspace(1.0, 0.0, num_steps + 1).tolist()
+        steps: List[Dict[str, Any]] = []
+        for step_index in range(start_step, num_steps):
+            step_started = time.perf_counter()
+            x_step_start = x_global
+            mapped_t = float(trajectory.times[step_index])
+            mapped_t_next = float(trajectory.times[step_index + 1])
+            dt = float(trajectory.time_intervals[step_index])
+            if not math.isclose(
+                mapped_t - mapped_t_next, dt, rel_tol=0, abs_tol=1e-12
+            ):
+                raise RuntimeError("global trajectory timestep mismatch")
+            patch_results = []
+            for patch_index, patch in enumerate(patches):
+                indices = patch["global_indices"]
+                if indices.numel() == 0:
+                    continue
+                local_coords = patch["local_coords"]
+                x_patch = SparseTensor(
+                    feats=x_step_start.feats[indices], coords=local_coords
+                )
+                shape_patch = SparseTensor(
+                    feats=shape_concat_cond.feats[indices], coords=local_coords
+                )
+                proj_patch = SparseTensor(
+                    feats=condition["proj"].feats[indices], coords=local_coords
+                )
+                patch_condition = {
+                    "mode": "multi_tile_paired",
+                    "global_bank": condition["global_bank"],
+                    "proj": proj_patch,
+                    "tile_ids": condition["tile_ids"][indices],
+                    "tile_weights": condition["tile_weights"][indices],
+                }
+                patch_negative = self.make_multitile_negative_condition(
+                    patch_condition
+                )
+                _, _, patch_velocity = sampler._get_model_prediction(
+                    flow_model,
+                    x_patch,
+                    mapped_t,
+                    patch_condition,
+                    neg_cond=patch_negative,
+                    concat_cond=shape_patch,
+                    **prediction_kwargs,
+                )
+                if (
+                    patch_velocity.feats.shape != x_patch.feats.shape
+                    or not torch.equal(patch_velocity.coords, local_coords)
+                    or not torch.isfinite(patch_velocity.feats).all()
+                ):
+                    raise RuntimeError(
+                        f"invalid patch velocity at patch {patch_index}"
+                    )
+                weights = self.texture_3d_patch_weights(
+                    local_coords, patch_size
+                ).to(patch_velocity.device)
+                patch_results.append(
+                    (indices, patch_velocity.feats, weights)
+                )
+            merged, coverage = self.merge_texture_3d_patch_velocities(
+                token_count=x_step_start.feats.shape[0],
+                patch_results=patch_results,
+                channels=x_step_start.feats.shape[1],
+                device=x_step_start.device,
+            )
+            metrics = self._velocity_similarity(
+                merged, trajectory.velocities[step_index]
+            )
+            # The only global update in this step.
+            x_global = x_step_start.replace(
+                x_step_start.feats - dt * merged.to(x_step_start.dtype)
+            )
+            record = {
+                **metrics,
+                "step_index": step_index,
+                "raw_t": raw_times[step_index],
+                "raw_t_next": raw_times[step_index + 1],
+                "mapped_t": mapped_t,
+                "mapped_t_next": mapped_t_next,
+                "time_interval": dt,
+                "patch_count": len(patches),
+                "velocity_coverage": 1.0,
+                "velocity_coverage_min": int(coverage.min().item()),
+                "velocity_coverage_max": int(coverage.max().item()),
+                "seconds": time.perf_counter() - step_started,
+            }
+            steps.append(record)
+            print(
+                f"[texture-multitile-3d-flow] step={step_index:02d} "
+                f"raw_t={record['raw_t']:.8f}->{record['raw_t_next']:.8f} "
+                f"mapped_t={mapped_t:.8f}->{mapped_t_next:.8f} "
+                f"patches={len(patches)} tokens={x_global.feats.shape[0]:,} "
+                f"image_membership_min={(condition['tile_ids'] >= 0).sum(1).min().item()} "
+                f"image_membership_max={(condition['tile_ids'] >= 0).sum(1).max().item()} "
+                "velocity_coverage=1.000000 "
+                f"velocity_coverage_min={coverage.min().item()} "
+                f"velocity_coverage_max={coverage.max().item()} "
+                f"cos_vs_global={metrics['cosine_similarity']:.8f} "
+                f"rel_l2_vs_global={metrics['relative_l2']:.8f} "
+                f"mse_vs_global={metrics['mse']:.8e} "
+                f"seconds={record['seconds']:.3f}"
+            )
+        trace = {
+            "enabled": True,
+            "status": "complete",
+            "stage": "texture",
+            "mode": "multi_tile_paired_3d_patch_flow",
+            "condition_format_version": "multi_tile_paired_v1",
+            "grid_resolution": 128,
+            "patch_size": patch_size,
+            "patch_stride": patch_stride,
+            "patch_count": len(patches),
+            "coverage_histogram": coverage_histogram,
+            "start_step": start_step,
+            "global_update_count_per_step": 1,
+            "velocity_fallback": None,
+            "steps": steps,
+            "baseline_final_state": trajectory.states[-1],
+            "final_state": x_global.feats.detach().cpu(),
+        }
+        diagnostics = {
+            "patch_coordinate_mode": "local",
+            "condition_mode": "multi_tile_paired",
+            "velocity_fallback": None,
+            "coverage_histogram": coverage_histogram,
+        }
+        return x_global, trace, diagnostics
+
     def _prepare_hr_image_tile_conditions(
         self,
         tiles: List[Dict[str, Any]],
@@ -3351,6 +3877,16 @@ class Pixal3DImageTo3DPipeline(Pipeline):
         hr_image_tile_weight: str = "tent",
         hr_image_tile_save_debug: bool = False,
         hr_image_tile_debug_dir: Optional[Union[str, Path]] = None,
+        texture_multitile_3d_patch_flow: bool = False,
+        texture_multitile_start_step: int = 6,
+        texture_canonical_image_size: int = 4096,
+        texture_image_tile_size: int = 1024,
+        texture_image_tile_stride: int = 512,
+        texture_3d_patch_size: int = 64,
+        texture_3d_patch_stride: int = 32,
+        texture_multitile_global_mode: str = "paired_block_fusion",
+        texture_multitile_save_debug: bool = False,
+        texture_multitile_debug_dir: Optional[Union[str, Path]] = None,
     ) -> List[MeshWithVoxel]:
         """
         Run the Pixal3D pipeline (proj mode, cascade).
@@ -3425,11 +3961,42 @@ class Pixal3DImageTo3DPipeline(Pipeline):
         mesh_scale = camera_params.get('mesh_scale', 1.0)
         
         if preprocess_image:
+            hr_texture_context = self.preprocess_canonical_images(image)
+        if hr_texture_context is not None and "image_4096" in hr_texture_context:
+            image_4096 = hr_texture_context["image_4096"]
+            image_1024 = hr_texture_context["image_1024"]
+            image_512 = hr_texture_context["image_512"]
+            image = image_1024
+        else:
+            image_4096 = image
+            image_1024 = image
+            image_512 = image
+        if texture_multitile_3d_patch_flow:
+            if pipeline_type != "2048_cascade":
+                raise ValueError("multi-tile 3D patch flow requires 2048_cascade")
             if hr_image_tile_texture_flow:
-                hr_texture_context = self.preprocess_image_with_hr(image)
-                image = hr_texture_context["global_image"]
-            else:
-                image = self.preprocess_image(image)
+                raise ValueError("legacy and paired image tile flows are exclusive")
+            if texture_guidance_mode != "global_original":
+                raise ValueError("paired multi-tile flow requires global_original")
+            expected = (4096, 1024, 512, 64, 32)
+            actual = (
+                texture_canonical_image_size,
+                texture_image_tile_size,
+                texture_image_tile_stride,
+                texture_3d_patch_size,
+                texture_3d_patch_stride,
+            )
+            if actual != expected:
+                raise ValueError(
+                    "paired v1 requires canonical/tile/stride/patch/stride "
+                    f"{expected}, got {actual}"
+                )
+            if texture_multitile_global_mode != "paired_block_fusion":
+                raise ValueError("only paired_block_fusion is supported")
+            if not 0 <= texture_multitile_start_step <= 12:
+                raise ValueError("texture_multitile_start_step must be in [0,12]")
+            if hr_texture_context is None or "foreground_mask_4096" not in hr_texture_context:
+                raise ValueError("canonical preprocessing context is required")
         if hr_image_tile_texture_flow:
             if pipeline_type != "2048_cascade":
                 raise ValueError(
@@ -3521,7 +4088,7 @@ class Pixal3DImageTo3DPipeline(Pipeline):
 
         # ---- Stage 1: Sparse Structure (proj) ----
         cond_ss = self.get_proj_cond_ss(
-            [image],
+            [image_512],
             camera_angle_x=camera_angle_x,
             distance=distance,
             mesh_scale=mesh_scale,
@@ -3536,7 +4103,7 @@ class Pixal3DImageTo3DPipeline(Pipeline):
 
         # ---- Stage 2: Shape LR 512 (proj) ----
         cond_shape_lr = self.get_proj_cond_shape(
-            self.image_cond_model_shape_512, [image], coords,
+            self.image_cond_model_shape_512, [image_512], coords,
             camera_angle_x=camera_angle_x,
             distance=distance,
             mesh_scale=mesh_scale,
@@ -3606,7 +4173,7 @@ class Pixal3DImageTo3DPipeline(Pipeline):
         # ---- Stage 3b: Shape HR (proj) ----
         print("Stage 3b: Shape HR (proj)")
         cond_shape_hr = self.get_proj_cond_shape(
-            self.image_cond_model_shape_1024, [image], hr_coords_unique,
+            self.image_cond_model_shape_1024, [image_1024], hr_coords_unique,
             camera_angle_x=camera_angle_x,
             distance=distance,
             mesh_scale=mesh_scale,
@@ -3758,7 +4325,7 @@ class Pixal3DImageTo3DPipeline(Pipeline):
         # ---- Stage 4: Texture (proj) ----
         tex_grid_res = actual_hr_resolution // 16
         cond_tex = self.get_proj_cond_shape(
-            self.image_cond_model_tex_1024, [image], shape_slat.coords,
+            self.image_cond_model_tex_1024, [image_1024], shape_slat.coords,
             camera_angle_x=camera_angle_x,
             distance=distance,
             mesh_scale=mesh_scale,
@@ -3816,28 +4383,41 @@ class Pixal3DImageTo3DPipeline(Pipeline):
             texture_image_tile_enabled = bool(
                 hr_image_tile_texture_flow
             )
+            texture_multitile_enabled = bool(
+                texture_multitile_3d_patch_flow
+            )
             texture_second_pass_enabled = bool(
-                texture_patch_enabled or texture_image_tile_enabled
+                texture_patch_enabled
+                or texture_image_tile_enabled
+                or texture_multitile_enabled
             )
             pending_texture_trace = {
                 "enabled": texture_second_pass_enabled,
                 "status": (
-                    "global_complete_image_tile_pending"
-                    if texture_image_tile_enabled
+                    "global_complete_multitile_3d_pending"
+                    if texture_multitile_enabled
                     else (
-                        "global_complete_patch_pending"
-                        if texture_patch_enabled
-                        else "global_only_complete"
+                        "global_complete_image_tile_pending"
+                        if texture_image_tile_enabled
+                        else (
+                            "global_complete_patch_pending"
+                            if texture_patch_enabled
+                            else "global_only_complete"
+                        )
                     )
                 ),
                 "stage": "texture",
                 "mode": (
-                    "hr_image_tile_velocity_flow"
-                    if texture_image_tile_enabled
+                    "multi_tile_paired_3d_patch_flow"
+                    if texture_multitile_enabled
                     else (
-                        "spatial_patch_flow"
-                        if texture_patch_enabled
-                        else "global_original"
+                        "hr_image_tile_velocity_flow"
+                        if texture_image_tile_enabled
+                        else (
+                            "spatial_patch_flow"
+                            if texture_patch_enabled
+                            else "global_original"
+                        )
                     )
                 ),
                 "patch_coordinate_mode": (
@@ -3852,18 +4432,22 @@ class Pixal3DImageTo3DPipeline(Pipeline):
                 "global_latent_coordinate_mode": "global",
                 "grid_resolution": 128,
                 "patch_size": (
-                    None if texture_image_tile_enabled else 64
+                    None if texture_image_tile_enabled else int(texture_3d_patch_size)
                 ),
                 "patch_stride": (
-                    None if texture_image_tile_enabled else 32
+                    None if texture_image_tile_enabled else int(texture_3d_patch_stride)
                 ),
                 "patch_count": (
                     None if texture_image_tile_enabled else 27
                 ),
                 "start_step": int(
-                    hr_image_tile_start_step
-                    if texture_image_tile_enabled
-                    else texture_patch_start_step
+                    texture_multitile_start_step
+                    if texture_multitile_enabled
+                    else (
+                        hr_image_tile_start_step
+                        if texture_image_tile_enabled
+                        else texture_patch_start_step
+                    )
                 ),
                 "start_source": (
                     "saved_state"
@@ -3916,7 +4500,7 @@ class Pixal3DImageTo3DPipeline(Pipeline):
                     else None
                 ),
             }
-            if not texture_image_tile_enabled:
+            if not texture_image_tile_enabled and not texture_multitile_enabled:
                 # Keep the existing disabled/spatial-patch trace payload
                 # exactly unchanged.
                 pending_texture_trace = {
@@ -3973,7 +4557,155 @@ class Pixal3DImageTo3DPipeline(Pipeline):
                 f"[texture-2048-trace] global baseline saved="
                 f"{texture_flow_trace_path} bytes={baseline_tex_trace_size:,}"
             )
-            if texture_image_tile_enabled:
+            if texture_multitile_enabled:
+                if texture_multitile_start_step == 12:
+                    # Strict identity: no projection, tile DINO/NAF, or patch
+                    # model call is allowed at the final trajectory state.
+                    final_state = global_tex_flow.trajectory.states[12].to(
+                        device=tex_noise.device,
+                        dtype=tex_noise.dtype,
+                        copy=True,
+                    )
+                    tex_slat_normalized = tex_noise.replace(final_state)
+                    texture_patch_trace = {
+                        "enabled": True,
+                        "status": "identity_start_step_final",
+                        "stage": "texture",
+                        "mode": "multi_tile_paired_3d_patch_flow",
+                        "condition_format_version": "multi_tile_paired_v1",
+                        "start_step": 12,
+                        "tile_condition_calls": 0,
+                        "patch_flow_calls": 0,
+                        "final_state": final_state.detach().cpu(),
+                    }
+                    texture_diagnostics = {
+                        "patch_coordinate_mode": "local",
+                        "global_latent_coordinate_mode": "global",
+                        "patch_guidance_mode": "multi_tile_paired_3d_patch_flow",
+                        "concat_cond_present": True,
+                        "conditional_unconditional_share_concat_cond": True,
+                        "identity": True,
+                        "tile_condition_calls": 0,
+                        "patch_flow_calls": 0,
+                        "velocity_fallback": None,
+                    }
+                else:
+                    projected_full_norm, projected_depth, projection_valid = (
+                        self._project_sparse_coords_to_image_norm(
+                            image_cond_model=self.image_cond_model_tex_1024,
+                            coords=shape_slat.coords,
+                            camera_angle_x=camera_angle_x,
+                            distance=distance,
+                            mesh_scale=mesh_scale,
+                            grid_resolution=tex_grid_res,
+                        )
+                    )
+                    if not torch.isfinite(projected_full_norm).all():
+                        raise RuntimeError("texture projection contains NaN/Inf")
+                    # Projection-valid and foreground masks are diagnostics,
+                    # never membership filters.
+                    paired_condition, tile_summary = (
+                        self._prepare_multitile_paired_condition(
+                            image_4096=image_4096,
+                            foreground_mask_4096=hr_texture_context[
+                                "foreground_mask_4096"
+                            ],
+                            global_coords=shape_slat.coords,
+                            projected_full_norm=projected_full_norm,
+                            camera_angle_x=camera_angle_x,
+                            distance=distance,
+                            mesh_scale=mesh_scale,
+                            grid_resolution=tex_grid_res,
+                            tile_size=texture_image_tile_size,
+                            tile_stride=texture_image_tile_stride,
+                            save_slot_proj=texture_multitile_save_debug,
+                        )
+                    )
+                    tex_slat_normalized, texture_patch_trace, texture_diagnostics = (
+                        self._run_multitile_3d_patch_texture_flow(
+                            flow_model=tex_flow_model,
+                            sampler=self.tex_slat_sampler,
+                            global_noise=tex_noise,
+                            shape_concat_cond=shape_concat_cond,
+                            sampler_params=tex_sampler_params,
+                            global_flow=global_tex_flow,
+                            condition=paired_condition,
+                            start_step=texture_multitile_start_step,
+                            patch_size=texture_3d_patch_size,
+                            patch_stride=texture_3d_patch_stride,
+                        )
+                    )
+                    texture_patch_trace.update(
+                        {
+                            "canonical_preprocessing_version": "canonical_v1",
+                            "canonical_image_size": texture_canonical_image_size,
+                            "image_tile_size": texture_image_tile_size,
+                            "image_tile_stride": texture_image_tile_stride,
+                            "tile_count": tile_summary["tile_count"],
+                            "multi_tile_fusion_mode": texture_multitile_global_mode,
+                            "condition_summary": {
+                                key: value for key, value in tile_summary.items()
+                                if key not in {
+                                    "raw_uv", "assignment_uv", "slot_proj"
+                                }
+                            },
+                            "projection_valid_count_diagnostic_only": int(
+                                projection_valid.sum().item()
+                            ),
+                        }
+                    )
+                    texture_diagnostics.update(
+                        {
+                            "patch_guidance_mode": "multi_tile_paired_3d_patch_flow",
+                            "global_latent_coordinate_mode": "global",
+                            "concat_cond_present": True,
+                            "conditional_unconditional_share_concat_cond": True,
+                            "dino_per_active_tile": True,
+                            "naf_per_active_tile": bool(
+                                getattr(
+                                    self.image_cond_model_tex_1024,
+                                    "use_naf_upsample",
+                                    False,
+                                )
+                            ),
+                        }
+                    )
+                    if texture_multitile_save_debug:
+                        if texture_multitile_debug_dir is None:
+                            raise ValueError(
+                                "texture_multitile_debug_dir is required"
+                            )
+                        debug_dir = Path(texture_multitile_debug_dir)
+                        debug_dir.mkdir(parents=True, exist_ok=True)
+                        torch.save(
+                            paired_condition["global_bank"].detach().cpu(),
+                            debug_dir / "tile_global_bank.pt",
+                        )
+                        torch.save(
+                            paired_condition["tile_ids"].detach().cpu(),
+                            debug_dir / "token_tile_ids.pt",
+                        )
+                        torch.save(
+                            paired_condition["tile_weights"].detach().cpu(),
+                            debug_dir / "token_tile_weights.pt",
+                        )
+                        torch.save(
+                            paired_condition["proj"].feats.detach().cpu(),
+                            debug_dir / "fused_proj.pt",
+                        )
+                        if tile_summary["slot_proj"] is not None:
+                            torch.save(
+                                tile_summary["slot_proj"],
+                                debug_dir / "optional_slot_proj.pt",
+                            )
+                    del (
+                        paired_condition,
+                        tile_summary,
+                        projected_full_norm,
+                        projected_depth,
+                        projection_valid,
+                    )
+            elif texture_image_tile_enabled:
                 hr_image = hr_texture_context["hr_image"]
                 foreground_mask_hr = hr_texture_context[
                     "foreground_mask_hr"

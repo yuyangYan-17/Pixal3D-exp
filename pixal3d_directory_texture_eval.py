@@ -1148,6 +1148,37 @@ class Pixal3DGenerator:
                 if texture_flow_trace_path is not None
                 else None
             ),
+            texture_multitile_3d_patch_flow=bool(
+                self.args.texture_multitile_3d_patch_flow
+            ),
+            texture_multitile_start_step=int(
+                self.args.texture_multitile_start_step
+            ),
+            texture_canonical_image_size=int(
+                self.args.texture_canonical_image_size
+            ),
+            texture_image_tile_size=int(
+                self.args.texture_image_tile_size
+            ),
+            texture_image_tile_stride=int(
+                self.args.texture_image_tile_stride
+            ),
+            texture_3d_patch_size=int(self.args.texture_3d_patch_size),
+            texture_3d_patch_stride=int(
+                self.args.texture_3d_patch_stride
+            ),
+            texture_multitile_global_mode=str(
+                self.args.texture_multitile_global_mode
+            ),
+            texture_multitile_save_debug=bool(
+                self.args.texture_multitile_save_debug
+            ),
+            texture_multitile_debug_dir=(
+                Path(texture_flow_trace_path).parent
+                / "texture_multitile"
+                if texture_flow_trace_path is not None
+                else None
+            ),
         )
         if torch.cuda.is_available():
             torch.cuda.synchronize()
@@ -1195,12 +1226,16 @@ class Pixal3DGenerator:
                 "patch_coordinate_mode"
             )
             expected_texture_coordinate_mode = (
-                "image_tile_global_subset"
-                if self.args.hr_image_tile_texture_flow
+                "local"
+                if self.args.texture_multitile_3d_patch_flow
                 else (
-                    None
-                    if self.args.texture_mode == "global_original"
-                    else "local"
+                    "image_tile_global_subset"
+                    if self.args.hr_image_tile_texture_flow
+                    else (
+                        None
+                        if self.args.texture_mode == "global_original"
+                        else "local"
+                    )
                 )
             )
             if texture_coordinate_mode != expected_texture_coordinate_mode:
@@ -1208,10 +1243,12 @@ class Pixal3DGenerator:
                     "2048 texture flow reported an unexpected coordinate mode"
                 )
             expected_texture_guidance_mode = (
-                "hr_image_tile_velocity_flow"
-                if self.args.hr_image_tile_texture_flow
+                "multi_tile_paired_3d_patch_flow"
+                if self.args.texture_multitile_3d_patch_flow
                 else self.args.texture_mode
             )
+            if self.args.hr_image_tile_texture_flow:
+                expected_texture_guidance_mode = "hr_image_tile_velocity_flow"
             if (
                 texture_flow_diagnostics.get("patch_guidance_mode")
                 != expected_texture_guidance_mode
@@ -1227,24 +1264,38 @@ class Pixal3DGenerator:
                 raise RuntimeError(
                     "Texture CFG branches did not share shape concat_cond"
                 )
-            if self.args.hr_image_tile_texture_flow:
-                if not texture_flow_diagnostics.get(
+            if (
+                self.args.hr_image_tile_texture_flow
+                or self.args.texture_multitile_3d_patch_flow
+            ):
+                identity_multitile = (
+                    self.args.texture_multitile_3d_patch_flow
+                    and self.args.texture_multitile_start_step
+                    == TEXTURE_SAMPLER["steps"]
+                )
+                if not identity_multitile and not texture_flow_diagnostics.get(
                     "dino_per_active_tile"
                 ):
                     raise RuntimeError(
                         "HR image tiles did not independently rerun DINOv3"
                     )
-                if not texture_flow_diagnostics.get(
+                if not identity_multitile and not texture_flow_diagnostics.get(
                     "naf_per_active_tile"
                 ):
                     raise RuntimeError(
                         "HR image tiles did not independently rerun NAF"
                     )
-                if texture_flow_diagnostics.get("feature_fusion"):
+                if (
+                    self.args.hr_image_tile_texture_flow
+                    and texture_flow_diagnostics.get("feature_fusion")
+                ):
                     raise RuntimeError(
                         "HR image-tile path unexpectedly fused image features"
                     )
-                if not texture_flow_diagnostics.get("velocity_fusion"):
+                if (
+                    self.args.hr_image_tile_texture_flow
+                    and not texture_flow_diagnostics.get("velocity_fusion")
+                ):
                     raise RuntimeError(
                         "HR image-tile path did not fuse per-step velocities"
                     )
@@ -1616,6 +1667,39 @@ class Pixal3DGenerator:
                     ),
                     "hr_image_tile_save_debug": bool(
                         self.args.hr_image_tile_save_debug
+                    ),
+                }
+            )
+        if self.args.texture_multitile_3d_patch_flow:
+            metadata.update(
+                {
+                    "canonical_preprocessing_version": "canonical_v1",
+                    "texture_multitile_3d_patch_flow": True,
+                    "texture_multitile_start_step": int(
+                        self.args.texture_multitile_start_step
+                    ),
+                    "texture_canonical_image_size": int(
+                        self.args.texture_canonical_image_size
+                    ),
+                    "texture_image_tile_size": int(
+                        self.args.texture_image_tile_size
+                    ),
+                    "texture_image_tile_stride": int(
+                        self.args.texture_image_tile_stride
+                    ),
+                    "texture_image_tile_count": 49,
+                    "texture_3d_patch_size": int(
+                        self.args.texture_3d_patch_size
+                    ),
+                    "texture_3d_patch_stride": int(
+                        self.args.texture_3d_patch_stride
+                    ),
+                    "texture_multitile_global_mode": str(
+                        self.args.texture_multitile_global_mode
+                    ),
+                    "condition_format_version": "multi_tile_paired_v1",
+                    "texture_multitile_save_debug": bool(
+                        self.args.texture_multitile_save_debug
                     ),
                 }
             )
@@ -2386,6 +2470,17 @@ def flow_experiment_tag(args: argparse.Namespace) -> str:
             f"-fallback{args.hr_image_tile_fallback}"
             f"-weight{args.hr_image_tile_weight}"
         )
+    if args.texture_multitile_3d_patch_flow:
+        tag += (
+            "__mtpaired-v1-canonicalv1"
+            f"-c{int(args.texture_canonical_image_size)}"
+            f"-tile{int(args.texture_image_tile_size)}"
+            f"-istride{int(args.texture_image_tile_stride)}"
+            f"-p{int(args.texture_3d_patch_size)}"
+            f"-pstride{int(args.texture_3d_patch_stride)}"
+            f"-step{int(args.texture_multitile_start_step)}"
+            f"-mode{args.texture_multitile_global_mode}"
+        )
     return tag
 
 
@@ -2416,12 +2511,16 @@ def flow_config_matches(
             == args.shape_skip_residual_mode
             and metadata.get("texture_patch_coordinate_mode")
             == (
-                "image_tile_global_subset"
-                if args.hr_image_tile_texture_flow
+                "local"
+                if args.texture_multitile_3d_patch_flow
                 else (
-                    None
-                    if args.texture_mode == "global_original"
-                    else "local"
+                    "image_tile_global_subset"
+                    if args.hr_image_tile_texture_flow
+                    else (
+                        None
+                        if args.texture_mode == "global_original"
+                        else "local"
+                    )
                 )
             )
             and int(metadata.get("texture_start_step", -1))
@@ -2441,9 +2540,33 @@ def flow_config_matches(
         )
         if not common_matches:
             return False
+        if args.texture_multitile_3d_patch_flow:
+            return bool(
+                metadata.get("texture_multitile_3d_patch_flow")
+                and metadata.get("canonical_preprocessing_version")
+                == "canonical_v1"
+                and metadata.get("condition_format_version")
+                == "multi_tile_paired_v1"
+                and int(metadata.get("texture_canonical_image_size", -1))
+                == int(args.texture_canonical_image_size)
+                and int(metadata.get("texture_image_tile_size", -1))
+                == int(args.texture_image_tile_size)
+                and int(metadata.get("texture_image_tile_stride", -1))
+                == int(args.texture_image_tile_stride)
+                and int(metadata.get("texture_image_tile_count", -1)) == 49
+                and int(metadata.get("texture_3d_patch_size", -1))
+                == int(args.texture_3d_patch_size)
+                and int(metadata.get("texture_3d_patch_stride", -1))
+                == int(args.texture_3d_patch_stride)
+                and int(metadata.get("texture_multitile_start_step", -1))
+                == int(args.texture_multitile_start_step)
+                and metadata.get("texture_multitile_global_mode")
+                == args.texture_multitile_global_mode
+            )
         if not args.hr_image_tile_texture_flow:
             return not bool(
                 metadata.get("hr_image_tile_texture_flow", False)
+                or metadata.get("texture_multitile_3d_patch_flow", False)
             )
         return bool(
             metadata.get("hr_image_tile_texture_flow")
@@ -2526,6 +2649,18 @@ def selected_generation_fields(
         "hr_image_tile_fallback",
         "hr_image_tile_weight",
         "hr_image_tile_save_debug",
+        "canonical_preprocessing_version",
+        "texture_multitile_3d_patch_flow",
+        "texture_multitile_start_step",
+        "texture_canonical_image_size",
+        "texture_image_tile_size",
+        "texture_image_tile_stride",
+        "texture_image_tile_count",
+        "texture_3d_patch_size",
+        "texture_3d_patch_stride",
+        "texture_multitile_global_mode",
+        "condition_format_version",
+        "texture_multitile_save_debug",
         "shape_flow_diagnostics",
         "texture_flow_diagnostics",
     )
@@ -2676,8 +2811,8 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=False,
         help=(
-            "Run independent DINOv3/NAF conditions for HR image tiles and "
-            "merge their texture velocities at each latter Euler step."
+            "LEGACY: run 2D-image-tile token-subset texture flow. This does "
+            "not preserve full 3D patch self-attention."
         ),
     )
     parser.add_argument(
@@ -2729,6 +2864,44 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=False,
         help="Save HR tile crops, mask, projection overlays, and metadata.",
+    )
+    parser.add_argument(
+        "--texture-multitile-3d-patch-flow",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Use paired per-tile global/proj fusion inside each block and "
+            "strict 64^3 overlapping 3D texture patches."
+        ),
+    )
+    parser.add_argument(
+        "--texture-multitile-start-step", type=int, default=6,
+        help="Restore global texture states[N], then execute N..11.",
+    )
+    parser.add_argument(
+        "--texture-canonical-image-size", type=int, default=4096,
+    )
+    parser.add_argument(
+        "--texture-image-tile-size", type=int, default=1024,
+    )
+    parser.add_argument(
+        "--texture-image-tile-stride", type=int, default=512,
+    )
+    parser.add_argument(
+        "--texture-3d-patch-size", type=int, default=64,
+    )
+    parser.add_argument(
+        "--texture-3d-patch-stride", type=int, default=32,
+    )
+    parser.add_argument(
+        "--texture-multitile-global-mode",
+        choices=("paired_block_fusion",),
+        default="paired_block_fusion",
+    )
+    parser.add_argument(
+        "--texture-multitile-save-debug",
+        action=argparse.BooleanOptionalAction,
+        default=False,
     )
 
     parser.add_argument(
@@ -2878,6 +3051,32 @@ def parse_args() -> argparse.Namespace:
             "--hr-image-tile-texture-flow cannot be combined with a local "
             "--texture-mode; keep --texture-mode global_original"
         )
+    if args.texture_multitile_3d_patch_flow:
+        if args.hr_image_tile_texture_flow:
+            parser.error("legacy and paired image tile flows are exclusive")
+        if args.texture_mode != "global_original":
+            parser.error(
+                "--texture-multitile-3d-patch-flow requires "
+                "--texture-mode global_original"
+            )
+        expected = (4096, 1024, 512, 64, 32)
+        actual = (
+            args.texture_canonical_image_size,
+            args.texture_image_tile_size,
+            args.texture_image_tile_stride,
+            args.texture_3d_patch_size,
+            args.texture_3d_patch_stride,
+        )
+        if actual != expected:
+            parser.error(
+                "paired v1 requires canonical/tile/image-stride/patch/"
+                f"patch-stride={expected}"
+            )
+        if not 0 <= args.texture_multitile_start_step <= TEXTURE_SAMPLER["steps"]:
+            parser.error(
+                "--texture-multitile-start-step must lie in "
+                f"[0, {TEXTURE_SAMPLER['steps']}]"
+            )
     if args.decimation_target <= 0:
         parser.error("--decimation-target must be positive")
     if args.texture_size <= 0:
@@ -2969,12 +3168,16 @@ def main() -> int:
                     source_copy = source.convert("RGBA")
                 source_copy.save(image_output_dir / "input_original.png")
 
-                hr_texture_context: Optional[Dict[str, Any]] = None
-                if args.hr_image_tile_texture_flow:
-                    hr_texture_context = (
-                        pipeline.preprocess_image_with_hr(source_copy)
-                    )
-                    condition_image = hr_texture_context["global_image"]
+                # Exactly one foreground/bbox/crop operation creates every
+                # stage input and the 4K tile source.
+                hr_texture_context: Optional[Dict[str, Any]] = (
+                    pipeline.preprocess_canonical_images(source_copy)
+                )
+                condition_image = hr_texture_context["image_1024"]
+                if (
+                    args.hr_image_tile_texture_flow
+                    or args.texture_multitile_3d_patch_flow
+                ):
                     hr_image_path = (
                         image_output_dir / "input_preprocessed_hr.png"
                     )
@@ -2984,16 +3187,15 @@ def main() -> int:
                     global_to_hr_transform_path = (
                         image_output_dir / "global_to_hr_transform.json"
                     )
-                    hr_texture_context["hr_image"].save(hr_image_path)
-                    hr_texture_context["foreground_mask_hr"].save(
+                    hr_texture_context["image_4096"].save(hr_image_path)
+                    hr_texture_context["foreground_mask_4096"].save(
                         foreground_mask_hr_path
                     )
                     atomic_json(
                         global_to_hr_transform_path,
-                        hr_texture_context["global_to_hr_transform"],
+                        hr_texture_context["metadata"],
                     )
                 else:
-                    condition_image = pipeline.preprocess_image(source_copy)
                     hr_image_path = None
                     foreground_mask_hr_path = None
                     global_to_hr_transform_path = None
