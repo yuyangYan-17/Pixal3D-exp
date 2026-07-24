@@ -2895,7 +2895,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--texture-multitile-global-mode",
-        choices=("paired_block_fusion", "target_context_hard"),
+        choices=(
+            "paired_block_fusion",
+            "target_context_hard",
+            "membership_velocity_fusion",
+        ),
         default="paired_block_fusion",
     )
     parser.add_argument(
