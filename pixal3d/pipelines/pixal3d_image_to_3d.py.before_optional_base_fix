@@ -2855,7 +2855,7 @@ class Pixal3DImageTo3DPipeline(Pipeline):
         camera_angle_x: float,
         distance: float,
         mesh_scale: float,
-        base_condition: Mapping[str, Any] = None,
+        base_condition: Mapping[str, Any],
         grid_resolution: int = 128,
         tile_size: int = 1024,
         tile_stride: int = 512,
@@ -2878,38 +2878,24 @@ class Pixal3DImageTo3DPipeline(Pipeline):
         if image_4096.size != (4096, 4096):
             raise ValueError("multi-tile extraction requires canonical 4096")
 
-        base_condition_available = base_condition is not None
-        base_global = None
-        base_proj = None
-        if base_condition_available:
-            base_global = base_condition.get("global")
-            base_proj = base_condition.get("proj")
-            if not isinstance(base_global, torch.Tensor):
-                raise TypeError(
-                    "base_condition['global'] must be a tensor"
-                )
-            if not isinstance(base_proj, SparseTensor):
-                raise TypeError(
-                    "base_condition['proj'] must be a SparseTensor"
-                )
-            if base_global.ndim != 3 or base_global.shape[0] != 1:
-                raise ValueError(
-                    "base full-image global must have shape [1, L, C]"
-                )
-            if base_proj.feats.shape[0] != global_coords.shape[0]:
-                raise RuntimeError(
-                    "base projected feature is not token aligned"
-                )
-            if not torch.equal(base_proj.coords, global_coords):
-                raise RuntimeError(
-                    "base projected coordinates changed token order"
-                )
-            if not torch.isfinite(base_global).all():
-                raise RuntimeError("base global contains NaN/Inf")
-            if not torch.isfinite(base_proj.feats).all():
-                raise RuntimeError(
-                    "base projected feature contains NaN/Inf"
-                )
+        base_global = base_condition.get("global")
+        base_proj = base_condition.get("proj")
+        if not isinstance(base_global, torch.Tensor):
+            raise TypeError("base_condition['global'] must be a tensor")
+        if not isinstance(base_proj, SparseTensor):
+            raise TypeError("base_condition['proj'] must be a SparseTensor")
+        if base_global.ndim != 3 or base_global.shape[0] != 1:
+            raise ValueError(
+                "base full-image global must have shape [1, L, C]"
+            )
+        if base_proj.feats.shape[0] != global_coords.shape[0]:
+            raise RuntimeError("base projected feature is not token aligned")
+        if not torch.equal(base_proj.coords, global_coords):
+            raise RuntimeError("base projected coordinates changed token order")
+        if not torch.isfinite(base_global).all():
+            raise RuntimeError("base global contains NaN/Inf")
+        if not torch.isfinite(base_proj.feats).all():
+            raise RuntimeError("base projected feature contains NaN/Inf")
 
         boxes = self.build_texture_image_tile_layout(
             4096, tile_size, tile_stride
@@ -2945,8 +2931,8 @@ class Pixal3DImageTo3DPipeline(Pipeline):
                 f"{bad[:16].tolist()}"
             )
 
-        fused_proj = None
-        owner_proj = None
+        fused_proj = torch.zeros_like(base_proj.feats)
+        owner_proj = torch.zeros_like(base_proj.feats)
         owner_write_count = torch.zeros(
             global_coords.shape[0],
             dtype=torch.int32,
@@ -3004,21 +2990,10 @@ class Pixal3DImageTo3DPipeline(Pipeline):
                 raise RuntimeError(
                     "tile global/proj extraction is not row aligned"
                 )
-            if (
-                base_proj is not None
-                and tile_proj.shape[1] != base_proj.feats.shape[1]
-            ):
+            if tile_proj.shape[1] != base_proj.feats.shape[1]:
                 raise RuntimeError(
                     "local and base projected channel counts differ"
                 )
-            if fused_proj is None:
-                fused_proj = torch.zeros(
-                    global_coords.shape[0],
-                    tile_proj.shape[1],
-                    device=tile_proj.device,
-                    dtype=tile_proj.dtype,
-                )
-                owner_proj = torch.zeros_like(fused_proj)
             if not torch.isfinite(tile_global).all():
                 raise RuntimeError(
                     f"tile {layout_tile_id} global contains NaN/Inf"
@@ -3099,22 +3074,6 @@ class Pixal3DImageTo3DPipeline(Pipeline):
 
         if not global_bank_parts:
             raise RuntimeError("no image tile condition was extracted")
-        if fused_proj is None or owner_proj is None:
-            raise RuntimeError(
-                "tile extraction did not initialize projected features"
-            )
-        if not base_condition_available:
-            # Legacy paired-fusion tests historically called this internal
-            # helper without a full-image condition. These placeholders keep
-            # that old preparation path numerically unchanged. The
-            # target_context_hard runner rejects them explicitly below.
-            base_global = torch.zeros_like(
-                global_bank_parts[0]
-            ).unsqueeze(0)
-            base_proj = SparseTensor(
-                feats=torch.zeros_like(fused_proj),
-                coords=global_coords,
-            )
         if torch.any(owner_write_count != 1):
             bad = torch.where(owner_write_count != 1)[0]
             raise RuntimeError(
@@ -3150,7 +3109,6 @@ class Pixal3DImageTo3DPipeline(Pipeline):
             "tile_ids": tile_ids,
             "tile_weights": tile_weights.to(fused_proj.device),
             # New target/context representation.
-            "base_condition_available": base_condition_available,
             "base_global": base_global,
             "base_proj": base_proj,
             "owner_tile_ids": owner_tile_ids,
@@ -3305,11 +3263,6 @@ class Pixal3DImageTo3DPipeline(Pipeline):
             )
 
         if fusion_mode == "target_context_hard":
-            if not condition.get("base_condition_available", False):
-                raise RuntimeError(
-                    "target_context_hard requires the canonical "
-                    "full-image base condition"
-                )
             required = {
                 "global_bank",
                 "base_global",

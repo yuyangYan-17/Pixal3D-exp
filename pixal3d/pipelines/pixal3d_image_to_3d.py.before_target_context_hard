@@ -2846,6 +2846,7 @@ class Pixal3DImageTo3DPipeline(Pipeline):
         return patch_state, trace_patch, diagnostics
 
     @torch.no_grad()
+    @torch.no_grad()
     def _prepare_multitile_paired_condition(
         self,
         image_4096: Image.Image,
@@ -2855,129 +2856,37 @@ class Pixal3DImageTo3DPipeline(Pipeline):
         camera_angle_x: float,
         distance: float,
         mesh_scale: float,
-        base_condition: Mapping[str, Any] = None,
         grid_resolution: int = 128,
         tile_size: int = 1024,
         tile_stride: int = 512,
         save_slot_proj: bool = False,
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-        """Extract local tile conditions plus one hard owner tile per token.
-
-        ``proj`` and ``tile_ids/tile_weights`` preserve the previous paired
-        block-fusion representation for comparison.  The new target/context
-        path additionally stores:
-
-        * ``base_global`` / ``base_proj``: canonical full-image condition.
-        * ``owner_tile_ids``: one center-preferred local tile per token.
-        * ``owner_proj``: the projected feature from that same owner tile.
-
-        This keeps every local target pair strictly matched while allowing all
-        non-target rows in a 64^3 expert forward to use a valid full-image
-        context condition.
-        """
+        """Extract matched global/proj conditions for every used image tile."""
         if image_4096.size != (4096, 4096):
-            raise ValueError("multi-tile extraction requires canonical 4096")
-
-        base_condition_available = base_condition is not None
-        base_global = None
-        base_proj = None
-        if base_condition_available:
-            base_global = base_condition.get("global")
-            base_proj = base_condition.get("proj")
-            if not isinstance(base_global, torch.Tensor):
-                raise TypeError(
-                    "base_condition['global'] must be a tensor"
-                )
-            if not isinstance(base_proj, SparseTensor):
-                raise TypeError(
-                    "base_condition['proj'] must be a SparseTensor"
-                )
-            if base_global.ndim != 3 or base_global.shape[0] != 1:
-                raise ValueError(
-                    "base full-image global must have shape [1, L, C]"
-                )
-            if base_proj.feats.shape[0] != global_coords.shape[0]:
-                raise RuntimeError(
-                    "base projected feature is not token aligned"
-                )
-            if not torch.equal(base_proj.coords, global_coords):
-                raise RuntimeError(
-                    "base projected coordinates changed token order"
-                )
-            if not torch.isfinite(base_global).all():
-                raise RuntimeError("base global contains NaN/Inf")
-            if not torch.isfinite(base_proj.feats).all():
-                raise RuntimeError(
-                    "base projected feature contains NaN/Inf"
-                )
-
+            raise ValueError("paired multi-tile extraction requires canonical 4096")
         boxes = self.build_texture_image_tile_layout(
             4096, tile_size, tile_stride
         )
         raw_uv = projected_full_norm.to(global_coords.device) * 4096.0
-        tile_ids_layout, tile_weights, assignment_uv = (
-            self.assign_texture_tiles(
-                raw_uv,
-                boxes,
-                canonical_size=4096,
-            )
+        tile_ids_layout, tile_weights, assignment_uv = self.assign_texture_tiles(
+            raw_uv, boxes, canonical_size=4096
         )
-
-        # Hard owner = covering crop in which the projected point has the
-        # largest 2D tent weight.  Overlap is therefore used to keep points
-        # away from crop borders, but each target row has one unambiguous
-        # local (global, proj) pair.
-        owner_scores = tile_weights.masked_fill(
-            tile_ids_layout < 0,
-            -torch.inf,
-        )
-        owner_slots = owner_scores.argmax(dim=1)
-        owner_layout_ids = tile_ids_layout.gather(
-            1, owner_slots[:, None]
-        )[:, 0]
-        owner_raw_weights = tile_weights.gather(
-            1, owner_slots[:, None]
-        )[:, 0]
-        if torch.any(owner_layout_ids < 0):
-            bad = torch.where(owner_layout_ids < 0)[0]
-            raise RuntimeError(
-                "hard image-tile routing left tokens without owners: "
-                f"{bad[:16].tolist()}"
-            )
-
-        fused_proj = None
-        owner_proj = None
-        owner_write_count = torch.zeros(
-            global_coords.shape[0],
-            dtype=torch.int32,
-            device=global_coords.device,
-        )
+        fused_proj: Optional[torch.Tensor] = None
         slot_proj = None
         global_bank_parts: List[torch.Tensor] = []
         layout_to_bank: Dict[int, int] = {}
         records: List[Dict[str, Any]] = []
         extraction_started = time.perf_counter()
-
-        used_layout_ids = torch.unique(
-            tile_ids_layout[tile_ids_layout >= 0],
-            sorted=True,
-        ).tolist()
-        for layout_tile_id in used_layout_ids:
-            layout_tile_id = int(layout_tile_id)
+        for layout_tile_id in torch.unique(
+            tile_ids_layout[tile_ids_layout >= 0], sorted=True
+        ).tolist():
             bank_id = len(global_bank_parts)
-            layout_to_bank[layout_tile_id] = bank_id
-            rows, slots = torch.where(
-                tile_ids_layout == layout_tile_id
-            )
-            x0, y0, x1, y1 = boxes[layout_tile_id]
-            tile_image = image_4096.crop(
-                (x0, y0, x1, y1)
-            ).convert("RGB")
+            layout_to_bank[int(layout_tile_id)] = bank_id
+            rows, slots = torch.where(tile_ids_layout == int(layout_tile_id))
+            x0, y0, x1, y1 = boxes[int(layout_tile_id)]
+            tile_image = image_4096.crop((x0, y0, x1, y1)).convert("RGB")
             if tile_image.size != (tile_size, tile_size):
-                raise RuntimeError(
-                    "canonical image tile has an invalid size"
-                )
-
+                raise RuntimeError("canonical image tile has an invalid size")
             started = time.perf_counter()
             tile_condition = self.get_proj_cond_shape(
                 image_cond_model=self.image_cond_model_tex_1024,
@@ -2988,29 +2897,14 @@ class Pixal3DImageTo3DPipeline(Pipeline):
                 mesh_scale=mesh_scale,
                 grid_resolution_override=grid_resolution,
                 projection_crop_box=(
-                    x0 / 4096.0,
-                    y0 / 4096.0,
-                    x1 / 4096.0,
-                    y1 / 4096.0,
+                    x0 / 4096.0, y0 / 4096.0,
+                    x1 / 4096.0, y1 / 4096.0,
                 ),
             )["cond"]
             tile_global = tile_condition["global"]
             tile_proj = tile_condition["proj"].feats
-            if (
-                tile_global.ndim != 3
-                or tile_global.shape[0] != 1
-                or tile_proj.shape[0] != rows.numel()
-            ):
-                raise RuntimeError(
-                    "tile global/proj extraction is not row aligned"
-                )
-            if (
-                base_proj is not None
-                and tile_proj.shape[1] != base_proj.feats.shape[1]
-            ):
-                raise RuntimeError(
-                    "local and base projected channel counts differ"
-                )
+            if tile_global.shape[0] != 1 or tile_proj.shape[0] != rows.numel():
+                raise RuntimeError("tile global/proj extraction is not row aligned")
             if fused_proj is None:
                 fused_proj = torch.zeros(
                     global_coords.shape[0],
@@ -3018,38 +2912,7 @@ class Pixal3DImageTo3DPipeline(Pipeline):
                     device=tile_proj.device,
                     dtype=tile_proj.dtype,
                 )
-                owner_proj = torch.zeros_like(fused_proj)
-            if not torch.isfinite(tile_global).all():
-                raise RuntimeError(
-                    f"tile {layout_tile_id} global contains NaN/Inf"
-                )
-            if not torch.isfinite(tile_proj).all():
-                raise RuntimeError(
-                    f"tile {layout_tile_id} proj contains NaN/Inf"
-                )
-
-            weights = tile_weights[rows, slots].to(
-                device=tile_proj.device,
-                dtype=tile_proj.dtype,
-            )
-            fused_proj.index_add_(
-                0,
-                rows,
-                tile_proj * weights[:, None],
-            )
-
-            owner_mask = owner_layout_ids[rows] == layout_tile_id
-            owner_rows = rows[owner_mask]
-            if owner_rows.numel() > 0:
-                owner_proj[owner_rows] = tile_proj[owner_mask]
-                owner_write_count.index_add_(
-                    0,
-                    owner_rows,
-                    torch.ones_like(owner_rows, dtype=torch.int32),
-                )
-
-            if save_slot_proj:
-                if slot_proj is None:
+                if save_slot_proj:
                     slot_proj = torch.zeros(
                         global_coords.shape[0],
                         4,
@@ -3057,29 +2920,24 @@ class Pixal3DImageTo3DPipeline(Pipeline):
                         device="cpu",
                         dtype=tile_proj.dtype,
                     )
-                slot_proj[rows.cpu(), slots.cpu()] = (
-                    tile_proj.detach().cpu()
-                )
-
+            weights = tile_weights[rows, slots].to(
+                device=tile_proj.device, dtype=tile_proj.dtype
+            )
+            fused_proj.index_add_(0, rows, tile_proj * weights[:, None])
+            if slot_proj is not None:
+                slot_proj[rows.cpu(), slots.cpu()] = tile_proj.detach().cpu()
             global_bank_parts.append(tile_global[0])
             foreground_ratio = float(
-                (
-                    np.asarray(
-                        foreground_mask_4096.crop(
-                            (x0, y0, x1, y1)
-                        )
-                    )
-                    > 0
-                ).mean()
+                (np.asarray(foreground_mask_4096.crop((x0, y0, x1, y1))) > 0)
+                .mean()
             )
             seconds = time.perf_counter() - started
             records.append(
                 {
-                    "layout_tile_id": layout_tile_id,
+                    "layout_tile_id": int(layout_tile_id),
                     "bank_tile_id": bank_id,
                     "box": [x0, y0, x1, y1],
                     "token_count": int(rows.numel()),
-                    "owner_token_count": int(owner_rows.numel()),
                     "foreground_ratio": foreground_ratio,
                     "global_shape": list(tile_global.shape),
                     "proj_shape": list(tile_proj.shape),
@@ -3088,88 +2946,28 @@ class Pixal3DImageTo3DPipeline(Pipeline):
             )
             print(
                 f"[texture-tile-cond] tile={layout_tile_id:03d} "
-                f"box={(x0, y0, x1, y1)} "
-                f"tokens={rows.numel():,} "
-                f"owners={owner_rows.numel():,} "
+                f"box={(x0, y0, x1, y1)} tokens={rows.numel():,} "
                 f"foreground_ratio={foreground_ratio:.6f} "
                 f"global_shape={tuple(tile_global.shape)} "
-                f"proj_shape={tuple(tile_proj.shape)} "
-                f"seconds={seconds:.3f}"
+                f"proj_shape={tuple(tile_proj.shape)} seconds={seconds:.3f}"
             )
-
-        if not global_bank_parts:
+        if fused_proj is None:
             raise RuntimeError("no image tile condition was extracted")
-        if fused_proj is None or owner_proj is None:
-            raise RuntimeError(
-                "tile extraction did not initialize projected features"
-            )
-        if not base_condition_available:
-            # Legacy paired-fusion tests historically called this internal
-            # helper without a full-image condition. These placeholders keep
-            # that old preparation path numerically unchanged. The
-            # target_context_hard runner rejects them explicitly below.
-            base_global = torch.zeros_like(
-                global_bank_parts[0]
-            ).unsqueeze(0)
-            base_proj = SparseTensor(
-                feats=torch.zeros_like(fused_proj),
-                coords=global_coords,
-            )
-        if torch.any(owner_write_count != 1):
-            bad = torch.where(owner_write_count != 1)[0]
-            raise RuntimeError(
-                "owner projected features were not written exactly once: "
-                f"{bad[:16].tolist()}"
-            )
-        if not torch.isfinite(fused_proj).all():
-            raise RuntimeError("fused projected features contain NaN/Inf")
-        if not torch.isfinite(owner_proj).all():
-            raise RuntimeError("owner projected features contain NaN/Inf")
-
-        tile_ids = torch.full_like(tile_ids_layout, -1)
-        owner_tile_ids = torch.full_like(owner_layout_ids, -1)
+        tile_ids = tile_ids_layout.clone()
         for layout_id, bank_id in layout_to_bank.items():
             tile_ids[tile_ids_layout == layout_id] = bank_id
-            owner_tile_ids[owner_layout_ids == layout_id] = bank_id
-        if torch.any(owner_tile_ids < 0):
-            bad = torch.where(owner_tile_ids < 0)[0]
-            raise RuntimeError(
-                "failed to remap owner tile IDs: "
-                f"{bad[:16].tolist()}"
-            )
-
         global_bank = torch.stack(global_bank_parts, dim=0)
         condition = {
-            # Previous representation retained for paired_block_fusion.
             "mode": "multi_tile_paired",
             "global_bank": global_bank,
-            "proj": SparseTensor(
-                feats=fused_proj,
-                coords=global_coords,
-            ),
+            "proj": SparseTensor(feats=fused_proj, coords=global_coords),
             "tile_ids": tile_ids,
             "tile_weights": tile_weights.to(fused_proj.device),
-            # New target/context representation.
-            "base_condition_available": base_condition_available,
-            "base_global": base_global,
-            "base_proj": base_proj,
-            "owner_tile_ids": owner_tile_ids,
-            "owner_slots": owner_slots,
-            "owner_weights": owner_raw_weights,
-            "owner_proj": SparseTensor(
-                feats=owner_proj,
-                coords=global_coords,
-            ),
         }
-
         counts = (tile_ids >= 0).sum(1)
         histogram = {
             int(value): int((counts == value).sum().item())
             for value in torch.unique(counts).tolist()
-        }
-        owner_histogram = {
-            int(value): int((owner_tile_ids == value).sum().item())
-            for value in torch.unique(owner_tile_ids).tolist()
         }
         summary = {
             "canonical_size": 4096,
@@ -3181,9 +2979,6 @@ class Pixal3DImageTo3DPipeline(Pipeline):
             "membership_min": int(counts.min().item()),
             "membership_max": int(counts.max().item()),
             "membership_histogram": histogram,
-            "owner_histogram": owner_histogram,
-            "owner_weight_min": float(owner_raw_weights.min().item()),
-            "owner_weight_max": float(owner_raw_weights.max().item()),
             "weight_sum_min": float(tile_weights.sum(1).min().item()),
             "weight_sum_max": float(tile_weights.sum(1).max().item()),
             "raw_uv": raw_uv.detach().cpu(),
@@ -3195,15 +2990,11 @@ class Pixal3DImageTo3DPipeline(Pipeline):
         }
         print(
             "[texture-image-tiles] canonical=4096x4096 "
-            f"tile={tile_size} stride={tile_stride} "
-            f"count={len(boxes)} "
-            f"active_tiles={len(global_bank_parts)} "
-            f"tokens={global_coords.shape[0]:,} "
+            f"tile={tile_size} stride={tile_stride} count={len(boxes)} "
+            f"active_tiles={len(global_bank_parts)} tokens={global_coords.shape[0]:,} "
             f"membership_min={summary['membership_min']} "
             f"membership_max={summary['membership_max']} "
             f"membership_histogram={histogram} "
-            f"owner_weight_min={summary['owner_weight_min']:.8f} "
-            f"owner_weight_max={summary['owner_weight_max']:.8f} "
             f"weight_sum_min={summary['weight_sum_min']:.8f} "
             f"weight_sum_max={summary['weight_sum_max']:.8f}"
         )
@@ -3222,27 +3013,7 @@ class Pixal3DImageTo3DPipeline(Pipeline):
         start_step: int,
         patch_size: int = 64,
         patch_stride: int = 32,
-        fusion_mode: str = "paired_block_fusion",
     ) -> Tuple[SparseTensor, Dict[str, Any], Dict[str, Any]]:
-        """Resume texture flow with either old paired fusion or target/context experts.
-
-        ``target_context_hard`` runs one complete 64^3 Flow forward per owner
-        tile present in a patch.  Target rows use that tile's matched local
-        global/proj; every other row remains in the complete patch as valid
-        three-dimensional context and uses the canonical full-image
-        global/proj.  Only target-row velocities are collected.  No velocity
-        fallback is permitted.
-        """
-        allowed_modes = {
-            "paired_block_fusion",
-            "target_context_hard",
-        }
-        if fusion_mode not in allowed_modes:
-            raise ValueError(
-                f"unsupported multi-tile fusion mode {fusion_mode!r}; "
-                f"expected one of {sorted(allowed_modes)}"
-            )
-
         trajectory = global_flow.trajectory
         if trajectory is None:
             raise RuntimeError("global texture trajectory was not recorded")
@@ -3250,109 +3021,22 @@ class Pixal3DImageTo3DPipeline(Pipeline):
         if len(trajectory.states) != num_steps + 1:
             raise RuntimeError("global texture trajectory is incomplete")
         if not 0 <= start_step <= num_steps:
-            raise ValueError(
-                "multi-tile start step is outside the trajectory"
-            )
-        if global_noise.feats.shape[0] != shape_concat_cond.feats.shape[0]:
-            raise RuntimeError(
-                "texture noise and shape condition token counts differ"
-            )
-        if not torch.equal(
-            global_noise.coords,
-            shape_concat_cond.coords,
-        ):
-            raise RuntimeError(
-                "texture noise and shape condition coordinates differ"
-            )
-
-        mode_name = (
-            "multi_tile_target_context_hard_3d_patch_flow"
-            if fusion_mode == "target_context_hard"
-            else "multi_tile_paired_3d_patch_flow"
-        )
-        condition_version = (
-            "multi_tile_target_context_hard_v1"
-            if fusion_mode == "target_context_hard"
-            else "multi_tile_paired_v1"
-        )
-
+            raise ValueError("multi-tile start step is outside the trajectory")
         selected_state = trajectory.states[start_step].to(
-            device=global_noise.device,
-            dtype=global_noise.dtype,
-            copy=True,
+            device=global_noise.device, dtype=global_noise.dtype, copy=True
         )
         x_global = global_noise.replace(selected_state)
         if start_step == num_steps:
-            return (
-                x_global,
-                {
-                    "enabled": True,
-                    "status": "identity_start_step_final",
-                    "mode": mode_name,
-                    "condition_format_version": condition_version,
-                    "start_step": start_step,
-                    "steps": [],
-                    "patch_flow_calls": 0,
-                    "expert_flow_calls": 0,
-                    "final_state": selected_state.detach().cpu(),
-                },
-                {
-                    "identity": True,
-                    "patch_flow_calls": 0,
-                    "expert_flow_calls": 0,
-                    "condition_mode": fusion_mode,
-                },
-            )
-
-        if fusion_mode == "target_context_hard":
-            if not condition.get("base_condition_available", False):
-                raise RuntimeError(
-                    "target_context_hard requires the canonical "
-                    "full-image base condition"
-                )
-            required = {
-                "global_bank",
-                "base_global",
-                "base_proj",
-                "owner_tile_ids",
-                "owner_proj",
-            }
-            missing = required - set(condition)
-            if missing:
-                raise KeyError(
-                    "target/context condition is missing: "
-                    f"{sorted(missing)}"
-                )
-            if not isinstance(condition["base_proj"], SparseTensor):
-                raise TypeError("base_proj must be a SparseTensor")
-            if not isinstance(condition["owner_proj"], SparseTensor):
-                raise TypeError("owner_proj must be a SparseTensor")
-            for key in ("base_proj", "owner_proj"):
-                projection = condition[key]
-                if projection.feats.shape[0] != global_noise.feats.shape[0]:
-                    raise RuntimeError(f"{key} is not token aligned")
-                if not torch.equal(
-                    projection.coords,
-                    global_noise.coords,
-                ):
-                    raise RuntimeError(f"{key} coordinates are misaligned")
-            if condition["owner_tile_ids"].shape != (
-                global_noise.feats.shape[0],
-            ):
-                raise RuntimeError("owner tile IDs are not token aligned")
-            if torch.any(condition["owner_tile_ids"] < 0):
-                raise RuntimeError("owner tile IDs contain invalid values")
-            if torch.any(
-                condition["owner_tile_ids"]
-                >= condition["global_bank"].shape[0]
-            ):
-                raise RuntimeError("owner tile IDs exceed global bank")
-
+            return x_global, {
+                "enabled": True,
+                "status": "identity_start_step_final",
+                "mode": "multi_tile_paired_3d_patch_flow",
+                "start_step": start_step,
+                "steps": [],
+                "final_state": selected_state.detach().cpu(),
+            }, {"identity": True, "patch_flow_calls": 0}
         patches, static_coverage = self.build_texture_3d_patches(
-            global_noise.coords,
-            128,
-            patch_size,
-            patch_stride,
+            global_noise.coords, 128, patch_size, patch_stride
         )
         coverage_histogram = {
             int(value): int((static_coverage == value).sum().item())
@@ -3360,448 +3044,129 @@ class Pixal3DImageTo3DPipeline(Pipeline):
         }
         print(
             "[texture-3d-patches] grid=128 "
-            f"patch={patch_size} stride={patch_stride} "
-            f"count={len(patches)} "
+            f"patch={patch_size} stride={patch_stride} count={len(patches)} "
             f"tokens={global_noise.feats.shape[0]:,} "
             f"coverage_min={static_coverage.min().item()} "
             f"coverage_max={static_coverage.max().item()} "
-            f"coverage_histogram={coverage_histogram} "
-            f"fusion_mode={fusion_mode}"
+            f"coverage_histogram={coverage_histogram}"
         )
-
         prediction_kwargs = {
-            key: value
-            for key, value in sampler_params.items()
-            if key
-            not in {
-                "steps",
-                "rescale_t",
-                "verbose",
-                "tqdm_desc",
-                "record_trajectory",
-                "trajectory_device",
+            key: value for key, value in sampler_params.items()
+            if key not in {
+                "steps", "rescale_t", "verbose", "tqdm_desc",
+                "record_trajectory", "trajectory_device",
                 "return_model_history",
             }
         }
-        raw_times = np.linspace(
-            1.0, 0.0, num_steps + 1
-        ).tolist()
+        raw_times = np.linspace(1.0, 0.0, num_steps + 1).tolist()
         steps: List[Dict[str, Any]] = []
-        total_patch_flow_calls = 0
-        total_expert_flow_calls = 0
-
         for step_index in range(start_step, num_steps):
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
             step_started = time.perf_counter()
             x_step_start = x_global
             mapped_t = float(trajectory.times[step_index])
-            mapped_t_next = float(
-                trajectory.times[step_index + 1]
-            )
-            dt = float(
-                trajectory.time_intervals[step_index]
-            )
+            mapped_t_next = float(trajectory.times[step_index + 1])
+            dt = float(trajectory.time_intervals[step_index])
             if not math.isclose(
-                mapped_t - mapped_t_next,
-                dt,
-                rel_tol=0,
-                abs_tol=1e-12,
+                mapped_t - mapped_t_next, dt, rel_tol=0, abs_tol=1e-12
             ):
-                raise RuntimeError(
-                    "global trajectory timestep mismatch"
-                )
-
+                raise RuntimeError("global trajectory timestep mismatch")
             patch_results = []
-            step_patch_flow_calls = 0
-            step_expert_flow_calls = 0
-            expert_count_per_patch: List[int] = []
-
             for patch_index, patch in enumerate(patches):
                 indices = patch["global_indices"]
                 if indices.numel() == 0:
-                    raise RuntimeError(
-                        f"3D patch {patch_index} is empty"
-                    )
+                    continue
                 local_coords = patch["local_coords"]
                 x_patch = SparseTensor(
-                    feats=x_step_start.feats[indices],
-                    coords=local_coords,
+                    feats=x_step_start.feats[indices], coords=local_coords
                 )
                 shape_patch = SparseTensor(
-                    feats=shape_concat_cond.feats[indices],
-                    coords=local_coords,
+                    feats=shape_concat_cond.feats[indices], coords=local_coords
                 )
-                if not torch.equal(
-                    x_patch.coords,
-                    shape_patch.coords,
+                proj_patch = SparseTensor(
+                    feats=condition["proj"].feats[indices], coords=local_coords
+                )
+                patch_condition = {
+                    "mode": "multi_tile_paired",
+                    "global_bank": condition["global_bank"],
+                    "proj": proj_patch,
+                    "tile_ids": condition["tile_ids"][indices],
+                    "tile_weights": condition["tile_weights"][indices],
+                }
+                patch_negative = self.make_multitile_negative_condition(
+                    patch_condition
+                )
+                _, _, patch_velocity = sampler._get_model_prediction(
+                    flow_model,
+                    x_patch,
+                    mapped_t,
+                    patch_condition,
+                    neg_cond=patch_negative,
+                    concat_cond=shape_patch,
+                    **prediction_kwargs,
+                )
+                if (
+                    patch_velocity.feats.shape != x_patch.feats.shape
+                    or not torch.equal(patch_velocity.coords, local_coords)
+                    or not torch.isfinite(patch_velocity.feats).all()
                 ):
                     raise RuntimeError(
-                        f"shape/texture coordinate mismatch "
-                        f"at patch {patch_index}"
+                        f"invalid patch velocity at patch {patch_index}"
                     )
-
-                if fusion_mode == "paired_block_fusion":
-                    proj_patch = SparseTensor(
-                        feats=condition["proj"].feats[indices],
-                        coords=local_coords,
-                    )
-                    patch_condition = {
-                        "mode": "multi_tile_paired",
-                        "global_bank": condition["global_bank"],
-                        "proj": proj_patch,
-                        "tile_ids": condition["tile_ids"][indices],
-                        "tile_weights": condition[
-                            "tile_weights"
-                        ][indices],
-                    }
-                    patch_negative = (
-                        self.make_multitile_negative_condition(
-                            patch_condition
-                        )
-                    )
-                    _, _, patch_velocity = (
-                        sampler._get_model_prediction(
-                            flow_model,
-                            x_patch,
-                            mapped_t,
-                            patch_condition,
-                            neg_cond=patch_negative,
-                            concat_cond=shape_patch,
-                            **prediction_kwargs,
-                        )
-                    )
-                    if (
-                        patch_velocity.feats.shape
-                        != x_patch.feats.shape
-                        or not torch.equal(
-                            patch_velocity.coords,
-                            local_coords,
-                        )
-                        or not torch.isfinite(
-                            patch_velocity.feats
-                        ).all()
-                    ):
-                        raise RuntimeError(
-                            f"invalid paired patch velocity "
-                            f"at patch {patch_index}"
-                        )
-                    patch_velocity_feats = (
-                        patch_velocity.feats
-                    )
-                    step_patch_flow_calls += 1
-                    total_patch_flow_calls += 1
-                    expert_count_per_patch.append(1)
-                else:
-                    # Complete 64^3 context is retained for every local
-                    # expert.  Each row has exactly one condition:
-                    # target -> local owner tile; context -> full image.
-                    patch_owner_ids = condition[
-                        "owner_tile_ids"
-                    ][indices]
-                    active_owner_ids = torch.unique(
-                        patch_owner_ids,
-                        sorted=True,
-                    )
-                    if active_owner_ids.numel() == 0:
-                        raise RuntimeError(
-                            f"patch {patch_index} has no owner tiles"
-                        )
-
-                    base_proj_feats = condition[
-                        "base_proj"
-                    ].feats[indices]
-                    owner_proj_feats = condition[
-                        "owner_proj"
-                    ].feats[indices]
-                    patch_velocity_sum = torch.zeros(
-                        x_patch.feats.shape,
-                        device=x_patch.device,
-                        dtype=torch.float32,
-                    )
-                    target_coverage = torch.zeros(
-                        x_patch.feats.shape[0],
-                        device=x_patch.device,
-                        dtype=torch.int32,
-                    )
-
-                    for owner_id_tensor in active_owner_ids:
-                        owner_id = int(
-                            owner_id_tensor.item()
-                        )
-                        target_rows = torch.where(
-                            patch_owner_ids == owner_id
-                        )[0]
-                        if target_rows.numel() == 0:
-                            raise RuntimeError(
-                                "active owner tile has no target rows"
-                            )
-
-                        expert_proj_feats = (
-                            base_proj_feats.clone()
-                        )
-                        expert_proj_feats[target_rows] = (
-                            owner_proj_feats[target_rows]
-                        )
-                        expert_proj = SparseTensor(
-                            feats=expert_proj_feats,
-                            coords=local_coords,
-                        )
-
-                        base_global = condition[
-                            "base_global"
-                        ]
-                        local_global = condition[
-                            "global_bank"
-                        ][owner_id : owner_id + 1]
-                        expert_global_bank = torch.cat(
-                            [base_global, local_global],
-                            dim=0,
-                        )
-
-                        # Four slots are retained to satisfy the current
-                        # multi-tile attention interface, but each row has
-                        # exactly one valid slot with weight one.
-                        expert_tile_ids = torch.full(
-                            (
-                                x_patch.feats.shape[0],
-                                4,
-                            ),
-                            -1,
-                            device=x_patch.device,
-                            dtype=torch.long,
-                        )
-                        expert_tile_weights = torch.zeros(
-                            (
-                                x_patch.feats.shape[0],
-                                4,
-                            ),
-                            device=x_patch.device,
-                            dtype=torch.float32,
-                        )
-                        expert_tile_ids[:, 0] = 0
-                        expert_tile_ids[target_rows, 0] = 1
-                        expert_tile_weights[:, 0] = 1.0
-
-                        expert_condition = {
-                            "mode": "multi_tile_paired",
-                            "global_bank": expert_global_bank,
-                            "proj": expert_proj,
-                            "tile_ids": expert_tile_ids,
-                            "tile_weights": expert_tile_weights,
-                        }
-                        expert_negative = (
-                            self.make_multitile_negative_condition(
-                                expert_condition
-                            )
-                        )
-                        _, _, expert_velocity = (
-                            sampler._get_model_prediction(
-                                flow_model,
-                                x_patch,
-                                mapped_t,
-                                expert_condition,
-                                neg_cond=expert_negative,
-                                concat_cond=shape_patch,
-                                **prediction_kwargs,
-                            )
-                        )
-                        if (
-                            expert_velocity.feats.shape
-                            != x_patch.feats.shape
-                            or not torch.equal(
-                                expert_velocity.coords,
-                                local_coords,
-                            )
-                            or not torch.isfinite(
-                                expert_velocity.feats
-                            ).all()
-                        ):
-                            raise RuntimeError(
-                                "invalid target/context expert "
-                                f"velocity at patch={patch_index}, "
-                                f"owner={owner_id}"
-                            )
-
-                        patch_velocity_sum.index_add_(
-                            0,
-                            target_rows,
-                            expert_velocity.feats[
-                                target_rows
-                            ].float(),
-                        )
-                        target_coverage.index_add_(
-                            0,
-                            target_rows,
-                            torch.ones_like(
-                                target_rows,
-                                dtype=torch.int32,
-                            ),
-                        )
-                        step_expert_flow_calls += 1
-                        total_expert_flow_calls += 1
-
-                        del (
-                            expert_proj_feats,
-                            expert_proj,
-                            expert_global_bank,
-                            expert_tile_ids,
-                            expert_tile_weights,
-                            expert_condition,
-                            expert_negative,
-                            expert_velocity,
-                        )
-
-                    if torch.any(target_coverage != 1):
-                        bad = torch.where(
-                            target_coverage != 1
-                        )[0]
-                        raise RuntimeError(
-                            "target/context experts did not "
-                            "produce exactly one velocity for every "
-                            f"patch row; patch={patch_index}, "
-                            f"bad_rows={bad[:16].tolist()}"
-                        )
-                    patch_velocity_feats = (
-                        patch_velocity_sum.to(
-                            dtype=x_patch.dtype
-                        )
-                    )
-                    expert_count_per_patch.append(
-                        int(active_owner_ids.numel())
-                    )
-
                 weights = self.texture_3d_patch_weights(
-                    local_coords,
-                    patch_size,
-                ).to(
-                    device=x_patch.device,
-                    dtype=torch.float32,
-                )
+                    local_coords, patch_size
+                ).to(patch_velocity.device)
                 patch_results.append(
-                    (
-                        indices,
-                        patch_velocity_feats,
-                        weights,
-                    )
+                    (indices, patch_velocity.feats, weights)
                 )
-
-            merged, coverage = (
-                self.merge_texture_3d_patch_velocities(
-                    token_count=x_step_start.feats.shape[0],
-                    patch_results=patch_results,
-                    channels=x_step_start.feats.shape[1],
-                    device=x_step_start.device,
-                )
+            merged, coverage = self.merge_texture_3d_patch_velocities(
+                token_count=x_step_start.feats.shape[0],
+                patch_results=patch_results,
+                channels=x_step_start.feats.shape[1],
+                device=x_step_start.device,
             )
             metrics = self._velocity_similarity(
-                merged,
-                trajectory.velocities[step_index],
+                merged, trajectory.velocities[step_index]
             )
-
-            # The only global update in this timestep.
+            # The only global update in this step.
             x_global = x_step_start.replace(
-                x_step_start.feats
-                - dt * merged.to(x_step_start.dtype)
+                x_step_start.feats - dt * merged.to(x_step_start.dtype)
             )
-            if not torch.equal(
-                x_global.coords,
-                global_noise.coords,
-            ):
-                raise RuntimeError(
-                    "target/context flow changed global "
-                    "coordinates or token order"
-                )
-
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
             record = {
                 **metrics,
                 "step_index": step_index,
                 "raw_t": raw_times[step_index],
-                "raw_t_next": raw_times[
-                    step_index + 1
-                ],
+                "raw_t_next": raw_times[step_index + 1],
                 "mapped_t": mapped_t,
                 "mapped_t_next": mapped_t_next,
                 "time_interval": dt,
                 "patch_count": len(patches),
-                "patch_flow_calls": step_patch_flow_calls,
-                "expert_flow_calls": step_expert_flow_calls,
-                "expert_count_per_patch": (
-                    expert_count_per_patch
-                ),
-                "expert_count_min": int(
-                    min(expert_count_per_patch)
-                ),
-                "expert_count_max": int(
-                    max(expert_count_per_patch)
-                ),
-                "expert_count_mean": float(
-                    np.mean(expert_count_per_patch)
-                ),
                 "velocity_coverage": 1.0,
-                "velocity_coverage_min": int(
-                    coverage.min().item()
-                ),
-                "velocity_coverage_max": int(
-                    coverage.max().item()
-                ),
-                "seconds": (
-                    time.perf_counter() - step_started
-                ),
+                "velocity_coverage_min": int(coverage.min().item()),
+                "velocity_coverage_max": int(coverage.max().item()),
+                "seconds": time.perf_counter() - step_started,
             }
             steps.append(record)
             print(
-                "[texture-multitile-3d-flow] "
-                f"mode={fusion_mode} "
-                f"step={step_index:02d} "
-                f"raw_t={record['raw_t']:.8f}->"
-                f"{record['raw_t_next']:.8f} "
-                f"mapped_t={mapped_t:.8f}->"
-                f"{mapped_t_next:.8f} "
-                f"patches={len(patches)} "
-                f"experts={step_expert_flow_calls} "
-                f"experts_per_patch="
-                f"{record['expert_count_min']}-"
-                f"{record['expert_count_max']} "
-                f"(mean={record['expert_count_mean']:.2f}) "
-                f"tokens={x_global.feats.shape[0]:,} "
+                f"[texture-multitile-3d-flow] step={step_index:02d} "
+                f"raw_t={record['raw_t']:.8f}->{record['raw_t_next']:.8f} "
+                f"mapped_t={mapped_t:.8f}->{mapped_t_next:.8f} "
+                f"patches={len(patches)} tokens={x_global.feats.shape[0]:,} "
+                f"image_membership_min={(condition['tile_ids'] >= 0).sum(1).min().item()} "
+                f"image_membership_max={(condition['tile_ids'] >= 0).sum(1).max().item()} "
                 "velocity_coverage=1.000000 "
-                f"velocity_coverage_min="
-                f"{coverage.min().item()} "
-                f"velocity_coverage_max="
-                f"{coverage.max().item()} "
-                f"cos_vs_global="
-                f"{metrics['cosine_similarity']:.8f} "
-                f"rel_l2_vs_global="
-                f"{metrics['relative_l2']:.8f} "
+                f"velocity_coverage_min={coverage.min().item()} "
+                f"velocity_coverage_max={coverage.max().item()} "
+                f"cos_vs_global={metrics['cosine_similarity']:.8f} "
+                f"rel_l2_vs_global={metrics['relative_l2']:.8f} "
                 f"mse_vs_global={metrics['mse']:.8e} "
                 f"seconds={record['seconds']:.3f}"
             )
-
         trace = {
             "enabled": True,
             "status": "complete",
             "stage": "texture",
-            "mode": mode_name,
-            "condition_format_version": condition_version,
-            "fusion_mode": fusion_mode,
-            "routing": (
-                "hard_center_owner"
-                if fusion_mode == "target_context_hard"
-                else "soft_paired_block"
-            ),
-            "context_condition": (
-                "canonical_full_image"
-                if fusion_mode == "target_context_hard"
-                else None
-            ),
-            "target_condition": (
-                "hard_owner_local_tile"
-                if fusion_mode == "target_context_hard"
-                else None
-            ),
+            "mode": "multi_tile_paired_3d_patch_flow",
+            "condition_format_version": "multi_tile_paired_v1",
             "grid_resolution": 128,
             "patch_size": patch_size,
             "patch_stride": patch_stride,
@@ -3810,34 +3175,15 @@ class Pixal3DImageTo3DPipeline(Pipeline):
             "start_step": start_step,
             "global_update_count_per_step": 1,
             "velocity_fallback": None,
-            "patch_flow_calls": total_patch_flow_calls,
-            "expert_flow_calls": total_expert_flow_calls,
             "steps": steps,
             "baseline_final_state": trajectory.states[-1],
             "final_state": x_global.feats.detach().cpu(),
         }
         diagnostics = {
             "patch_coordinate_mode": "local",
-            "condition_mode": fusion_mode,
-            "routing": (
-                "hard_center_owner"
-                if fusion_mode == "target_context_hard"
-                else "soft_paired_block"
-            ),
-            "context_condition": (
-                "canonical_full_image"
-                if fusion_mode == "target_context_hard"
-                else None
-            ),
-            "target_condition": (
-                "hard_owner_local_tile"
-                if fusion_mode == "target_context_hard"
-                else None
-            ),
+            "condition_mode": "multi_tile_paired",
             "velocity_fallback": None,
             "coverage_histogram": coverage_histogram,
-            "patch_flow_calls": total_patch_flow_calls,
-            "expert_flow_calls": total_expert_flow_calls,
         }
         return x_global, trace, diagnostics
 
@@ -4645,14 +3991,8 @@ class Pixal3DImageTo3DPipeline(Pipeline):
                     "paired v1 requires canonical/tile/stride/patch/stride "
                     f"{expected}, got {actual}"
                 )
-            if texture_multitile_global_mode not in {
-                "paired_block_fusion",
-                "target_context_hard",
-            }:
-                raise ValueError(
-                    "texture_multitile_global_mode must be "
-                    "paired_block_fusion or target_context_hard"
-                )
+            if texture_multitile_global_mode != "paired_block_fusion":
+                raise ValueError("only paired_block_fusion is supported")
             if not 0 <= texture_multitile_start_step <= 12:
                 raise ValueError("texture_multitile_start_step must be in [0,12]")
             if hr_texture_context is None or "foreground_mask_4096" not in hr_texture_context:
@@ -5274,8 +4614,7 @@ class Pixal3DImageTo3DPipeline(Pipeline):
                             projected_full_norm=projected_full_norm,
                             camera_angle_x=camera_angle_x,
                             distance=distance,
-                            mesh_scale=mesh_scale,                            base_condition=cond_tex["cond"],
-
+                            mesh_scale=mesh_scale,
                             grid_resolution=tex_grid_res,
                             tile_size=texture_image_tile_size,
                             tile_stride=texture_image_tile_stride,
@@ -5291,8 +4630,7 @@ class Pixal3DImageTo3DPipeline(Pipeline):
                             sampler_params=tex_sampler_params,
                             global_flow=global_tex_flow,
                             condition=paired_condition,
-                            start_step=texture_multitile_start_step,                            fusion_mode=texture_multitile_global_mode,
-
+                            start_step=texture_multitile_start_step,
                             patch_size=texture_3d_patch_size,
                             patch_stride=texture_3d_patch_stride,
                         )
