@@ -1,35 +1,39 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Pixal3D 1024 joint tile cascade with a union master support.
+"""Pixal3D 2048 tile cascade with projective tile recanonicalization.
 
-Support preparation:
-    full image -> sparse structure -> global shape-512 -> upsample -> C64_base
+The complete image first produces a full-object C128 sparse support.  For each
+4096 -> 1024 crop, every C128 point whose complete-image projection lies inside
+the crop is retained, including occluded/back-side points inferred by the global
+model.  Those points are deterministically re-parameterized into a new tile
+canonical coordinate system q_tile in [-1, 1]^3:
 
-For every active 4K image tile (at least ``--min-tile-tokens`` input points):
-    C64_tile_input -> floor(/2) -> unique C32_tile
-    -> local shape-512 -> learned upsample -> C64_local
+    global C128 q_global
+      -> complete-image camera projection
+      -> crop-local pixel coordinates
+      -> inverse projection through the centered Pixal3D tile camera
+      -> q_tile, preserving q_tile.z = q_global.z
 
-All locally proposed coordinates are inserted before the formal 1024 flows:
-    C64_master = C64_base UNION C64_local(tile 0) UNION ...
+No depth slab, z-buffer, visibility test, fitted local cube, or point-depth
+selection is used.  Small numerical/projective overflow outside [-1, 1] is
+clamped rather than discarded and is reported in the trace.
 
-The 1024 shape and texture flows then share one master state. At every step:
-    1. Run the complete-image 1024 model on all C64_master points.
-    2. During the first N steps, update only with the complete-image velocity.
-    3. During the final 12-N steps, give each active tile the current master
-       x_t restricted to that tile's C64_local coordinates and the same t.
-    4. Each tile predicts velocity using its own crop DINO/projection features.
-    5. Tent-weighted overlapping tile velocities replace the global velocity
-       where available; all uncovered master points use global velocity.
-    6. Update the single master state exactly once.
+Each tile uses its projectively recanonicalized C32 support as the sparse
+structure result, runs the official 512 shape flow on the high-resolution crop,
+upsamples to tile C64, and maps the resulting C64 coordinates back through the
+exact inverse projective transform to continuous global C128 coordinates.
+The formal shape and texture trajectories remain a single C128 master state.
+During selected latter Euler steps, each tile C64 point reads the current
+feature of exactly one mapped global C128 master point.  The tile model predicts
+a velocity for that point from the crop view.  Velocities from multiple local
+points and overlapping tiles are tent-weighted and averaged on the same global
+master row.  Uncovered master rows retain the global velocity.
 
-There are no private tile 1024 trajectories. Every tile coordinate has an exact
-row in C64_master, so every tile velocity is evaluated on the current master
-state and can be fused without state transplantation.
-
-After GLB export, the script uses the aligned Pixal3D camera/transform from the
-provided evaluation code to render with Blender Cycles, save an original/render
-comparison, and compute PSNR, SSIM, and LPIPS.
+The script targets the current Pixal3D-exp branch, whose projection condition
+supports sparse grid_indices and grid_resolution_override and whose samplers
+expose timestep_schedule() and sample_once().
 """
+
 from __future__ import annotations
 
 import argparse
@@ -38,18 +42,15 @@ import json
 import math
 import os
 import shlex
-import shutil
 import subprocess
-import tempfile
+import sys
 import time
-import warnings
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from PIL import Image
 from tqdm import tqdm
 
@@ -62,24 +63,27 @@ os.environ.setdefault(
 )
 os.environ.setdefault("FLEX_GEMM_AUTOTUNER_VERBOSE", "1")
 
-from inference import (
+from inference import (  # noqa: E402
     MODEL_PATH,
     distance_from_fov,
     get_camera_params_wild_moge,
     init_pipeline,
     load_moge_model,
 )
-from pixal3d.modules.sparse import SparseTensor
+from pixal3d.modules.sparse import SparseTensor  # noqa: E402
 
-try:
+try:  # Required only when final decoding/export is enabled.
     import o_voxel  # type: ignore
-except Exception:
+except Exception:  # pragma: no cover
     o_voxel = None
 
+
 GRID_LR = 32
-GRID_HR = 64
+GRID_TILE_HR = 64
+GRID_MASTER = 128
 RESOLUTION_LR = 512
-RESOLUTION_HR = 1024
+RESOLUTION_TILE_HR = 1024
+RESOLUTION_MASTER = 2048
 CANONICAL_IMAGE_SIZE = 4096
 DEFAULT_TILE_SIZE = 1024
 DEFAULT_TILE_STRIDE = 512
@@ -93,34 +97,60 @@ PIXAL3D_EXPORT_ROTATION = np.array(
     ],
     dtype=np.float64,
 )
-OVOXEL_DECODER_TO_GLTF = np.array(
-    [
-        [1.0, 0.0, 0.0, 0.0],
-        [0.0, 0.0, 1.0, 0.0],
-        [0.0, -1.0, 0.0, 0.0],
-        [0.0, 0.0, 0.0, 1.0],
-    ],
-    dtype=np.float64,
-)
-PIXAL3D_DECODER_TO_EXPORTED_GLTF = PIXAL3D_EXPORT_ROTATION @ OVOXEL_DECODER_TO_GLTF
-PIXAL3D_EXPORTED_GLTF_TO_INTERNAL = np.linalg.inv(PIXAL3D_DECODER_TO_EXPORTED_GLTF)
+
+
+@dataclass
+class RecordedFlow:
+    result: Any
+    name: str
+
+    @property
+    def trajectory(self) -> Any:
+        value = getattr(self.result, "trajectory", None)
+        if value is None:
+            raise RuntimeError(f"{self.name} did not record a trajectory")
+        return value
+
+    @property
+    def samples(self) -> SparseTensor:
+        value = getattr(self.result, "samples", None)
+        if not isinstance(value, SparseTensor):
+            raise TypeError(f"{self.name}.samples is not a SparseTensor")
+        return value
+
+
+@dataclass
+class TileCameraTransform:
+    box: Tuple[int, int, int, int]
+    output_size: int
+    camera_angle_x: float
+    distance: float
+    mesh_scale: float
+    full_focal_pixels: float
+    tile_focal_pixels: float
+    crop_scale_x: float
+    crop_scale_y: float
 
 
 @dataclass
 class TileExpert:
     tile_id: int
     box: Tuple[int, int, int, int]
-    projection_crop_box: Tuple[float, float, float, float]
-    input_base_rows: torch.Tensor
-    local_coords64: torch.Tensor
+    transform: TileCameraTransform
+    input_base_rows: torch.Tensor              # [M]
+    input_local_coords32: torch.Tensor         # [N32,4]
+    local_coords64: torch.Tensor               # [K,4], tile-space integer IDs
+    local_tile_camera_points64: torch.Tensor   # [K,3]
+    local_global_camera_points64: torch.Tensor # [K,3]
+    mapped_global_coords128: torch.Tensor      # [K,4], global-space integer IDs
     shape_condition_cpu: Mapping[str, Any]
     texture_condition_cpu: Mapping[str, Any]
-    lr_trace_path: Optional[str] = None
-    # Filled only after all tile supports have been unioned into C64_master.
-    master_rows: Optional[torch.Tensor] = None
-    active_master_rows: Optional[torch.Tensor] = None
-    active_local_rows: Optional[torch.Tensor] = None
-    active_weights: Optional[torch.Tensor] = None
+    input_transform_stats: Mapping[str, Any]
+    output_transform_stats: Mapping[str, Any]
+    lr_trace_path: Optional[str]
+    local_to_master_row: Optional[torch.Tensor] = None  # [K]
+    active_local_rows: Optional[torch.Tensor] = None    # [Ka]
+    active_tent_weights: Optional[torch.Tensor] = None  # [Ka]
 
 
 @dataclass
@@ -132,25 +162,6 @@ class OnlineFlowResult:
     velocities: List[torch.Tensor]
     step_records: List[Dict[str, Any]]
     covered_rows_union: int
-
-@dataclass
-class RecordedFlow:
-    result: Any
-    name: str
-
-    @property
-    def trajectory(self) -> Any:
-        trajectory = getattr(self.result, "trajectory", None)
-        if trajectory is None:
-            raise RuntimeError(f"{self.name} did not record a trajectory")
-        return trajectory
-
-    @property
-    def samples(self) -> SparseTensor:
-        samples = getattr(self.result, "samples", None)
-        if not isinstance(samples, SparseTensor):
-            raise TypeError(f"{self.name}.samples is not a SparseTensor")
-        return samples
 
 
 def _sync_cuda() -> None:
@@ -176,15 +187,16 @@ def _randn(
     channels: int,
     *,
     device: torch.device,
-    dtype: torch.dtype = torch.float32,
     seed: int,
+    dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
-    if rows < 0 or channels <= 0:
-        raise ValueError(f"invalid random tensor shape: rows={rows}, channels={channels}")
+    if rows <= 0 or channels <= 0:
+        raise ValueError(f"invalid random tensor shape ({rows}, {channels})")
     generator = torch.Generator(device=device)
     generator.manual_seed(int(seed))
     return torch.randn(
-        (rows, channels),
+        rows,
+        channels,
         generator=generator,
         device=device,
         dtype=dtype,
@@ -215,1052 +227,6 @@ def _normalize_sparse(
 ) -> SparseTensor:
     std, mean = _normalization(normalization, value.device, value.dtype)
     return value.replace((value.feats - mean) / std)
-
-
-def _validate_trajectory(flow: RecordedFlow, expected_steps: int) -> None:
-    trajectory = flow.trajectory
-    states = trajectory.states
-    velocities = trajectory.velocities
-    if len(states) != expected_steps + 1 or len(velocities) != expected_steps:
-        raise RuntimeError(
-            f"{flow.name} trajectory must have {expected_steps + 1} states and "
-            f"{expected_steps} velocities, got {len(states)} and {len(velocities)}"
-        )
-    if len(trajectory.times) != expected_steps + 1:
-        raise RuntimeError(f"{flow.name} has an invalid mapped-time count")
-    if len(trajectory.time_intervals) != expected_steps:
-        raise RuntimeError(f"{flow.name} has an invalid dt count")
-
-
-def _run_recorded_flow(
-    *,
-    pipeline: Any,
-    sampler: Any,
-    flow_model: torch.nn.Module,
-    noise: SparseTensor,
-    condition: Mapping[str, Any],
-    sampler_params: Mapping[str, Any],
-    description: str,
-    concat_cond: Optional[SparseTensor] = None,
-) -> RecordedFlow:
-    if noise.coords.ndim != 2 or noise.coords.shape[1] != 4:
-        raise ValueError(f"{description}: invalid sparse coordinates")
-    if concat_cond is not None and not torch.equal(noise.coords, concat_cond.coords):
-        raise RuntimeError(f"{description}: noise and concat condition coords differ")
-
-    if pipeline.low_vram:
-        flow_model.to(pipeline.device)
-
-    call_kwargs: Dict[str, Any] = {
-        **condition,
-        **dict(sampler_params),
-        "verbose": True,
-        "tqdm_desc": description,
-        "record_trajectory": True,
-        "trajectory_device": "cpu",
-        "return_model_history": False,
-    }
-    if concat_cond is not None:
-        call_kwargs["concat_cond"] = concat_cond
-
-    started = time.perf_counter()
-    result = sampler.sample(flow_model, noise, **call_kwargs)
-    _sync_cuda()
-    print(
-        f"[recorded-flow] name={description!r} tokens={noise.feats.shape[0]:,} "
-        f"channels={noise.feats.shape[1]} seconds={time.perf_counter() - started:.3f}"
-    )
-
-    if pipeline.low_vram:
-        flow_model.cpu()
-        _empty_cuda_cache()
-
-    wrapped = RecordedFlow(result=result, name=description)
-    expected_steps = int(sampler_params.get("steps", 12))
-    _validate_trajectory(wrapped, expected_steps)
-    if not torch.equal(wrapped.samples.coords, noise.coords):
-        raise RuntimeError(f"{description}: sampler changed coordinates or token order")
-    return wrapped
-
-
-def _learned_upsample_to_grid64(
-    pipeline: Any,
-    lr_shape_denormalized: SparseTensor,
-) -> torch.Tensor:
-    decoder = pipeline.models["shape_slat_decoder"]
-    if pipeline.low_vram:
-        decoder.to(pipeline.device)
-        decoder.low_vram = True
-    try:
-        proposed = decoder.upsample(lr_shape_denormalized, upsample_times=4)
-    finally:
-        if pipeline.low_vram:
-            decoder.cpu()
-            decoder.low_vram = False
-            _empty_cuda_cache()
-
-    if proposed.ndim != 2 or proposed.shape[1] != 4:
-        raise RuntimeError(
-            "shape_slat_decoder.upsample must return [N,4] coordinates; "
-            f"got {tuple(proposed.shape)}"
-        )
-    quantized = torch.cat(
-        [
-            proposed[:, :1],
-            (
-                (proposed[:, 1:] + 0.5)
-                / float(RESOLUTION_LR)
-                * float(GRID_HR)
-            ).int(),
-        ],
-        dim=1,
-    )
-    coords64 = torch.unique(quantized, dim=0)
-    if coords64.numel() == 0:
-        raise RuntimeError("learned shape upsample produced an empty grid64 support")
-    if torch.any(coords64[:, 1:] < 0) or torch.any(coords64[:, 1:] >= GRID_HR):
-        bad = coords64[
-            ((coords64[:, 1:] < 0) | (coords64[:, 1:] >= GRID_HR)).any(dim=1)
-        ]
-        raise RuntimeError(
-            "learned shape upsample produced coordinates outside grid64: "
-            f"{bad[:16].detach().cpu().tolist()}"
-        )
-    return coords64
-
-
-def _downsample_grid64_to_grid32(coords64: torch.Tensor) -> torch.Tensor:
-    if coords64.ndim != 2 or coords64.shape[1] != 4:
-        raise ValueError("coords64 must have shape [N,4]")
-    coords32 = coords64.clone()
-    coords32[:, 1:] = torch.div(
-        coords32[:, 1:], 2, rounding_mode="floor"
-    )
-    coords32 = torch.unique(coords32, dim=0)
-    if coords32.numel() == 0:
-        raise RuntimeError("grid64 -> grid32 downsample produced no coordinates")
-    if torch.any(coords32[:, 1:] < 0) or torch.any(coords32[:, 1:] >= GRID_LR):
-        raise RuntimeError("downsampled tile coordinates lie outside grid32")
-    return coords32
-
-
-def _coord_key_rows(coords: torch.Tensor) -> Dict[Tuple[int, int, int, int], int]:
-    cpu = coords.detach().to(device="cpu", dtype=torch.int64)
-    mapping: Dict[Tuple[int, int, int, int], int] = {}
-    for row, values in enumerate(cpu.tolist()):
-        key = tuple(int(v) for v in values)
-        if key in mapping:
-            raise RuntimeError(f"duplicate sparse coordinate: {key}")
-        mapping[key] = row
-    return mapping
-
-
-def _exact_tile_intersection(
-    *,
-    global_coords: torch.Tensor,
-    tile_input_global_rows: torch.Tensor,
-    local_coords64: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Return exact C64_tile_input ∩ C64_local row correspondences."""
-    input_coords = global_coords.index_select(0, tile_input_global_rows)
-    input_map = _coord_key_rows(input_coords)
-    local_map = _coord_key_rows(local_coords64)
-    common_keys = sorted(set(input_map).intersection(local_map))
-    if not common_keys:
-        empty = torch.empty(0, dtype=torch.long)
-        return empty, empty
-
-    input_rows_relative = torch.tensor(
-        [input_map[key] for key in common_keys], dtype=torch.long
-    )
-    local_rows = torch.tensor(
-        [local_map[key] for key in common_keys], dtype=torch.long
-    )
-    global_rows = tile_input_global_rows.detach().cpu().index_select(
-        0, input_rows_relative
-    )
-    return global_rows, local_rows
-
-
-def _tile_rows_and_weights(
-    tile_ids: torch.Tensor,
-    tile_weights: torch.Tensor,
-    tile_id: int,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    membership = tile_ids == int(tile_id)
-    row_mask = membership.any(dim=1)
-    rows = torch.where(row_mask)[0]
-    if rows.numel() == 0:
-        return rows, torch.empty(0, device=tile_weights.device)
-    slots = membership[rows].to(torch.int64).argmax(dim=1)
-    weights = tile_weights[rows, slots]
-    if torch.any(weights <= 0) or not torch.isfinite(weights).all():
-        raise RuntimeError(f"tile {tile_id}: invalid membership weights")
-    return rows, weights
-
-
-def _parse_tile_ids(value: Optional[str]) -> Optional[set[int]]:
-    if value is None or not value.strip():
-        return None
-    output: set[int] = set()
-    for item in value.split(","):
-        item = item.strip()
-        if not item:
-            continue
-        output.add(int(item))
-    return output
-
-
-def _estimate_camera(
-    *,
-    image_1024: Image.Image,
-    output_dir: Path,
-    manual_fov: float,
-    mesh_scale: float,
-    extend_pixel: int,
-    image_resolution: int,
-) -> Dict[str, float]:
-    output_dir.mkdir(parents=True, exist_ok=True)
-    if manual_fov > 0:
-        camera_angle_x = float(manual_fov)
-        distance = distance_from_fov(
-            camera_angle_x,
-            torch.tensor([-1.0, 0.0, 0.0]),
-            torch.tensor([0 - extend_pixel, image_resolution - 1 + extend_pixel]),
-            mesh_scale,
-            image_resolution,
-        )["distance_from_x"]
-        return {
-            "camera_angle_x": camera_angle_x,
-            "distance": float(distance),
-            "mesh_scale": float(mesh_scale),
-        }
-
-    temporary = output_dir / f"_joint_tile_moge_{int(time.time() * 1000)}.png"
-    image_1024.save(temporary)
-    print("[MoGe-2] Loading model for camera estimation...")
-    model = load_moge_model(device="cuda")
-    try:
-        params = get_camera_params_wild_moge(
-            str(temporary),
-            model,
-            device="cuda",
-            mesh_scale=mesh_scale,
-            extend_pixel=extend_pixel,
-            image_resolution=image_resolution,
-        )
-    finally:
-        model.cpu()
-        del model
-        temporary.unlink(missing_ok=True)
-        _empty_cuda_cache()
-    return {
-        "camera_angle_x": float(params["camera_angle_x"]),
-        "distance": float(params["distance"]),
-        "mesh_scale": float(params["mesh_scale"]),
-    }
-
-
-def _build_sampler_params(args: argparse.Namespace, pipeline: Any) -> Dict[str, Dict[str, Any]]:
-    ss = {
-        **pipeline.sparse_structure_sampler_params,
-        "steps": int(args.steps),
-        "guidance_strength": float(args.ss_guidance_strength),
-        "guidance_rescale": float(args.ss_guidance_rescale),
-        "rescale_t": float(args.ss_rescale_t),
-    }
-    shape = {
-        **pipeline.shape_slat_sampler_params,
-        "steps": int(args.steps),
-        "guidance_strength": float(args.shape_guidance_strength),
-        "guidance_rescale": float(args.shape_guidance_rescale),
-        "rescale_t": float(args.shape_rescale_t),
-    }
-    texture = {
-        **pipeline.tex_slat_sampler_params,
-        "steps": int(args.steps),
-        "guidance_strength": float(args.texture_guidance_strength),
-        "guidance_rescale": float(args.texture_guidance_rescale),
-        "rescale_t": float(args.texture_rescale_t),
-    }
-    return {"ss": ss, "shape": shape, "texture": texture}
-
-
-def _global_initial_support(
-    *,
-    pipeline: Any,
-    image_512: Image.Image,
-    image_1024: Image.Image,
-    camera: Mapping[str, float],
-    sampler_params: Mapping[str, Mapping[str, Any]],
-    seed: int,
-) -> Tuple[
-    torch.Tensor,
-    torch.Tensor,
-    RecordedFlow,
-    SparseTensor,
-]:
-    """Run standard global SS + shape512 + learned upsample to C64_global."""
-    cond_ss = pipeline.get_proj_cond_ss(
-        [image_512],
-        camera_angle_x=camera["camera_angle_x"],
-        distance=camera["distance"],
-        mesh_scale=camera["mesh_scale"],
-    )
-    _seed_everything(seed)
-    coords32 = pipeline.sample_sparse_structure(
-        cond_ss,
-        resolution=GRID_LR,
-        sampler_params=dict(sampler_params["ss"]),
-    )
-    del cond_ss
-    if coords32.numel() == 0:
-        raise RuntimeError("global sparse structure is empty")
-    print(f"[global-support] C32 tokens={coords32.shape[0]:,}")
-
-    cond_lr = pipeline.get_proj_cond_shape(
-        pipeline.image_cond_model_shape_512,
-        [image_512],
-        coords32,
-        camera_angle_x=camera["camera_angle_x"],
-        distance=camera["distance"],
-        mesh_scale=camera["mesh_scale"],
-        grid_resolution_override=GRID_LR,
-    )
-    flow_lr = pipeline.models["shape_slat_flow_model_512"]
-    lr_noise = SparseTensor(
-        feats=_randn(
-            coords32.shape[0],
-            int(flow_lr.in_channels),
-            device=pipeline.device,
-            seed=seed + 101,
-        ),
-        coords=coords32,
-    )
-    lr_record = _run_recorded_flow(
-        pipeline=pipeline,
-        sampler=pipeline.shape_slat_sampler,
-        flow_model=flow_lr,
-        noise=lr_noise,
-        condition=cond_lr,
-        sampler_params=sampler_params["shape"],
-        description="Global shape SLat 512 (recorded)",
-    )
-    lr_shape_denorm = _denormalize_sparse(
-        lr_record.samples, pipeline.shape_slat_normalization
-    )
-    coords64 = _learned_upsample_to_grid64(pipeline, lr_shape_denorm)
-    print(f"[global-support] C64_global tokens={coords64.shape[0]:,}")
-    return coords32, coords64, lr_record, lr_shape_denorm
-
-def json_safe(value: Any) -> Any:
-    if isinstance(value, Path):
-        return str(value)
-    if isinstance(value, np.generic):
-        return json_safe(value.item())
-    if isinstance(value, np.ndarray):
-        return value.tolist()
-    if isinstance(value, torch.Tensor):
-        return value.detach().cpu().tolist()
-    if isinstance(value, float):
-        return value if math.isfinite(value) else None
-    if isinstance(value, Mapping):
-        return {str(key): json_safe(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [json_safe(item) for item in value]
-    return value
-
-
-def atomic_json(path: Path, value: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    with temporary.open("w", encoding="utf-8") as file:
-        json.dump(json_safe(value), file, ensure_ascii=False, indent=2, allow_nan=False)
-    temporary.replace(path)
-
-
-def composite_on_black(image: Image.Image) -> Image.Image:
-    rgba = image.convert("RGBA")
-    background = Image.new("RGBA", rgba.size, (0, 0, 0, 255))
-    background.alpha_composite(rgba)
-    return background.convert("RGB")
-
-
-def save_metric_reference(
-    condition_image: Image.Image,
-    output_path: Path,
-    render_resolution: int,
-) -> Image.Image:
-    reference = composite_on_black(condition_image)
-    target_size = (int(render_resolution), int(render_resolution))
-    if reference.size != target_size:
-        reference = reference.resize(target_size, Image.Resampling.LANCZOS)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    reference.save(output_path)
-    return reference
-
-
-def save_black_composited_render(path: Path, expected_resolution: int) -> Image.Image:
-    with Image.open(path) as image:
-        rgb = composite_on_black(image)
-    target_size = (int(expected_resolution), int(expected_resolution))
-    if rgb.size != target_size:
-        rgb = rgb.resize(target_size, Image.Resampling.LANCZOS)
-    rgb.save(path)
-    return rgb
-
-
-def save_comparison(
-    original: Image.Image,
-    rendered: Image.Image,
-    output_path: Path,
-) -> None:
-    original_rgb = original.convert("RGB")
-    rendered_rgb = rendered.convert("RGB")
-    if rendered_rgb.size != original_rgb.size:
-        rendered_rgb = rendered_rgb.resize(
-            original_rgb.size,
-            Image.Resampling.LANCZOS,
-        )
-    width, height = original_rgb.size
-    comparison = Image.new("RGB", (width * 2, height), (255, 255, 255))
-    comparison.paste(original_rgb, (0, 0))
-    comparison.paste(rendered_rgb, (width, 0))
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    comparison.save(output_path)
-
-BLENDER_HELPER_SOURCE = r"""
-import argparse
-import json
-import math
-import os
-import sys
-import time
-import traceback
-from collections import OrderedDict
-from pathlib import Path
-
-import bpy
-from mathutils import Matrix
-
-
-def log(message):
-    print("[blender-cycles] %s" % message, flush=True)
-
-
-def require_single_visible_device():
-    value = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
-    tokens = [token.strip() for token in value.split(",") if token.strip()]
-    if len(tokens) != 1:
-        raise RuntimeError(
-            "Cycles helper requires exactly one CUDA_VISIBLE_DEVICES entry; "
-            "got %r" % value
-        )
-    log(
-        "CUDA_DEVICE_ORDER=%s CUDA_VISIBLE_DEVICES=%s"
-        % (os.environ.get("CUDA_DEVICE_ORDER", "<unset>"), tokens[0])
-    )
-
-
-def clear_scene():
-    bpy.ops.object.select_all(action="SELECT")
-    bpy.ops.object.delete(use_global=False)
-    for datablocks in (
-        bpy.data.meshes,
-        bpy.data.curves,
-        bpy.data.materials,
-        bpy.data.cameras,
-        bpy.data.lights,
-        bpy.data.images,
-    ):
-        for block in list(datablocks):
-            try:
-                datablocks.remove(block)
-            except Exception:
-                pass
-
-
-def clear_lights():
-    for obj in list(bpy.data.objects):
-        if obj.type == "LIGHT":
-            bpy.data.objects.remove(obj, do_unlink=True)
-    for light in list(bpy.data.lights):
-        if light.users == 0:
-            try:
-                bpy.data.lights.remove(light)
-            except Exception:
-                pass
-
-
-def configure_cycles_gpu(scene):
-    addon = bpy.context.preferences.addons.get("cycles")
-    if addon is None:
-        raise RuntimeError("Cycles addon is unavailable")
-
-    preferences = addon.preferences
-    selected_backend = None
-    selected_device = None
-    errors = []
-
-    # A800 has no RT cores; try CUDA first, then OptiX as fallback.
-    for backend in ("CUDA", "OPTIX"):
-        try:
-            preferences.compute_device_type = backend
-            preferences.get_devices()
-            devices = list(preferences.devices)
-            candidates = [device for device in devices if device.type == backend]
-            if not candidates:
-                continue
-
-            for device in devices:
-                device.use = False
-            selected_device = candidates[0]
-            selected_device.use = True
-            selected_backend = backend
-            break
-        except Exception as exc:
-            errors.append("%s: %s" % (backend, exc))
-
-    if selected_backend is None or selected_device is None:
-        raise RuntimeError(
-            "No usable Cycles CUDA/OptiX device found: " + "; ".join(errors)
-        )
-
-    scene.cycles.device = "GPU"
-    log(
-        "cycles backend=%s selected=%s id=%s"
-        % (
-            selected_backend,
-            selected_device.name,
-            getattr(selected_device, "id", "<unknown>"),
-        )
-    )
-    for device in preferences.devices:
-        log(
-            "cycles-device name=%s type=%s use=%s id=%s"
-            % (
-                device.name,
-                device.type,
-                device.use,
-                getattr(device, "id", "<unknown>"),
-            )
-        )
-
-
-def configure_render(resolution, samples):
-    scene = bpy.context.scene
-    scene.render.engine = "CYCLES"
-    configure_cycles_gpu(scene)
-    scene.render.resolution_x = int(resolution)
-    scene.render.resolution_y = int(resolution)
-    scene.render.resolution_percentage = 100
-    scene.render.image_settings.file_format = "PNG"
-    scene.render.image_settings.color_mode = "RGBA"
-    scene.render.image_settings.color_depth = "8"
-    scene.render.film_transparent = True
-    scene.render.use_file_extension = True
-    scene.cycles.samples = int(samples)
-    scene.cycles.use_denoising = True
-
-    # Reuse geometry/BVH across the light variants of the same imported model.
-    if hasattr(scene.render, "use_persistent_data"):
-        scene.render.use_persistent_data = True
-
-    try:
-        scene.display_settings.display_device = "sRGB"
-        scene.view_settings.view_transform = "Standard"
-        scene.view_settings.look = "None"
-    except Exception:
-        pass
-    scene.view_settings.exposure = 0.0
-    scene.view_settings.gamma = 1.0
-    world = scene.world or bpy.data.worlds.new("World")
-    scene.world = world
-    world.use_nodes = True
-    return scene
-
-def set_world(scene, strength, color=(1.0, 1.0, 1.0, 1.0)):
-    world = scene.world
-    world.use_nodes = True
-    background = world.node_tree.nodes.get("Background")
-    if background is not None:
-        background.inputs["Color"].default_value = color
-        background.inputs["Strength"].default_value = float(strength)
-
-
-def import_glb(path):
-    before = set(bpy.data.objects)
-    try:
-        bpy.ops.import_scene.gltf(
-            filepath=str(path),
-            merge_vertices=False,
-            import_shading="NORMALS",
-        )
-    except TypeError:
-        bpy.ops.import_scene.gltf(filepath=str(path))
-    imported = [obj for obj in bpy.data.objects if obj not in before]
-    roots = [obj for obj in imported if obj.parent is None]
-    meshes = [obj for obj in imported if obj.type == "MESH"]
-    if not meshes:
-        raise RuntimeError("temporary GLB contains no mesh objects")
-    total_vertices = sum(len(obj.data.vertices) for obj in meshes)
-    total_polygons = sum(len(obj.data.polygons) for obj in meshes)
-    log(
-        "imported meshes=%d vertices=%d polygons=%d merge_vertices=False"
-        % (len(meshes), total_vertices, total_polygons)
-    )
-    return imported, roots
-
-
-def apply_root_transform(roots, values):
-    matrix_gltf = Matrix(values)
-    gltf_to_blender = Matrix((
-        (1.0, 0.0,  0.0, 0.0),
-        (0.0, 0.0, -1.0, 0.0),
-        (0.0, 1.0,  0.0, 0.0),
-        (0.0, 0.0,  0.0, 1.0),
-    ))
-    matrix_blender = gltf_to_blender @ matrix_gltf @ gltf_to_blender.inverted()
-    for root in roots:
-        root.matrix_world = matrix_blender @ root.matrix_world
-    bpy.context.view_layer.update()
-
-
-def add_area(scene, name, location, energy, size, color=(1.0, 1.0, 1.0)):
-    data = bpy.data.lights.new(name=name, type="AREA")
-    data.energy = float(energy)
-    data.shape = "DISK"
-    data.size = float(size)
-    data.color = color
-    obj = bpy.data.objects.new(name, data)
-    scene.collection.objects.link(obj)
-    obj.location = location
-    obj.rotation_euler = (-obj.location).to_track_quat("-Z", "Y").to_euler()
-    return obj
-
-
-def add_light_rig(scene, mode):
-    if mode == "studio":
-        set_world(scene, 0.22)
-        add_area(scene, "Key", (-3.5, -4.5, 4.5), 850.0, 4.5)
-        add_area(scene, "Fill", (4.0, -2.5, 2.0), 430.0, 5.0)
-        add_area(scene, "Top", (0.0, 0.5, 5.0), 300.0, 4.0)
-        add_area(scene, "Rim", (0.5, 4.0, 3.0), 300.0, 3.0)
-    elif mode == "three_point":
-        set_world(scene, 0.12)
-        add_area(scene, "Key", (-3.0, -4.0, 3.5), 1000.0, 3.0)
-        add_area(scene, "Fill", (3.5, -2.5, 1.5), 350.0, 4.0)
-        add_area(scene, "Rim", (1.0, 4.0, 3.0), 650.0, 2.5)
-    elif mode == "softbox":
-        set_world(scene, 0.30)
-        add_area(scene, "SoftboxLeft", (-3.5, -3.5, 3.0), 650.0, 6.0)
-        add_area(scene, "SoftboxRight", (3.5, -3.0, 2.5), 600.0, 6.0)
-        add_area(scene, "SoftboxTop", (0.0, 0.0, 5.0), 250.0, 5.0)
-    elif mode == "front":
-        set_world(scene, 0.15)
-        add_area(scene, "Front", (0.0, -4.5, 0.8), 1000.0, 5.0)
-        add_area(scene, "FrontTop", (0.0, -2.5, 4.0), 250.0, 4.0)
-    elif mode == "uniform":
-        set_world(scene, 0.35)
-        positions = (
-            (0.0, -4.0, 0.0),
-            (0.0, 4.0, 0.0),
-            (-4.0, 0.0, 0.0),
-            (4.0, 0.0, 0.0),
-            (0.0, 0.0, 4.0),
-            (0.0, 0.0, -4.0),
-        )
-        for index, position in enumerate(positions):
-            add_area(scene, "Uniform%02d" % index, position, 230.0, 4.5)
-    elif mode == "dramatic":
-        set_world(scene, 0.035)
-        add_area(scene, "HardKey", (-3.0, -3.5, 4.5), 1250.0, 1.5)
-        add_area(
-            scene,
-            "CoolRim",
-            (2.5, 4.0, 3.5),
-            900.0,
-            2.0,
-            (0.65, 0.75, 1.0),
-        )
-        add_area(
-            scene,
-            "WarmFill",
-            (3.5, -1.5, 0.5),
-            120.0,
-            3.0,
-            (1.0, 0.72, 0.55),
-        )
-    else:
-        raise ValueError("unsupported light mode: %s" % mode)
-
-
-def create_aligned_camera(scene, distance, fov_rad):
-    camera_data = bpy.data.cameras.new("Camera")
-    camera = bpy.data.objects.new("Camera", camera_data)
-    scene.collection.objects.link(camera)
-    camera.matrix_world = Matrix((
-        (1.0, 0.0,  0.0, 0.0),
-        (0.0, 0.0, -1.0, -float(distance)),
-        (0.0, 1.0,  0.0, 0.0),
-        (0.0, 0.0,  0.0, 1.0),
-    ))
-    camera_data.type = "PERSP"
-    camera_data.sensor_fit = "HORIZONTAL"
-    camera_data.sensor_width = 32.0
-    camera_data.sensor_height = 32.0
-    camera_data.lens = 16.0 / math.tan(float(fov_rad) / 2.0)
-    camera_data.clip_start = 0.01
-    camera_data.clip_end = 100.0
-    scene.camera = camera
-    return camera
-
-
-def write_status(path, payload):
-    status_path = Path(path)
-    status_path.parent.mkdir(parents=True, exist_ok=True)
-    status_path.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-
-
-def group_key(job):
-    return (
-        job["input_glb"],
-        int(job["resolution"]),
-        float(job["fov_rad"]),
-        float(job["distance"]),
-        int(job.get("samples", 64)),
-        json.dumps(job["transform"], separators=(",", ":")),
-    )
-
-
-def render_group(group_index, group_count, jobs):
-    first = jobs[0]
-    clear_scene()
-    scene = configure_render(first["resolution"], first.get("samples", 64))
-
-    started = time.perf_counter()
-    _, roots = import_glb(first["input_glb"])
-    apply_root_transform(roots, first["transform"])
-    create_aligned_camera(scene, first["distance"], first["fov_rad"])
-    log(
-        "group=%d/%d imported_once jobs=%d seconds=%.3f input=%s"
-        % (
-            group_index,
-            group_count,
-            len(jobs),
-            time.perf_counter() - started,
-            first["input_glb"],
-        )
-    )
-
-    for job_index, job in enumerate(jobs, start=1):
-        try:
-            clear_lights()
-            add_light_rig(scene, job["light_mode"])
-            output = Path(job["output_png"])
-            output.parent.mkdir(parents=True, exist_ok=True)
-            scene.render.filepath = str(output)
-            render_started = time.perf_counter()
-            log(
-                "render group=%d job=%d/%d light=%s start"
-                % (group_index, job_index, len(jobs), job["light_mode"])
-            )
-            bpy.ops.render.render(write_still=True)
-            log(
-                "render group=%d job=%d/%d light=%s seconds=%.3f done"
-                % (
-                    group_index,
-                    job_index,
-                    len(jobs),
-                    job["light_mode"],
-                    time.perf_counter() - render_started,
-                )
-            )
-            write_status(
-                job["status_json"],
-                {"status": "success", "output_png": job["output_png"], "error": None},
-            )
-        except Exception as exc:
-            error = "%s: %s" % (type(exc).__name__, exc)
-            traceback.print_exc()
-            write_status(
-                job["status_json"],
-                {
-                    "status": "failed",
-                    "output_png": job["output_png"],
-                    "error": error,
-                    "traceback": traceback.format_exc(),
-                },
-            )
-
-
-def main():
-    require_single_visible_device()
-    argv = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else []
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--jobs-json", required=True)
-    args = parser.parse_args(argv)
-    jobs = json.loads(Path(args.jobs_json).read_text(encoding="utf-8"))
-
-    groups = OrderedDict()
-    for job in jobs:
-        groups.setdefault(group_key(job), []).append(job)
-
-    group_values = list(groups.values())
-    for group_index, group_jobs in enumerate(group_values, start=1):
-        try:
-            render_group(group_index, len(group_values), group_jobs)
-        except Exception as exc:
-            error = "%s: %s" % (type(exc).__name__, exc)
-            traceback.print_exc()
-            for job in group_jobs:
-                write_status(
-                    job["status_json"],
-                    {
-                        "status": "failed",
-                        "output_png": job["output_png"],
-                        "error": error,
-                        "traceback": traceback.format_exc(),
-                    },
-                )
-
-
-if __name__ == "__main__":
-    main()
-"""
-
-def ensure_blender_helper(work_dir: Path) -> Path:
-    helper_path = work_dir / "_pixal3d_blender_texture_render.py"
-    helper_path.parent.mkdir(parents=True, exist_ok=True)
-    helper_path.write_text(BLENDER_HELPER_SOURCE, encoding="utf-8")
-    return helper_path
-
-
-def run_blender_jobs(
-    blender_executable: str,
-    helper_path: Path,
-    jobs: Sequence[Mapping[str, Any]],
-    work_dir: Path,
-    log_path: Path,
-) -> Dict[str, Dict[str, Any]]:
-    jobs = list(jobs)
-    if not jobs:
-        print("[render] no missing renders")
-        return {}
-
-    jobs_path = work_dir / "blender_jobs.json"
-    atomic_json(jobs_path, jobs)
-    command = [
-        blender_executable,
-        "--background",
-        "--python",
-        str(helper_path),
-        "--",
-        "--jobs-json",
-        str(jobs_path),
-    ]
-    print(f"[render] {shlex.join(command)}")
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-
-    environment = os.environ.copy()
-
-    visible_devices = environment.get("CUDA_VISIBLE_DEVICES", "").strip()
-    visible_tokens = [
-        token.strip()
-        for token in visible_devices.split(",")
-        if token.strip()
-    ]
-    if len(visible_tokens) != 1:
-        raise RuntimeError(
-            "This renderer requires exactly one CUDA_VISIBLE_DEVICES entry; "
-            f"got {visible_devices!r}"
-        )
-
-    environment["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-    environment["CUDA_VISIBLE_DEVICES"] = visible_tokens[0]
-    environment.pop("LIBGL_ALWAYS_SOFTWARE", None)
-
-    for key in ("PYTHONHOME", "PYTHONPATH"):
-        environment.pop(key, None)
-
-    ld_library_path = environment.get("LD_LIBRARY_PATH", "")
-    if "conda" in ld_library_path.lower() or "miniconda" in ld_library_path.lower():
-        environment.pop("LD_LIBRARY_PATH", None)
-
-    print(
-        f"[blender-env] CUDA_DEVICE_ORDER={environment['CUDA_DEVICE_ORDER']} "
-        f"CUDA_VISIBLE_DEVICES={environment['CUDA_VISIBLE_DEVICES']}"
-    )
-
-    with log_path.open("a", encoding="utf-8") as log_file:
-        log_file.write(f"\n# Blender command: {shlex.join(command)}\n")
-        process = subprocess.run(
-            command,
-            stdout=log_file,
-            stderr=subprocess.STDOUT,
-            text=True,
-            check=False,
-            env=environment,
-        )
-
-    results: Dict[str, Dict[str, Any]] = {}
-    for job in jobs:
-        output_png = str(job["output_png"])
-        status_path = Path(job["status_json"])
-        if status_path.is_file():
-            try:
-                status = json.loads(status_path.read_text(encoding="utf-8"))
-            except Exception as exc:
-                status = {
-                    "status": "failed",
-                    "output_png": output_png,
-                    "error": f"invalid Blender status JSON: {exc}",
-                }
-        elif Path(output_png).is_file():
-            status = {
-                "status": "success",
-                "output_png": output_png,
-                "error": None,
-            }
-        else:
-            status = {
-                "status": "failed",
-                "output_png": output_png,
-                "error": (
-                    f"Blender exited with code {process.returncode} "
-                    "without producing this render"
-                ),
-            }
-        results[output_png] = status
-
-    if process.returncode != 0:
-        print(
-            f"[render-warning] Blender exited with code {process.returncode}; "
-            f"see {log_path}"
-        )
-    failures = sum(
-        result.get("status") != "success" for result in results.values()
-    )
-    print(
-        f"[render] requested={len(jobs)} "
-        f"success={len(jobs) - failures} failed={failures}"
-    )
-    return results
-
-
-def load_metric_tensor(path: Path, size: Tuple[int, int]) -> torch.Tensor:
-    with Image.open(path) as image:
-        rgb = composite_on_black(image)
-    if rgb.size != size:
-        rgb = rgb.resize(size, Image.Resampling.LANCZOS)
-    array = np.asarray(rgb, dtype=np.float32) / 255.0
-    return torch.from_numpy(array).permute(2, 0, 1).contiguous()
-
-
-def psnr_metric(reference: torch.Tensor, prediction: torch.Tensor) -> float:
-    mse = float(F.mse_loss(prediction, reference).item())
-    if mse <= 0.0:
-        return float("inf")
-    return float(10.0 * math.log10(1.0 / mse))
-
-
-def gaussian_kernel(
-    window_size: int,
-    sigma: float,
-    device: torch.device,
-    dtype: torch.dtype,
-) -> torch.Tensor:
-    coordinates = torch.arange(window_size, device=device, dtype=dtype)
-    coordinates = coordinates - (window_size - 1) / 2.0
-    kernel_1d = torch.exp(-(coordinates**2) / (2.0 * sigma**2))
-    kernel_1d = kernel_1d / kernel_1d.sum()
-    return kernel_1d[:, None] * kernel_1d[None, :]
-
-
-def ssim_metric(
-    reference: torch.Tensor,
-    prediction: torch.Tensor,
-    window_size: int = 11,
-    sigma: float = 1.5,
-) -> float:
-    x = reference.unsqueeze(0).float()
-    y = prediction.unsqueeze(0).float()
-    channels = int(x.shape[1])
-    kernel = gaussian_kernel(window_size, sigma, x.device, x.dtype)
-    kernel = kernel[None, None].expand(channels, 1, window_size, window_size)
-    padding = window_size // 2
-
-    mu_x = F.conv2d(x, kernel, padding=padding, groups=channels)
-    mu_y = F.conv2d(y, kernel, padding=padding, groups=channels)
-    mu_x_sq = mu_x**2
-    mu_y_sq = mu_y**2
-    mu_xy = mu_x * mu_y
-    sigma_x_sq = F.conv2d(x * x, kernel, padding=padding, groups=channels) - mu_x_sq
-    sigma_y_sq = F.conv2d(y * y, kernel, padding=padding, groups=channels) - mu_y_sq
-    sigma_xy = F.conv2d(x * y, kernel, padding=padding, groups=channels) - mu_xy
-
-    c1 = 0.01**2
-    c2 = 0.03**2
-    ssim_map = (
-        (2.0 * mu_xy + c1)
-        * (2.0 * sigma_xy + c2)
-        / ((mu_x_sq + mu_y_sq + c1) * (sigma_x_sq + sigma_y_sq + c2) + 1e-12)
-    )
-    return float(ssim_map.mean().item())
-
-
-class LPIPSEvaluator:
-    def __init__(self, network: str, device: torch.device):
-        try:
-            import lpips
-        except ImportError as exc:
-            raise RuntimeError(
-                "The lpips package is required. Install it with: pip install lpips"
-            ) from exc
-        self.device = device
-        # lpips 0.1 still calls torchvision through the legacy `pretrained`
-        # argument.  Suppress only those two compatibility warnings.
-        with warnings.catch_warnings():
-            warnings.filterwarnings(
-                "ignore",
-                message=r"The parameter 'pretrained' is deprecated since 0\.13.*",
-                category=UserWarning,
-                module=r"torchvision\.models\._utils",
-            )
-            warnings.filterwarnings(
-                "ignore",
-                message=r"Arguments other than a weight enum or `None` for 'weights' are deprecated since 0\.13.*",
-                category=UserWarning,
-                module=r"torchvision\.models\._utils",
-            )
-            self.model = lpips.LPIPS(net=network).eval().to(device)
-
-    @torch.inference_mode()
-    def evaluate(self, reference: torch.Tensor, prediction: torch.Tensor) -> float:
-        x = reference.unsqueeze(0).to(self.device)
-        y = prediction.unsqueeze(0).to(self.device)
-        value = self.model(x * 2.0 - 1.0, y * 2.0 - 1.0)
-        return float(value.mean().item())
-
-
-def evaluate_render(
-    reference_cpu: torch.Tensor,
-    prediction_path: Path,
-    lpips_evaluator: LPIPSEvaluator,
-) -> Dict[str, float]:
-    height, width = int(reference_cpu.shape[1]), int(reference_cpu.shape[2])
-    prediction_cpu = load_metric_tensor(prediction_path, (width, height))
-    # PSNR/SSIM are inexpensive and stay on CPU. LPIPS uses the selected device.
-    metrics = {
-        "psnr_db": psnr_metric(reference_cpu, prediction_cpu),
-        "ssim": ssim_metric(reference_cpu, prediction_cpu),
-        "lpips": lpips_evaluator.evaluate(reference_cpu, prediction_cpu),
-    }
-    del prediction_cpu
-    return metrics
 
 
 def _features(value: Any) -> torch.Tensor:
@@ -1303,144 +269,701 @@ def _tree_to_device(value: Any, device: torch.device) -> Any:
 
 def _sample_once_kwargs(sampler_params: Mapping[str, Any]) -> Dict[str, Any]:
     excluded = {
-        "steps", "rescale_t", "verbose", "tqdm_desc", "record_trajectory",
-        "trajectory_device", "return_model_history",
+        "steps",
+        "rescale_t",
+        "verbose",
+        "tqdm_desc",
+        "record_trajectory",
+        "trajectory_device",
+        "return_model_history",
     }
     return {key: value for key, value in sampler_params.items() if key not in excluded}
 
 
-def _build_master_support(
-    base_coords64: torch.Tensor,
-    tile_experts: Sequence[TileExpert],
-) -> Tuple[torch.Tensor, Dict[str, int]]:
-    """Preserve base row order and append the sorted union of tile-only coords."""
-    if base_coords64.ndim != 2 or base_coords64.shape[1] != 4:
-        raise ValueError("base_coords64 must have shape [N,4]")
-    base_cpu = base_coords64.detach().to(device="cpu", dtype=torch.int64)
-    base_keys = [tuple(int(v) for v in row) for row in base_cpu.tolist()]
-    if len(set(base_keys)) != len(base_keys):
-        raise RuntimeError("base C64 support contains duplicate coordinates")
-
-    known = set(base_keys)
-    extra_keys: set[Tuple[int, int, int, int]] = set()
-    total_local_rows = 0
-    for expert in tile_experts:
-        local_cpu = expert.local_coords64.detach().to(device="cpu", dtype=torch.int64)
-        total_local_rows += int(local_cpu.shape[0])
-        for row in local_cpu.tolist():
-            key = tuple(int(v) for v in row)
-            if key not in known:
-                extra_keys.add(key)
-
-    ordered = base_keys + sorted(extra_keys)
-    master_cpu = torch.tensor(ordered, dtype=base_coords64.dtype)
-    master = master_cpu.to(device=base_coords64.device)
-    return master, {
-        "base_tokens": int(base_coords64.shape[0]),
-        "tile_local_rows_total": int(total_local_rows),
-        "added_unique_tokens": int(len(extra_keys)),
-        "master_tokens": int(len(ordered)),
-    }
-
-
-def _bind_tile_experts_to_master(
-    *,
-    tile_experts: Sequence[TileExpert],
-    master_coords64: torch.Tensor,
-    master_tile_ids: torch.Tensor,
-    master_tile_weights: torch.Tensor,
-) -> List[TileExpert]:
-    """Map every local coordinate to master and attach positive tent rows."""
-    master_map = _coord_key_rows(master_coords64)
-    usable: List[TileExpert] = []
-    for expert in tile_experts:
-        local_cpu = expert.local_coords64.detach().to(device="cpu", dtype=torch.int64)
-        master_rows = []
-        for row in local_cpu.tolist():
-            key = tuple(int(v) for v in row)
-            if key not in master_map:
-                raise RuntimeError(
-                    f"tile {expert.tile_id}: local coordinate missing from C64_master: {key}"
-                )
-            master_rows.append(master_map[key])
-        expert.master_rows = torch.tensor(master_rows, dtype=torch.long)
-
-        assigned_rows, assigned_weights = _tile_rows_and_weights(
-            master_tile_ids, master_tile_weights, expert.tile_id
-        )
-        weight_by_master = {
-            int(row): float(weight)
-            for row, weight in zip(
-                assigned_rows.detach().cpu().tolist(),
-                assigned_weights.detach().cpu().tolist(),
-            )
-        }
-        active_local: List[int] = []
-        active_master: List[int] = []
-        active_weights: List[float] = []
-        for local_row, master_row in enumerate(master_rows):
-            weight = weight_by_master.get(int(master_row), 0.0)
-            if weight > 0.0 and math.isfinite(weight):
-                active_local.append(local_row)
-                active_master.append(master_row)
-                active_weights.append(weight)
-
-        if not active_local:
-            print(
-                f"[master-bind] tile={expert.tile_id:02d} has no positive tent rows; skipped"
-            )
-            continue
-        expert.active_local_rows = torch.tensor(active_local, dtype=torch.long)
-        expert.active_master_rows = torch.tensor(active_master, dtype=torch.long)
-        expert.active_weights = torch.tensor(active_weights, dtype=torch.float32)
-        print(
-            f"[master-bind] tile={expert.tile_id:02d} local={len(master_rows):,} "
-            f"active_tent={len(active_local):,}"
-        )
-        usable.append(expert)
-    return usable
-
-
-def _save_tile_lr_trace(
-    *,
-    path: Path,
-    tile_id: int,
-    box: Sequence[int],
-    projection_crop_box: Sequence[float],
-    input_coords64: torch.Tensor,
-    coords32: torch.Tensor,
-    local_coords64: torch.Tensor,
-    lr_shape_flow: RecordedFlow,
-    seeds: Mapping[str, int],
-) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    torch.save(
-        {
-            "format": "pixal3d_joint_tile_master_union_support_v3",
-            "tile_id": int(tile_id),
-            "box_4096": [int(v) for v in box],
-            "projection_crop_box": [float(v) for v in projection_crop_box],
-            "input_coords64": input_coords64.detach().cpu(),
-            "coords32": coords32.detach().cpu(),
-            "local_coords64": local_coords64.detach().cpu(),
-            "seeds": {key: int(value) for key, value in seeds.items()},
-            "shape_512": _serialize_trajectory(lr_shape_flow),
-        },
-        temporary,
-    )
-    temporary.replace(path)
-
-
-def _serialize_trajectory(flow: RecordedFlow) -> Dict[str, Any]:
+def _validate_trajectory(flow: RecordedFlow, expected_steps: int) -> None:
     trajectory = flow.trajectory
-    return {
-        "times": torch.as_tensor(trajectory.times, dtype=torch.float64),
-        "time_intervals": torch.as_tensor(trajectory.time_intervals, dtype=torch.float64),
-        "states": [state.detach().cpu() for state in trajectory.states],
-        "velocities": [velocity.detach().cpu() for velocity in trajectory.velocities],
-        "final_samples": flow.samples.feats.detach().cpu(),
+    if len(trajectory.states) != expected_steps + 1:
+        raise RuntimeError(f"{flow.name}: invalid state count")
+    if len(trajectory.velocities) != expected_steps:
+        raise RuntimeError(f"{flow.name}: invalid velocity count")
+    if len(trajectory.times) != expected_steps + 1:
+        raise RuntimeError(f"{flow.name}: invalid time count")
+    if len(trajectory.time_intervals) != expected_steps:
+        raise RuntimeError(f"{flow.name}: invalid interval count")
+
+
+def _run_recorded_flow(
+    *,
+    pipeline: Any,
+    sampler: Any,
+    flow_model: torch.nn.Module,
+    noise: SparseTensor,
+    condition: Mapping[str, Any],
+    sampler_params: Mapping[str, Any],
+    description: str,
+    concat_cond: Optional[SparseTensor] = None,
+) -> RecordedFlow:
+    if concat_cond is not None and not torch.equal(noise.coords, concat_cond.coords):
+        raise RuntimeError(f"{description}: noise/concat coordinates differ")
+    if pipeline.low_vram:
+        flow_model.to(pipeline.device)
+    kwargs: Dict[str, Any] = {
+        **condition,
+        **dict(sampler_params),
+        "verbose": True,
+        "tqdm_desc": description,
+        "record_trajectory": True,
+        "trajectory_device": "cpu",
+        "return_model_history": False,
     }
+    if concat_cond is not None:
+        kwargs["concat_cond"] = concat_cond
+    started = time.perf_counter()
+    result = sampler.sample(flow_model, noise, **kwargs)
+    _sync_cuda()
+    print(
+        f"[recorded-flow] {description}: tokens={noise.feats.shape[0]:,} "
+        f"channels={noise.feats.shape[1]} seconds={time.perf_counter()-started:.3f}"
+    )
+    if pipeline.low_vram:
+        flow_model.cpu()
+        _empty_cuda_cache()
+    wrapped = RecordedFlow(result=result, name=description)
+    _validate_trajectory(wrapped, int(sampler_params.get("steps", 12)))
+    if not torch.equal(wrapped.samples.coords, noise.coords):
+        raise RuntimeError(f"{description}: sampler changed sparse coordinates")
+    return wrapped
+
+
+def _endpoint_indices_to_q(indices: torch.Tensor, resolution: int) -> torch.Tensor:
+    if resolution <= 1:
+        raise ValueError("resolution must exceed one")
+    return indices.to(torch.float32) * (2.0 / float(resolution - 1)) - 1.0
+
+
+def _q_to_endpoint_indices(q: torch.Tensor, resolution: int) -> torch.Tensor:
+    return torch.round((q + 1.0) * (float(resolution - 1) / 2.0)).to(torch.int32)
+
+
+def _quantize_decoder_candidates(
+    candidates: torch.Tensor,
+    *,
+    target_grid: int,
+    source_resolution: int = RESOLUTION_LR,
+) -> torch.Tensor:
+    if candidates.ndim != 2 or candidates.shape[1] != 4:
+        raise ValueError(f"decoder candidates must be [N,4], got {tuple(candidates.shape)}")
+    # Match the official Pixal3D cascade exactly: decoder coordinates live in
+    # the 512 endpoint convention and are mapped to [0, target_grid-1] with
+    # round(), not to [0, target_grid] with floor().
+    quantized_xyz = torch.round(
+        (candidates[:, 1:].to(torch.float32) + 0.5)
+        / float(source_resolution)
+        * float(target_grid - 1)
+    ).to(torch.int32)
+    quantized = torch.cat(
+        [candidates[:, :1].to(torch.int32), quantized_xyz],
+        dim=1,
+    )
+    quantized = torch.unique(quantized, dim=0)
+    valid = ((quantized[:, 1:] >= 0) & (quantized[:, 1:] < target_grid)).all(dim=1)
+    quantized = quantized[valid]
+    if quantized.numel() == 0:
+        raise RuntimeError(f"decoder upsample produced no C{target_grid} coordinates")
+    return quantized
+
+
+def _learned_upsample(
+    pipeline: Any,
+    lr_shape_denormalized: SparseTensor,
+    *,
+    target_grid: int,
+) -> torch.Tensor:
+    decoder = pipeline.models["shape_slat_decoder"]
+    if pipeline.low_vram:
+        decoder.to(pipeline.device)
+        decoder.low_vram = True
+    try:
+        candidates = decoder.upsample(lr_shape_denormalized, upsample_times=4)
+    finally:
+        if pipeline.low_vram:
+            decoder.cpu()
+            decoder.low_vram = False
+            _empty_cuda_cache()
+    return _quantize_decoder_candidates(candidates, target_grid=target_grid)
+
+
+def _coord_key_rows(coords: torch.Tensor) -> Dict[Tuple[int, int, int, int], int]:
+    cpu = coords.detach().to(device="cpu", dtype=torch.int64)
+    mapping: Dict[Tuple[int, int, int, int], int] = {}
+    for row, values in enumerate(cpu.tolist()):
+        key = tuple(int(value) for value in values)
+        if key in mapping:
+            raise RuntimeError(f"duplicate sparse coordinate {key}")
+        mapping[key] = row
+    return mapping
+
+
+def _global_coords_to_camera(
+    coords: torch.Tensor,
+    *,
+    grid_resolution: int,
+    camera: Mapping[str, float],
+) -> torch.Tensor:
+    q = _endpoint_indices_to_q(coords[:, 1:4], grid_resolution).to(coords.device)
+    center = torch.tensor(
+        [0.0, 0.0, -float(camera["distance"])],
+        device=coords.device,
+        dtype=q.dtype,
+    )
+    return center[None] + q / (2.0 * float(camera["mesh_scale"]))
+
+
+def _camera_to_global_q(
+    camera_points: torch.Tensor,
+    *,
+    camera: Mapping[str, float],
+) -> torch.Tensor:
+    center = torch.tensor(
+        [0.0, 0.0, -float(camera["distance"])],
+        device=camera_points.device,
+        dtype=camera_points.dtype,
+    )
+    return 2.0 * float(camera["mesh_scale"]) * (camera_points - center[None])
+
+
+def _project_camera_points(
+    camera_points: torch.Tensor,
+    camera_angle_x: torch.Tensor | float,
+    resolution: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    points = camera_points
+    if points.ndim == 2:
+        points = points.unsqueeze(0)
+    if points.ndim != 3 or points.shape[-1] != 3:
+        raise ValueError("camera_points must be [K,3] or [B,K,3]")
+    batch = points.shape[0]
+    fov = torch.as_tensor(camera_angle_x, device=points.device, dtype=points.dtype)
+    if fov.ndim == 0:
+        fov = fov[None]
+    if fov.numel() == 1 and batch > 1:
+        fov = fov.expand(batch)
+    if fov.shape != (batch,):
+        raise ValueError(f"camera_angle_x must broadcast to [{batch}]")
+    focal = float(resolution) / (2.0 * torch.tan(fov / 2.0))
+    depth = -points[..., 2]
+    denom = depth.clamp_min(1e-8)
+    x = focal[:, None] * points[..., 0] / denom + float(resolution) / 2.0
+    y = -focal[:, None] * points[..., 1] / denom + float(resolution) / 2.0
+    pixels = torch.stack([x, y], dim=-1)
+    valid = (
+        (depth > 0)
+        & (x >= 0)
+        & (x < resolution)
+        & (y >= 0)
+        & (y < resolution)
+        & torch.isfinite(pixels).all(dim=-1)
+    )
+    return pixels, depth, valid
+
+
+def _get_tile_projection_condition(
+    *,
+    pipeline: Any,
+    image_cond_model: torch.nn.Module,
+    image: Image.Image,
+    coords: torch.Tensor,
+    transform: TileCameraTransform,
+    grid_resolution: int,
+) -> Mapping[str, Any]:
+    """Use the ordinary Pixal3D centered-camera projection in tile space."""
+    return pipeline.get_proj_cond_shape(
+        image_cond_model,
+        [image],
+        coords,
+        camera_angle_x=float(transform.camera_angle_x),
+        distance=float(transform.distance),
+        mesh_scale=float(transform.mesh_scale),
+        grid_resolution_override=int(grid_resolution),
+    )
+
+
+def _tile_layout(
+    canonical_size: int,
+    tile_size: int,
+    tile_stride: int,
+) -> List[Tuple[int, int, int, int]]:
+    starts = list(range(0, canonical_size - tile_size + 1, tile_stride))
+    if not starts or starts[-1] != canonical_size - tile_size:
+        raise ValueError("tile layout does not land on the final image edge")
+    return [
+        (x0, y0, x0 + tile_size, y0 + tile_size)
+        for y0 in starts
+        for x0 in starts
+    ]
+
+
+def _rows_and_tent_weights(
+    uv: torch.Tensor,
+    valid: torch.Tensor,
+    box: Sequence[int],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    x0, y0, x1, y1 = (float(value) for value in box)
+    in_box = (
+        valid
+        & (uv[:, 0] >= x0)
+        & (uv[:, 0] < x1)
+        & (uv[:, 1] >= y0)
+        & (uv[:, 1] < y1)
+    )
+    rows = torch.where(in_box)[0]
+    if rows.numel() == 0:
+        return rows, torch.empty(0, device=uv.device, dtype=torch.float32)
+    local_x = (uv[rows, 0] - x0) / (x1 - x0)
+    local_y = (uv[rows, 1] - y0) / (y1 - y0)
+    weights = (
+        (1.0 - (2.0 * local_x - 1.0).abs())
+        * (1.0 - (2.0 * local_y - 1.0).abs())
+    ).clamp_min(1e-3)
+    return rows, weights.to(torch.float32)
+
+
+def _focal_pixels(camera_angle_x: float, resolution: int) -> float:
+    return float(resolution) / (2.0 * math.tan(float(camera_angle_x) / 2.0))
+
+
+def _build_tile_camera_transform(
+    *,
+    box: Sequence[int],
+    camera: Mapping[str, float],
+    canonical_size: int,
+    output_size: int,
+    extend_pixel: int = 0,
+) -> TileCameraTransform:
+    """Construct a centered Pixal3D camera representing one raw image crop.
+
+    The crop keeps the complete-image pixel rays.  Its focal length in output
+    pixels is the complete-image focal length multiplied by the crop resize
+    factor.  The tile FOV and Pixal3D distance are then derived exactly as in
+    official inference.  No point depth statistics enter this construction.
+    """
+    x0, y0, x1, y1 = (int(v) for v in box)
+    crop_w = x1 - x0
+    crop_h = y1 - y0
+    if crop_w <= 0 or crop_h <= 0:
+        raise ValueError(f"invalid tile box {tuple(box)}")
+    scale_x = float(output_size) / float(crop_w)
+    scale_y = float(output_size) / float(crop_h)
+    full_focal = _focal_pixels(float(camera["camera_angle_x"]), canonical_size)
+    tile_fx = full_focal * scale_x
+    tile_fy = full_focal * scale_y
+    if not math.isclose(tile_fx, tile_fy, rel_tol=1e-6, abs_tol=1e-6):
+        raise ValueError(
+            "current Pixal3D projection accepts one symmetric FOV; "
+            f"tile focal mismatch fx={tile_fx}, fy={tile_fy}"
+        )
+    tile_fov = 2.0 * math.atan(float(output_size) / (2.0 * tile_fx))
+    tile_mesh_scale = float(camera["mesh_scale"])
+    tile_distance = distance_from_fov(
+        tile_fov,
+        torch.tensor([-1.0, 0.0, 0.0]),
+        torch.tensor([0 - int(extend_pixel), output_size - 1 + int(extend_pixel)]),
+        tile_mesh_scale,
+        output_size,
+    )["distance_from_x"]
+    return TileCameraTransform(
+        box=(x0, y0, x1, y1),
+        output_size=int(output_size),
+        camera_angle_x=float(tile_fov),
+        distance=float(tile_distance),
+        mesh_scale=float(tile_mesh_scale),
+        full_focal_pixels=float(full_focal),
+        tile_focal_pixels=float(tile_fx),
+        crop_scale_x=float(scale_x),
+        crop_scale_y=float(scale_y),
+    )
+
+
+def _tile_coords_to_camera(
+    coords: torch.Tensor,
+    *,
+    grid_resolution: int,
+    transform: TileCameraTransform,
+) -> torch.Tensor:
+    q = _endpoint_indices_to_q(coords[:, 1:4], grid_resolution).to(coords.device)
+    center = torch.tensor(
+        [0.0, 0.0, -float(transform.distance)],
+        device=coords.device,
+        dtype=q.dtype,
+    )
+    return center[None] + q / (2.0 * float(transform.mesh_scale))
+
+
+def _global_q_to_tile_q(
+    q_global: torch.Tensor,
+    *,
+    camera: Mapping[str, float],
+    transform: TileCameraTransform,
+    clamp: bool = True,
+) -> Tuple[torch.Tensor, Dict[str, Any]]:
+    """Projectively recanonicalize global q into the tile's new [-1,1]^3.
+
+    The complete normalized depth coordinate is preserved exactly before the
+    optional numerical clamp: q_tile.z = q_global.z.  Every supplied row is
+    returned; no visibility/depth/range row filtering occurs.
+    """
+    if q_global.ndim != 2 or q_global.shape[1] != 3:
+        raise ValueError("q_global must be [N,3]")
+    dtype = q_global.dtype
+    device = q_global.device
+    global_center = torch.tensor(
+        [0.0, 0.0, -float(camera["distance"])],
+        device=device,
+        dtype=dtype,
+    )
+    global_points = global_center[None] + q_global / (2.0 * float(camera["mesh_scale"]))
+    uv, _, valid = _project_camera_points(
+        global_points,
+        float(camera["camera_angle_x"]),
+        CANONICAL_IMAGE_SIZE,
+    )
+    uv = uv[0]
+    valid = valid[0]
+    if not bool(valid.all().item()):
+        raise RuntimeError("selected global tile rows include invalid complete-camera projections")
+
+    x0, y0, _, _ = transform.box
+    u_tile = (uv[:, 0] - float(x0)) * float(transform.crop_scale_x)
+    v_tile = (uv[:, 1] - float(y0)) * float(transform.crop_scale_y)
+    qz = q_global[:, 2]
+    depth_tile = float(transform.distance) - qz / (2.0 * float(transform.mesh_scale))
+    if bool((depth_tile <= 0).any().item()):
+        raise RuntimeError("tile canonical depth became non-positive")
+    x_tile = (
+        (u_tile - float(transform.output_size) / 2.0)
+        * depth_tile
+        / float(transform.tile_focal_pixels)
+    )
+    y_tile = -(
+        (v_tile - float(transform.output_size) / 2.0)
+        * depth_tile
+        / float(transform.tile_focal_pixels)
+    )
+    q_raw = torch.stack(
+        [
+            2.0 * float(transform.mesh_scale) * x_tile,
+            2.0 * float(transform.mesh_scale) * y_tile,
+            qz,
+        ],
+        dim=1,
+    )
+    overflow = (q_raw.abs() - 1.0).clamp_min(0.0)
+    row_overflow = (overflow > 0).any(dim=1)
+    stats = {
+        "rows": int(q_raw.shape[0]),
+        "clamped_rows": int(row_overflow.sum().item()),
+        "clamped_fraction": float(row_overflow.float().mean().item()) if q_raw.shape[0] else 0.0,
+        "max_overflow": float(overflow.max().item()) if overflow.numel() else 0.0,
+        "q_raw_min": [float(v) for v in q_raw.amin(dim=0).detach().cpu().tolist()] if q_raw.shape[0] else [],
+        "q_raw_max": [float(v) for v in q_raw.amax(dim=0).detach().cpu().tolist()] if q_raw.shape[0] else [],
+    }
+    return (q_raw.clamp(-1.0, 1.0) if clamp else q_raw), stats
+
+
+def _tile_q_to_global_q(
+    q_tile: torch.Tensor,
+    *,
+    transform: TileCameraTransform,
+    camera: Mapping[str, float],
+    clamp: bool = True,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, Any]]:
+    """Exact inverse projective recanonicalization, preserving q_global.z."""
+    if q_tile.ndim != 2 or q_tile.shape[1] != 3:
+        raise ValueError("q_tile must be [N,3]")
+    st = float(transform.mesh_scale)
+    qz = q_tile[:, 2]
+    tile_points = torch.stack(
+        [
+            q_tile[:, 0] / (2.0 * st),
+            q_tile[:, 1] / (2.0 * st),
+            qz / (2.0 * st) - float(transform.distance),
+        ],
+        dim=1,
+    )
+    uv_tile, _, valid = _project_camera_points(
+        tile_points,
+        float(transform.camera_angle_x),
+        int(transform.output_size),
+    )
+    uv_tile = uv_tile[0]
+    # Do not reject rows solely because the model's canonical back half projects
+    # slightly outside the nominal image edge. Positive depth/finite values are
+    # the only hard requirements here.
+    finite = torch.isfinite(uv_tile).all(dim=1) & torch.isfinite(tile_points).all(dim=1)
+    positive_depth = (-tile_points[:, 2]) > 0
+    if not bool((finite & positive_depth).all().item()):
+        raise RuntimeError("tile coordinates produced invalid camera rays")
+
+    x0, y0, _, _ = transform.box
+    u_full = uv_tile[:, 0] / float(transform.crop_scale_x) + float(x0)
+    v_full = uv_tile[:, 1] / float(transform.crop_scale_y) + float(y0)
+    sg = float(camera["mesh_scale"])
+    depth_global = float(camera["distance"]) - qz / (2.0 * sg)
+    x_global = (
+        (u_full - CANONICAL_IMAGE_SIZE / 2.0)
+        * depth_global
+        / float(transform.full_focal_pixels)
+    )
+    y_global = -(
+        (v_full - CANONICAL_IMAGE_SIZE / 2.0)
+        * depth_global
+        / float(transform.full_focal_pixels)
+    )
+    global_points = torch.stack([x_global, y_global, -depth_global], dim=1)
+    q_raw = torch.stack(
+        [
+            2.0 * sg * x_global,
+            2.0 * sg * y_global,
+            qz,
+        ],
+        dim=1,
+    )
+    overflow = (q_raw.abs() - 1.0).clamp_min(0.0)
+    row_overflow = (overflow > 0).any(dim=1)
+    stats = {
+        "rows": int(q_raw.shape[0]),
+        "clamped_rows": int(row_overflow.sum().item()),
+        "clamped_fraction": float(row_overflow.float().mean().item()) if q_raw.shape[0] else 0.0,
+        "max_overflow": float(overflow.max().item()) if overflow.numel() else 0.0,
+        "q_raw_min": [float(v) for v in q_raw.amin(dim=0).detach().cpu().tolist()] if q_raw.shape[0] else [],
+        "q_raw_max": [float(v) for v in q_raw.amax(dim=0).detach().cpu().tolist()] if q_raw.shape[0] else [],
+    }
+    q_out = q_raw.clamp(-1.0, 1.0) if clamp else q_raw
+    return q_out, tile_points, global_points, stats
+
+
+def _selected_global_coords_to_local_coords(
+    base_coords128: torch.Tensor,
+    input_rows: torch.Tensor,
+    *,
+    camera: Mapping[str, float],
+    transform: TileCameraTransform,
+    grid_resolution: int,
+) -> Tuple[torch.Tensor, Dict[str, Any]]:
+    selected = base_coords128.index_select(0, input_rows)
+    q_global = _endpoint_indices_to_q(selected[:, 1:4], GRID_MASTER).to(selected.device)
+    q_tile, stats = _global_q_to_tile_q(
+        q_global,
+        camera=camera,
+        transform=transform,
+        clamp=True,
+    )
+    xyz = _q_to_endpoint_indices(q_tile, grid_resolution).clamp(0, grid_resolution - 1)
+    batch = torch.zeros((xyz.shape[0], 1), device=xyz.device, dtype=xyz.dtype)
+    coords = torch.cat([batch, xyz], dim=1).to(torch.int32)
+    coords = torch.unique(coords, dim=0)
+    if coords.numel() == 0:
+        raise RuntimeError("tile projective coordinate quantization is empty")
+    stats = {
+        **stats,
+        "input_rows": int(selected.shape[0]),
+        "unique_coords": int(coords.shape[0]),
+        "quantization_merge_rows": int(selected.shape[0] - coords.shape[0]),
+    }
+    return coords, stats
+
+
+def _local_coords_to_global128(
+    local_coords: torch.Tensor,
+    *,
+    transform: TileCameraTransform,
+    camera: Mapping[str, float],
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, Any]]:
+    """Map each tile C64 row to one global C128 coordinate ID.
+
+    The integer IDs are never compared across spaces.  The mapping is:
+
+        tile C64 ID -> q_tile -> inverse projective transform -> q_global
+        -> nearest endpoint-aligned global C128 ID.
+
+    Row order is preserved, so mapped_global_coords128[k] identifies the global
+    master point whose current feature and velocity correspond to local row k.
+    Multiple local rows and multiple tiles may map to the same global row; their
+    velocities are averaged later.
+    """
+    q_tile = _endpoint_indices_to_q(
+        local_coords[:, 1:4], GRID_TILE_HR
+    ).to(local_coords.device)
+    q_global, tile_points, global_points, stats = _tile_q_to_global_q(
+        q_tile,
+        transform=transform,
+        camera=camera,
+        clamp=True,
+    )
+    mapped_xyz = _q_to_endpoint_indices(q_global, GRID_MASTER).clamp(
+        0, GRID_MASTER - 1
+    )
+    mapped = torch.cat(
+        [
+            torch.zeros(
+                (mapped_xyz.shape[0], 1),
+                device=mapped_xyz.device,
+                dtype=torch.int32,
+            ),
+            mapped_xyz.to(torch.int32),
+        ],
+        dim=1,
+    )
+    unique_count = int(torch.unique(mapped, dim=0).shape[0])
+    stats = {
+        **stats,
+        "mapped_rows": int(mapped.shape[0]),
+        "mapped_unique_global_coords": unique_count,
+        "many_to_one_rows": int(mapped.shape[0] - unique_count),
+    }
+    return mapped, tile_points, global_points, stats
+
+
+def _estimate_camera(
+    *,
+    image_1024: Image.Image,
+    output_dir: Path,
+    manual_fov: float,
+    mesh_scale: float,
+    extend_pixel: int,
+    image_resolution: int,
+) -> Dict[str, float]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    if manual_fov > 0:
+        distance = distance_from_fov(
+            float(manual_fov),
+            torch.tensor([-1.0, 0.0, 0.0]),
+            torch.tensor([0 - extend_pixel, image_resolution - 1 + extend_pixel]),
+            float(mesh_scale),
+            int(image_resolution),
+        )["distance_from_x"]
+        return {
+            "camera_angle_x": float(manual_fov),
+            "distance": float(distance),
+            "mesh_scale": float(mesh_scale),
+        }
+    temporary = output_dir / f"_joint_tile_moge_{int(time.time()*1000)}.png"
+    image_1024.save(temporary)
+    print("[MoGe-2] loading global-image camera estimator")
+    model = load_moge_model(device="cuda")
+    try:
+        params = get_camera_params_wild_moge(
+            str(temporary),
+            model,
+            device="cuda",
+            mesh_scale=float(mesh_scale),
+            extend_pixel=int(extend_pixel),
+            image_resolution=int(image_resolution),
+        )
+    finally:
+        model.cpu()
+        del model
+        temporary.unlink(missing_ok=True)
+        _empty_cuda_cache()
+    return {
+        "camera_angle_x": float(params["camera_angle_x"]),
+        "distance": float(params["distance"]),
+        "mesh_scale": float(params["mesh_scale"]),
+    }
+
+
+def _build_sampler_params(
+    args: argparse.Namespace,
+    pipeline: Any,
+) -> Dict[str, Dict[str, Any]]:
+    return {
+        "ss": {
+            **pipeline.sparse_structure_sampler_params,
+            "steps": int(args.steps),
+            "guidance_strength": float(args.ss_guidance_strength),
+            "guidance_rescale": float(args.ss_guidance_rescale),
+            "rescale_t": float(args.ss_rescale_t),
+        },
+        "shape": {
+            **pipeline.shape_slat_sampler_params,
+            "steps": int(args.steps),
+            "guidance_strength": float(args.shape_guidance_strength),
+            "guidance_rescale": float(args.shape_guidance_rescale),
+            "rescale_t": float(args.shape_rescale_t),
+        },
+        "texture": {
+            **pipeline.tex_slat_sampler_params,
+            "steps": int(args.steps),
+            "guidance_strength": float(args.texture_guidance_strength),
+            "guidance_rescale": float(args.texture_guidance_rescale),
+            "rescale_t": float(args.texture_rescale_t),
+        },
+    }
+
+
+def _global_initial_support(
+    *,
+    pipeline: Any,
+    image_512: Image.Image,
+    camera: Mapping[str, float],
+    sampler_params: Mapping[str, Mapping[str, Any]],
+    seed: int,
+    max_num_tokens: int,
+) -> Tuple[torch.Tensor, torch.Tensor, RecordedFlow]:
+    cond_ss = pipeline.get_proj_cond_ss(
+        [image_512],
+        camera_angle_x=float(camera["camera_angle_x"]),
+        distance=float(camera["distance"]),
+        mesh_scale=float(camera["mesh_scale"]),
+    )
+    _seed_everything(seed)
+    coords32 = pipeline.sample_sparse_structure(
+        cond_ss,
+        resolution=GRID_LR,
+        sampler_params=dict(sampler_params["ss"]),
+    )
+    del cond_ss
+    if coords32.numel() == 0:
+        raise RuntimeError("global sparse structure is empty")
+    print(f"[global-support] C32={coords32.shape[0]:,}")
+
+    cond_lr = pipeline.get_proj_cond_shape(
+        pipeline.image_cond_model_shape_512,
+        [image_512],
+        coords32,
+        camera_angle_x=float(camera["camera_angle_x"]),
+        distance=float(camera["distance"]),
+        mesh_scale=float(camera["mesh_scale"]),
+        grid_resolution_override=GRID_LR,
+    )
+    model = pipeline.models["shape_slat_flow_model_512"]
+    noise = SparseTensor(
+        feats=_randn(
+            coords32.shape[0],
+            int(model.in_channels),
+            device=pipeline.device,
+            seed=seed + 101,
+        ),
+        coords=coords32,
+    )
+    flow = _run_recorded_flow(
+        pipeline=pipeline,
+        sampler=pipeline.shape_slat_sampler,
+        flow_model=model,
+        noise=noise,
+        condition=cond_lr,
+        sampler_params=sampler_params["shape"],
+        description="Global shape SLat 512",
+    )
+    lr_denorm = _denormalize_sparse(flow.samples, pipeline.shape_slat_normalization)
+    coords128 = _learned_upsample(pipeline, lr_denorm, target_grid=GRID_MASTER)
+    if coords128.shape[0] > max_num_tokens:
+        raise RuntimeError(
+            f"C128_base has {coords128.shape[0]:,} tokens, exceeding "
+            f"--max-num-tokens={max_num_tokens:,}"
+        )
+    print(f"[global-support] C128_base={coords128.shape[0]:,}")
+    return coords32, coords128, flow
 
 
 def _prepare_one_tile(
@@ -1448,47 +971,64 @@ def _prepare_one_tile(
     pipeline: Any,
     tile_id: int,
     box: Tuple[int, int, int, int],
-    projection_crop_box: Tuple[float, float, float, float],
-    tile_image_1024: Image.Image,
-    base_coords64: torch.Tensor,
-    tile_input_rows: torch.Tensor,
+    image_4096: Image.Image,
+    base_coords128: torch.Tensor,
+    input_rows: torch.Tensor,
     camera: Mapping[str, float],
     sampler_params: Mapping[str, Mapping[str, Any]],
     base_seed: int,
     trace_dir: Path,
     save_lr_trace: bool,
+    extend_pixel: int,
 ) -> TileExpert:
-    started = time.perf_counter()
-    tile_input_rows_device = tile_input_rows.to(
-        device=base_coords64.device, dtype=torch.long
+    transform = _build_tile_camera_transform(
+        box=box,
+        camera=camera,
+        canonical_size=CANONICAL_IMAGE_SIZE,
+        output_size=RESOLUTION_TILE_HR,
+        extend_pixel=extend_pixel,
     )
-    input_coords64 = base_coords64.index_select(0, tile_input_rows_device)
-    coords32 = _downsample_grid64_to_grid32(input_coords64)
+    coords32, input_stats = _selected_global_coords_to_local_coords(
+        base_coords128,
+        input_rows,
+        camera=camera,
+        transform=transform,
+        grid_resolution=GRID_LR,
+    )
+    tile_image_1024 = image_4096.crop(box).convert("RGB")
+    if tile_image_1024.size != (RESOLUTION_TILE_HR, RESOLUTION_TILE_HR):
+        tile_image_1024 = tile_image_1024.resize(
+            (RESOLUTION_TILE_HR, RESOLUTION_TILE_HR), Image.Resampling.LANCZOS
+        )
     tile_image_512 = tile_image_1024.resize(
         (RESOLUTION_LR, RESOLUTION_LR), Image.Resampling.LANCZOS
     )
-
-    lr_seed = base_seed + tile_id * 10 + 1
     print(
-        f"[tile-prepare] tile={tile_id:02d} box={box} "
-        f"C64_input={input_coords64.shape[0]:,} C32={coords32.shape[0]:,}"
+        f"[tile-camera] tile={tile_id:02d} box={box} "
+        f"fov={transform.camera_angle_x:.8f} distance={transform.distance:.8f} "
+        f"mesh_scale={transform.mesh_scale:.8f} focal={transform.tile_focal_pixels:.3f}"
+    )
+    print(
+        f"[tile-prepare] tile={tile_id:02d} base_rows={input_rows.numel():,} "
+        f"C32_local={coords32.shape[0]:,} "
+        f"input_clamped={input_stats['clamped_rows']:,}/{input_stats['rows']:,} "
+        f"max_overflow={input_stats['max_overflow']:.6f}"
     )
 
-    cond_lr = pipeline.get_proj_cond_shape(
-        pipeline.image_cond_model_shape_512,
-        [tile_image_512],
-        coords32,
-        camera_angle_x=camera["camera_angle_x"],
-        distance=camera["distance"],
-        mesh_scale=camera["mesh_scale"],
-        grid_resolution_override=GRID_LR,
-        projection_crop_box=projection_crop_box,
+    cond_lr = _get_tile_projection_condition(
+        pipeline=pipeline,
+        image_cond_model=pipeline.image_cond_model_shape_512,
+        image=tile_image_512,
+        coords=coords32,
+        transform=transform,
+        grid_resolution=GRID_LR,
     )
-    shape_lr_model = pipeline.models["shape_slat_flow_model_512"]
-    lr_noise = SparseTensor(
+    model_lr = pipeline.models["shape_slat_flow_model_512"]
+    lr_seed = base_seed + tile_id * 100 + 1
+    noise_lr = SparseTensor(
         feats=_randn(
             coords32.shape[0],
-            int(shape_lr_model.in_channels),
+            int(model_lr.in_channels),
             device=pipeline.device,
             seed=lr_seed,
         ),
@@ -1497,254 +1037,457 @@ def _prepare_one_tile(
     lr_flow = _run_recorded_flow(
         pipeline=pipeline,
         sampler=pipeline.shape_slat_sampler,
-        flow_model=shape_lr_model,
-        noise=lr_noise,
+        flow_model=model_lr,
+        noise=noise_lr,
         condition=cond_lr,
         sampler_params=sampler_params["shape"],
         description=f"Tile {tile_id:02d} shape SLat 512",
     )
-    lr_shape_denorm = _denormalize_sparse(
-        lr_flow.samples, pipeline.shape_slat_normalization
+    lr_denorm = _denormalize_sparse(lr_flow.samples, pipeline.shape_slat_normalization)
+    local_coords64 = _learned_upsample(
+        pipeline,
+        lr_denorm,
+        target_grid=GRID_TILE_HR,
     )
-    local_coords64 = _learned_upsample_to_grid64(pipeline, lr_shape_denorm)
+    (
+        mapped,
+        local_tile_camera_points,
+        local_global_camera_points,
+        output_stats,
+    ) = _local_coords_to_global128(
+        local_coords64,
+        transform=transform,
+        camera=camera,
+    )
     print(
-        f"[tile-prepare] tile={tile_id:02d} C64_local={local_coords64.shape[0]:,}"
+        f"[tile-prepare] tile={tile_id:02d} C64_local={local_coords64.shape[0]:,} "
+        f"mapped_C128_unique={torch.unique(mapped, dim=0).shape[0]:,} "
+        f"output_clamped={output_stats['clamped_rows']:,}/{output_stats['rows']:,} "
+        f"max_overflow={output_stats['max_overflow']:.6f}"
     )
-
-    shape_condition = pipeline.get_proj_cond_shape(
-        pipeline.image_cond_model_shape_1024,
-        [tile_image_1024],
-        local_coords64,
-        camera_angle_x=camera["camera_angle_x"],
-        distance=camera["distance"],
-        mesh_scale=camera["mesh_scale"],
-        grid_resolution_override=GRID_HR,
-        projection_crop_box=projection_crop_box,
+    shape_condition = _get_tile_projection_condition(
+        pipeline=pipeline,
+        image_cond_model=pipeline.image_cond_model_shape_1024,
+        image=tile_image_1024,
+        coords=local_coords64,
+        transform=transform,
+        grid_resolution=GRID_TILE_HR,
     )
-    texture_condition = pipeline.get_proj_cond_shape(
-        pipeline.image_cond_model_tex_1024,
-        [tile_image_1024],
-        local_coords64,
-        camera_angle_x=camera["camera_angle_x"],
-        distance=camera["distance"],
-        mesh_scale=camera["mesh_scale"],
-        grid_resolution_override=GRID_HR,
-        projection_crop_box=projection_crop_box,
+    texture_condition = _get_tile_projection_condition(
+        pipeline=pipeline,
+        image_cond_model=pipeline.image_cond_model_tex_1024,
+        image=tile_image_1024,
+        coords=local_coords64,
+        transform=transform,
+        grid_resolution=GRID_TILE_HR,
     )
+    shape_condition_cpu = _tree_to_cpu(shape_condition)
+    texture_condition_cpu = _tree_to_cpu(texture_condition)
 
     trace_path_value: Optional[str] = None
     if save_lr_trace:
-        trace_path = trace_dir / f"tile_{tile_id:04d}.pt"
-        _save_tile_lr_trace(
-            path=trace_path,
-            tile_id=tile_id,
-            box=box,
-            projection_crop_box=projection_crop_box,
-            input_coords64=input_coords64,
-            coords32=coords32,
-            local_coords64=local_coords64,
-            lr_shape_flow=lr_flow,
-            seeds={"shape_512": lr_seed},
+        path = trace_dir / "tiles" / f"tile_{tile_id:04d}_support.pt"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(path.suffix + ".tmp")
+        torch.save(
+            {
+                "format": "pixal3d_2048_tile_point_velocity_support_v1",
+                "tile_id": tile_id,
+                "box_4096": list(box),
+                "transform": asdict(transform),
+                "input_transform_stats": dict(input_stats),
+                "output_transform_stats": dict(output_stats),
+                "input_base_rows": input_rows.cpu(),
+                "input_base_coords128": base_coords128.index_select(0, input_rows).cpu(),
+                "coords32_local": coords32.cpu(),
+                "coords64_local": local_coords64.cpu(),
+                "coords128_mapped": mapped.cpu(),
+                "tile_camera_points64": local_tile_camera_points.cpu(),
+                "global_camera_points64": local_global_camera_points.cpu(),
+                "shape_512": {
+                    "times": torch.as_tensor(lr_flow.trajectory.times),
+                    "time_intervals": torch.as_tensor(lr_flow.trajectory.time_intervals),
+                    "states": [state.detach().cpu() for state in lr_flow.trajectory.states],
+                    "velocities": [v.detach().cpu() for v in lr_flow.trajectory.velocities],
+                    "final_samples": lr_flow.samples.feats.detach().cpu(),
+                },
+                "seed_shape_512": lr_seed,
+            },
+            temporary,
         )
-        trace_path_value = str(trace_path.resolve())
+        temporary.replace(path)
+        trace_path_value = str(path.resolve())
 
-    shape_condition_cpu = _tree_to_cpu(shape_condition)
-    texture_condition_cpu = _tree_to_cpu(texture_condition)
-    print(
-        f"[tile-prepare] tile={tile_id:02d} input={input_coords64.shape[0]:,} "
-        f"local={local_coords64.shape[0]:,} seconds={time.perf_counter()-started:.3f}"
-    )
-    del cond_lr, lr_noise, lr_shape_denorm, shape_condition, texture_condition, lr_flow
+    del cond_lr, noise_lr, lr_denorm, lr_flow, shape_condition, texture_condition
     _empty_cuda_cache()
     return TileExpert(
         tile_id=int(tile_id),
         box=tuple(int(v) for v in box),
-        projection_crop_box=tuple(float(v) for v in projection_crop_box),
-        input_base_rows=tile_input_rows.detach().cpu(),
-        local_coords64=local_coords64,
+        transform=transform,
+        input_base_rows=input_rows.detach().cpu(),
+        input_local_coords32=coords32.detach().cpu(),
+        local_coords64=local_coords64.detach().cpu(),
+        local_tile_camera_points64=local_tile_camera_points.detach().cpu(),
+        local_global_camera_points64=local_global_camera_points.detach().cpu(),
+        mapped_global_coords128=mapped.detach().cpu(),
         shape_condition_cpu=shape_condition_cpu,
         texture_condition_cpu=texture_condition_cpu,
+        input_transform_stats=dict(input_stats),
+        output_transform_stats=dict(output_stats),
         lr_trace_path=trace_path_value,
     )
 
 
+def _build_master_support(
+    base_coords128: torch.Tensor,
+    tile_experts: Sequence[TileExpert],
+    max_num_tokens: int,
+) -> Tuple[torch.Tensor, Dict[str, int]]:
+    """Union C128_base with the single mapped global ID of every tile row."""
+    base_cpu = base_coords128.detach().to(device="cpu", dtype=torch.int64)
+    base_keys = [tuple(int(v) for v in row) for row in base_cpu.tolist()]
+    if len(set(base_keys)) != len(base_keys):
+        raise RuntimeError("C128_base contains duplicate coordinates")
+
+    known = set(base_keys)
+    extras: set[Tuple[int, int, int, int]] = set()
+    total_local_rows = 0
+    total_unique_tile_coords = 0
+    for expert in tile_experts:
+        mapped = expert.mapped_global_coords128.detach().to(
+            device="cpu", dtype=torch.int64
+        )
+        total_local_rows += int(mapped.shape[0])
+        unique_mapped = torch.unique(mapped, dim=0)
+        total_unique_tile_coords += int(unique_mapped.shape[0])
+        for values in unique_mapped.tolist():
+            key = tuple(int(v) for v in values)
+            if key not in known:
+                extras.add(key)
+
+    ordered = base_keys + sorted(extras)
+    if len(ordered) > max_num_tokens:
+        raise RuntimeError(
+            f"C128_master has {len(ordered):,} tokens, exceeding "
+            f"--max-num-tokens={max_num_tokens:,}"
+        )
+    master = torch.tensor(
+        ordered, dtype=base_coords128.dtype, device=base_coords128.device
+    )
+    return master, {
+        "base_tokens": len(base_keys),
+        "tile_local_rows_total": total_local_rows,
+        "tile_unique_mapped_coords_sum": total_unique_tile_coords,
+        "added_unique_tokens": len(extras),
+        "master_tokens": len(ordered),
+    }
+
+
+def _bind_tile_experts_to_master(
+    *,
+    tile_experts: Sequence[TileExpert],
+    master_coords128: torch.Tensor,
+    camera: Mapping[str, float],
+) -> List[TileExpert]:
+    """Build a one-to-one row correspondence for each local row.
+
+    One-to-one here means one local row reads/writes one global master row.  The
+    relation is many-to-one globally: several local rows or several tiles may
+    map to the same master row, and their velocities are averaged there.
+    """
+    del camera
+    master_map = _coord_key_rows(master_coords128)
+    usable: List[TileExpert] = []
+    for expert in tile_experts:
+        mapped_cpu = expert.mapped_global_coords128.detach().to(
+            device="cpu", dtype=torch.int64
+        )
+        if mapped_cpu.shape[0] != expert.local_coords64.shape[0]:
+            raise RuntimeError(
+                f"tile {expert.tile_id}: mapped/local row counts differ "
+                f"({mapped_cpu.shape[0]} vs {expert.local_coords64.shape[0]})"
+            )
+        master_rows = torch.tensor(
+            [master_map[tuple(int(v) for v in row)] for row in mapped_cpu.tolist()],
+            dtype=torch.long,
+        )
+        count = int(master_rows.numel())
+        if count == 0:
+            print(f"[tile-bind] tile={expert.tile_id:02d} has no local rows")
+            continue
+
+        # All generated C64 rows retain their global point correspondence.
+        # The tent weight only blends overlapping image tiles; it does not
+        # change point identity or perform latent interpolation.
+        uv, _, _ = _project_camera_points(
+            expert.local_tile_camera_points64,
+            float(expert.transform.camera_angle_x),
+            int(expert.transform.output_size),
+        )
+        uv = uv[0]
+        local_x = (uv[:, 0] / float(expert.transform.output_size)).clamp(0.0, 1.0)
+        local_y = (uv[:, 1] / float(expert.transform.output_size)).clamp(0.0, 1.0)
+        tent_weights = (
+            (1.0 - (2.0 * local_x - 1.0).abs())
+            * (1.0 - (2.0 * local_y - 1.0).abs())
+        ).clamp_min(1e-3).to(torch.float32)
+        local_rows = torch.arange(count, dtype=torch.long)
+
+        expert.local_to_master_row = master_rows
+        expert.active_local_rows = local_rows
+        expert.active_tent_weights = tent_weights.detach().cpu()
+        unique_master = int(torch.unique(master_rows).numel())
+        duplicate_rows = count - unique_master
+        print(
+            f"[tile-bind] tile={expert.tile_id:02d} local={count:,} "
+            f"unique_master={unique_master:,} many_to_one={duplicate_rows:,}"
+        )
+        usable.append(expert)
+    return usable
+
+
 @torch.no_grad()
-def _run_online_fused_flow(
+def _run_online_master_flow(
     *,
     pipeline: Any,
     sampler: Any,
     flow_model: torch.nn.Module,
-    global_state: SparseTensor,
+    master_state: SparseTensor,
     global_condition: Mapping[str, Any],
     tile_experts: Sequence[TileExpert],
     sampler_params: Mapping[str, Any],
     replace_last_n: int,
+    replace_alpha: float,
     stage: str,
     global_concat_cond: Optional[SparseTensor] = None,
+    save_step_states: bool = True,
 ) -> OnlineFlowResult:
+    """Run one synchronized C128 trajectory with point-identity tile fusion.
+
+    Shapes per tile with K local rows and C latent channels:
+
+      local_to_master_row: [K]
+      master_state.feats:  [N,C]
+      tile_state.feats:    [K,C] = index_select(master_state, rows)
+      tile_velocity:       [K,C]
+
+    Multiple local rows/tiles writing the same master row are accumulated with
+    index_add and normalized by their scalar tent weights.  No latent or
+    velocity is spread to neighboring C128 lattice IDs.
+    """
     if stage not in {"shape", "texture"}:
         raise ValueError(stage)
     steps = int(sampler_params.get("steps", 12))
     if not 0 <= replace_last_n <= steps:
         raise ValueError(f"{stage}: replace_last_n must be in [0,{steps}]")
-    rescale_t = float(sampler_params.get("rescale_t", 1.0))
-    times = [float(v) for v in sampler.timestep_schedule(steps, rescale_t)]
+    if not 0.0 <= replace_alpha <= 1.0:
+        raise ValueError("replace_alpha must be in [0,1]")
+
+    times = [
+        float(v)
+        for v in sampler.timestep_schedule(
+            steps,
+            float(sampler_params.get("rescale_t", 1.0)),
+        )
+    ]
     intervals = [times[i] - times[i + 1] for i in range(steps)]
     start_step = steps - replace_last_n
     step_kwargs = _sample_once_kwargs(sampler_params)
-
     if pipeline.low_vram:
         flow_model.to(pipeline.device)
-    device = global_state.device
+    device = master_state.device
     global_condition_device = _tree_to_device(global_condition, device)
     if global_concat_cond is not None and not torch.equal(
-        global_state.coords, global_concat_cond.coords
+        master_state.coords, global_concat_cond.coords
     ):
-        raise RuntimeError(f"{stage}: global state/concat coords differ")
+        raise RuntimeError(f"{stage}: master/concat coordinates differ")
 
-    states_cpu = [global_state.feats.detach().cpu().clone()]
+    states_cpu: List[torch.Tensor] = []
     velocities_cpu: List[torch.Tensor] = []
+    if save_step_states:
+        states_cpu.append(master_state.feats.detach().cpu().clone())
     records: List[Dict[str, Any]] = []
     union_covered = torch.zeros(
-        global_state.feats.shape[0], dtype=torch.bool, device=device
+        master_state.feats.shape[0], dtype=torch.bool, device=device
     )
 
-    progress = tqdm(
-        range(steps), desc=f"Master-union joint {stage} 1024", dynamic_ncols=True
-    )
+    progress = tqdm(range(steps), desc=f"C128 master joint {stage}", dynamic_ncols=True)
     for step in progress:
         t = times[step]
         t_next = times[step + 1]
         dt = intervals[step]
 
-        # The complete-image model always predicts on every master point.
         global_call = {**global_condition_device, **step_kwargs}
         if global_concat_cond is not None:
             global_call["concat_cond"] = global_concat_cond
         global_out = sampler.sample_once(
-            flow_model, global_state, t, t_next, **global_call
+            flow_model,
+            master_state,
+            t,
+            t_next,
+            **global_call,
         )
-        global_velocity = _features(global_out.pred_v).to(dtype=torch.float32)
-        merged = global_velocity.clone()
-
-        velocity_sum = torch.zeros_like(global_velocity)
+        global_velocity = _features(global_out.pred_v).to(torch.float32)  # [N,C]
+        merged = global_velocity.clone()                                  # [N,C]
+        velocity_sum = torch.zeros_like(global_velocity)                  # [N,C]
         weight_sum = torch.zeros(
             (global_velocity.shape[0], 1), device=device, dtype=torch.float32
-        )
+        )                                                                 # [N,1]
         tile_calls = 0
+        local_rows_evaluated = 0
 
-        # First N steps are complete-image-only. Tile forwards begin exactly at
-        # start_step and always receive the current master x_t at their rows.
         if step >= start_step:
             for expert in tile_experts:
                 if (
-                    expert.master_rows is None
-                    or expert.active_master_rows is None
+                    expert.local_to_master_row is None
                     or expert.active_local_rows is None
-                    or expert.active_weights is None
+                    or expert.active_tent_weights is None
                 ):
-                    raise RuntimeError(
-                        f"tile {expert.tile_id}: master row binding is incomplete"
-                    )
-                master_rows = expert.master_rows.to(device=device, dtype=torch.long)
-                tile_state = SparseTensor(
-                    feats=global_state.feats.index_select(0, master_rows),
-                    coords=expert.local_coords64,
-                )
+                    raise RuntimeError(f"tile {expert.tile_id}: incomplete master binding")
+
+                local_to_master = expert.local_to_master_row.to(
+                    device=device, dtype=torch.long
+                )                                                         # [K]
+                local_coords = expert.local_coords64.to(device=device)    # [K,4]
+                tile_features = master_state.feats.index_select(
+                    0, local_to_master
+                )                                                         # [K,C]
+                tile_state = SparseTensor(feats=tile_features, coords=local_coords)
+
                 condition_cpu = (
                     expert.shape_condition_cpu
                     if stage == "shape"
                     else expert.texture_condition_cpu
                 )
-                condition_device = _tree_to_device(condition_cpu, device)
-                tile_call = {**condition_device, **step_kwargs}
+                tile_call = {**_tree_to_device(condition_cpu, device), **step_kwargs}
+                tile_shape_features: Optional[torch.Tensor] = None
                 if global_concat_cond is not None:
+                    tile_shape_features = global_concat_cond.feats.index_select(
+                        0, local_to_master
+                    )                                                     # [K,Cshape]
                     tile_call["concat_cond"] = SparseTensor(
-                        feats=global_concat_cond.feats.index_select(0, master_rows),
-                        coords=expert.local_coords64,
+                        feats=tile_shape_features,
+                        coords=local_coords,
                     )
+
                 tile_out = sampler.sample_once(
-                    flow_model, tile_state, t, t_next, **tile_call
+                    flow_model,
+                    tile_state,
+                    t,
+                    t_next,
+                    **tile_call,
                 )
-                tile_velocity = _features(tile_out.pred_v).to(dtype=torch.float32)
+                tile_velocity = _features(tile_out.pred_v).to(torch.float32)  # [K,C]
+
                 active_local = expert.active_local_rows.to(
                     device=device, dtype=torch.long
-                )
-                active_master = expert.active_master_rows.to(
-                    device=device, dtype=torch.long
-                )
-                weights = expert.active_weights.to(
+                )                                                         # [Ka]
+                active_master = local_to_master.index_select(
+                    0, active_local
+                )                                                         # [Ka]
+                tent = expert.active_tent_weights.to(
                     device=device, dtype=torch.float32
-                )[:, None]
-                selected = tile_velocity.index_select(0, active_local)
-                velocity_sum.index_add_(0, active_master, selected * weights)
-                weight_sum.index_add_(0, active_master, weights)
+                )                                                         # [Ka]
+                selected_velocity = tile_velocity.index_select(
+                    0, active_local
+                )                                                         # [Ka,C]
+
+                velocity_sum.index_add_(
+                    0,
+                    active_master,
+                    selected_velocity * tent[:, None],
+                )
+                weight_sum.index_add_(
+                    0,
+                    active_master,
+                    tent[:, None],
+                )
                 tile_calls += 1
-                del tile_state, condition_device, tile_call, tile_out
+                local_rows_evaluated += int(active_local.numel())
+
+                del (
+                    tile_features,
+                    tile_state,
+                    tile_call,
+                    tile_out,
+                    tile_velocity,
+                    active_master,
+                    selected_velocity,
+                )
+                if tile_shape_features is not None:
+                    del tile_shape_features
 
             covered = weight_sum[:, 0] > 0
             union_covered |= covered
             if torch.any(covered):
-                # Simple replacement requested by the experiment: normalized
-                # overlapping-tile mean replaces the complete-image velocity.
-                merged[covered] = velocity_sum[covered] / weight_sum[covered]
+                local_mean = velocity_sum[covered] / weight_sum[covered]  # [Nc,C]
+                merged[covered] = (
+                    (1.0 - replace_alpha) * global_velocity[covered]
+                    + replace_alpha * local_mean
+                )
         else:
             covered = torch.zeros(
                 global_velocity.shape[0], dtype=torch.bool, device=device
             )
 
-        next_global_feats = global_state.feats - float(dt) * merged.to(
-            global_state.dtype
+        next_state = master_state.replace(
+            master_state.feats - float(dt) * merged.to(master_state.dtype)
         )
-        next_global = global_state.replace(next_global_feats)
-        if not torch.isfinite(next_global.feats).all():
+        if not torch.isfinite(next_state.feats).all():
             raise RuntimeError(f"{stage}: non-finite master state at step {step}")
 
         covered_count = int(covered.sum().item())
         if covered_count:
-            local_mean = velocity_sum[covered] / weight_sum[covered]
-            global_cov = global_velocity[covered]
+            local_mean_all = velocity_sum[covered] / weight_sum[covered]
+            global_covered = global_velocity[covered]
             cosine = float(
                 torch.nn.functional.cosine_similarity(
-                    local_mean.flatten()[None], global_cov.flatten()[None]
+                    local_mean_all.flatten()[None],
+                    global_covered.flatten()[None],
                 ).item()
             )
             norm_ratio = float(
-                local_mean.norm().item() / max(global_cov.norm().item(), 1e-12)
+                local_mean_all.norm().item()
+                / max(global_covered.norm().item(), 1e-12)
             )
         else:
             cosine = 1.0
             norm_ratio = 1.0
+
         record = {
-            "step": int(step),
-            "t": float(t),
-            "t_next": float(t_next),
-            "dt": float(dt),
-            "replacement_active": bool(step >= start_step),
+            "step": step,
+            "t": t,
+            "t_next": t_next,
+            "dt": dt,
+            "replacement_active": step >= start_step,
             "covered_rows": covered_count,
-            "covered_ratio": covered_count / float(global_state.feats.shape[0]),
-            "tile_experts_called": int(tile_calls),
-            "fallback_global_rows": int(global_state.feats.shape[0] - covered_count),
+            "covered_ratio": covered_count / float(master_state.feats.shape[0]),
+            "tile_experts_called": tile_calls,
+            "local_rows_evaluated": local_rows_evaluated,
+            "fallback_global_rows": int(master_state.feats.shape[0] - covered_count),
             "local_vs_global_cosine_covered": cosine,
             "local_to_global_norm_ratio_covered": norm_ratio,
         }
         records.append(record)
         progress.set_postfix(
-            covered=f"{covered_count}/{global_state.feats.shape[0]}",
+            covered=f"{covered_count}/{master_state.feats.shape[0]}",
+            local=local_rows_evaluated,
             tiles=tile_calls,
             replace=int(step >= start_step),
             cos=f"{cosine:.4f}",
         )
-        global_state = next_global
-        velocities_cpu.append(merged.detach().cpu().clone())
-        states_cpu.append(global_state.feats.detach().cpu().clone())
-        del global_out
+
+        master_state = next_state
+        if save_step_states:
+            velocities_cpu.append(merged.detach().cpu().clone())
+            states_cpu.append(master_state.feats.detach().cpu().clone())
+        del global_out, global_velocity, merged, velocity_sum, weight_sum
 
     if pipeline.low_vram:
         flow_model.cpu()
         _empty_cuda_cache()
     return OnlineFlowResult(
-        samples=global_state,
+        samples=master_state,
         times=times,
         time_intervals=intervals,
         states=states_cpu,
@@ -1752,6 +1495,105 @@ def _run_online_fused_flow(
         step_records=records,
         covered_rows_union=int(union_covered.sum().item()),
     )
+
+
+def _atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    temporary.replace(path)
+
+
+def _save_global_trace(
+    *,
+    path: Path,
+    camera: Mapping[str, float],
+    base_coords128: torch.Tensor,
+    master_coords128: torch.Tensor,
+    global_lr_flow: RecordedFlow,
+    tile_experts: Sequence[TileExpert],
+    shape_flow: OnlineFlowResult,
+    texture_flow: OnlineFlowResult,
+    shape_final_norm: SparseTensor,
+    texture_final_norm: SparseTensor,
+    sampler_params: Mapping[str, Mapping[str, Any]],
+    master_stats: Mapping[str, int],
+) -> None:
+    tile_payload = []
+    for expert in tile_experts:
+        tile_payload.append(
+            {
+                "tile_id": expert.tile_id,
+                "box": list(expert.box),
+                "transform": asdict(expert.transform),
+                "input_transform_stats": dict(expert.input_transform_stats),
+                "output_transform_stats": dict(expert.output_transform_stats),
+                "input_base_rows": expert.input_base_rows,
+                "coords32_local": expert.input_local_coords32,
+                "coords64_local": expert.local_coords64.cpu(),
+                "tile_camera_points64": expert.local_tile_camera_points64.cpu(),
+                "global_camera_points64": expert.local_global_camera_points64.cpu(),
+                "coords128_mapped": expert.mapped_global_coords128.cpu(),
+                "local_to_master_row": (
+                    None
+                    if expert.local_to_master_row is None
+                    else expert.local_to_master_row.cpu()
+                ),
+                "active_local_rows": expert.active_local_rows,
+                "active_tent_weights": expert.active_tent_weights,
+                "lr_trace_path": expert.lr_trace_path,
+            }
+        )
+    payload = {
+        "format": "pixal3d_joint_tile_cascade_2048_master128_point_velocity_v1",
+        "coordinate_system": {
+            "global_master_grid": GRID_MASTER,
+            "global_flow_model_grid": GRID_MASTER,
+            "tile_lr_grid": GRID_LR,
+            "tile_hr_grid": GRID_TILE_HR,
+            "tile_projection": "global q -> crop pixels -> centered tile camera q, preserving normalized z",
+            "master_update": "one Euler update per step",
+            "resampling": "tile ID -> q_tile -> q_global -> one C128 ID; direct feature gather; tent-weighted multi-tile velocity mean",
+        },
+        "camera": dict(camera),
+        "sampler_params": {key: dict(value) for key, value in sampler_params.items()},
+        "master_stats": dict(master_stats),
+        "base_coords128": base_coords128.cpu(),
+        "master_coords128": master_coords128.cpu(),
+        "global_shape_512": {
+            "times": torch.as_tensor(global_lr_flow.trajectory.times),
+            "time_intervals": torch.as_tensor(global_lr_flow.trajectory.time_intervals),
+            "states": [state.detach().cpu() for state in global_lr_flow.trajectory.states],
+            "velocities": [v.detach().cpu() for v in global_lr_flow.trajectory.velocities],
+            "final_samples": global_lr_flow.samples.feats.detach().cpu(),
+        },
+        "tiles": tile_payload,
+        "shape_2048": {
+            "times": torch.as_tensor(shape_flow.times),
+            "time_intervals": torch.as_tensor(shape_flow.time_intervals),
+            "states": shape_flow.states,
+            "velocities": shape_flow.velocities,
+            "step_records": shape_flow.step_records,
+            "covered_rows_union": shape_flow.covered_rows_union,
+            "final_normalized": shape_final_norm.feats.detach().cpu(),
+        },
+        "texture_2048": {
+            "times": torch.as_tensor(texture_flow.times),
+            "time_intervals": torch.as_tensor(texture_flow.time_intervals),
+            "states": texture_flow.states,
+            "velocities": texture_flow.velocities,
+            "step_records": texture_flow.step_records,
+            "covered_rows_union": texture_flow.covered_rows_union,
+            "final_normalized": texture_final_norm.feats.detach().cpu(),
+        },
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    torch.save(payload, temporary)
+    temporary.replace(path)
 
 
 def _export_glb(
@@ -1762,165 +1604,192 @@ def _export_glb(
     output_path: Path,
     texture_size: int,
     decimation_target: int,
-) -> Dict[str, int]:
+    postprocess_cache_dir: Path,
+    camera: Mapping[str, Any],
+    seed: int,
+) -> Dict[str, Any]:
     if o_voxel is None:
-        raise RuntimeError("o_voxel is unavailable; use --no-decode or fix the environment")
-    mesh_list = pipeline.decode_latent(shape_slat, texture_slat, RESOLUTION_HR)
-    mesh = mesh_list[0]
+        raise RuntimeError("o_voxel is unavailable; run with --no-decode or fix the environment")
+    meshes = pipeline.decode_latent(shape_slat, texture_slat, RESOLUTION_MASTER)
+    mesh = meshes[0]
     vertices = int(mesh.vertices.shape[0])
     faces = int(mesh.faces.shape[0])
-    print(f"[Decoder mesh] vertices={vertices:,}, faces={faces:,}")
-    # Match the supplied evaluation path: preserve the decoder mesh topology
-    # instead of silently evaluating an aggressively decimated surrogate.
-    effective_decimation_target = faces
-    if int(decimation_target) != effective_decimation_target:
-        print(
-            f"[export] requested_decimation_target={int(decimation_target):,} "
-            f"ignored; preserving decoder faces={effective_decimation_target:,}"
-        )
-    glb = o_voxel.postprocess.to_glb(
-        vertices=mesh.vertices,
-        faces=mesh.faces,
-        attr_volume=mesh.attrs,
-        coords=mesh.coords,
-        attr_layout=pipeline.pbr_attr_layout,
-        grid_size=RESOLUTION_HR,
-        aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
-        decimation_target=effective_decimation_target,
-        texture_size=int(texture_size),
-        remesh=False,
-        use_tqdm=True,
-        verbose=False,
+    effective_target = faces if decimation_target <= 0 else min(faces, int(decimation_target))
+    print(f"[decode] vertices={vertices:,} faces={faces:,}")
+
+    export_kwargs = {
+        "vertices": mesh.vertices,
+        "faces": mesh.faces,
+        "attr_volume": mesh.attrs,
+        "coords": mesh.coords,
+        "attr_layout": pipeline.pbr_attr_layout,
+        "grid_size": RESOLUTION_MASTER,
+        "aabb": [[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
+        "decimation_target": effective_target,
+        "texture_size": int(texture_size),
+        "remesh": False,
+        "use_tqdm": True,
+        "verbose": False,
+    }
+
+    # Save the exact decoder/postprocess inputs before UV baking.  The repository
+    # evaluator render_pixal3d_cache_no_uv.py consumes this cache and uses the
+    # same aligned Pixal3D camera for PSNR/SSIM/LPIPS.
+    try:
+        from pixal3d_directory_texture_eval import save_to_glb_cache
+    except Exception as exc:
+        raise RuntimeError(
+            "cannot import save_to_glb_cache from pixal3d_directory_texture_eval.py"
+        ) from exc
+
+    cache_manifest = save_to_glb_cache(
+        postprocess_cache_dir,
+        export_kwargs,
+        extra_metadata={
+            "camera_params": dict(camera),
+            "pipeline_resolution": RESOLUTION_MASTER,
+            "actual_grid_resolution": GRID_MASTER,
+            "seed": int(seed),
+            "decoder_vertices": vertices,
+            "decoder_faces": faces,
+            "flow_experiment": "joint_tile_cascade_master128_point_velocity",
+        },
+        overwrite=True,
     )
+    # render_pixal3d_cache_no_uv.py currently reads grid_size from the top-level
+    # manifest even though save_to_glb_cache stores it in python_meta.pt. Mirror
+    # the scalar here so alignment verification can run without changing the
+    # evaluator script.
+    manifest_path = postprocess_cache_dir / "manifest.json"
+    published_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    published_manifest["grid_size"] = int(RESOLUTION_MASTER)
+    published_manifest["aabb"] = export_kwargs["aabb"]
+    _atomic_json(manifest_path, published_manifest)
+    cache_manifest = published_manifest
+    print(f"[postprocess-cache] {postprocess_cache_dir}")
+
+    glb = o_voxel.postprocess.to_glb(**export_kwargs)
     glb.apply_transform(PIXAL3D_EXPORT_ROTATION)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     glb.export(str(output_path), extension_webp=False)
-    print(f"[Done] GLB saved to: {output_path}")
-    return {"decoder_vertices": vertices, "decoder_faces": faces, "effective_decimation_target": effective_decimation_target}
+    print(f"[done] GLB saved to {output_path}")
+    return {
+        "decoder_vertices": vertices,
+        "decoder_faces": faces,
+        "effective_decimation_target": effective_target,
+        "postprocess_cache": str(postprocess_cache_dir),
+        "postprocess_cache_manifest": cache_manifest,
+    }
 
 
-def _offload_pipeline_for_render(pipeline: Any) -> None:
-    models = getattr(pipeline, "models", None)
-    if models is not None and hasattr(models, "items"):
-        for _, model in models.items():
-            if model is not None:
-                try:
-                    model.cpu()
-                except Exception:
-                    pass
-    for name in (
-        "image_cond_model_ss", "image_cond_model_shape_512",
-        "image_cond_model_shape_1024", "image_cond_model_tex_1024",
-    ):
-        model = getattr(pipeline, name, None)
-        if model is not None:
-            try:
-                model.cpu()
-            except Exception:
-                pass
-    _empty_cuda_cache()
-
-
-def _render_and_evaluate(
+def _run_aligned_render_eval(
     *,
-    glb_path: Path,
-    condition_image: Image.Image,
-    camera: Mapping[str, float],
-    output_dir: Path,
-    blender: str,
+    trace_dir: Path,
+    reference_image: Path,
     light: str,
     render_resolution: int,
     metric_resolution: int,
     blender_samples: int,
     lpips_net: str,
-    metric_device: torch.device,
+    blender: str,
 ) -> Dict[str, Any]:
-    output_dir.mkdir(parents=True, exist_ok=True)
-    reference_path = output_dir / "original.png"
-    render_path = output_dir / "render.png"
-    comparison_path = output_dir / "comparison.png"
+    cache_dir = trace_dir / "postprocess_cache"
+    output_dir = trace_dir / "aligned_eval"
+    script_path = Path(__file__).resolve().parent / "render_pixal3d_cache_no_uv.py"
+    if not script_path.is_file():
+        raise FileNotFoundError(
+            f"aligned evaluator is missing: {script_path}"
+        )
+    command = [
+        sys.executable,
+        str(script_path),
+        "--cache-dir", str(cache_dir),
+        "--output-dir", str(output_dir),
+        "--reference-image", str(reference_image),
+        "--lights", str(light),
+        "--engine", "cycles",
+        "--material-mode", "pbr",
+        "--render-resolution", str(int(render_resolution)),
+        "--metric-resolution", str(int(metric_resolution)),
+        "--samples", str(int(blender_samples)),
+        "--lpips-net", str(lpips_net),
+        "--metric-device", "cuda",
+        "--blender", str(blender),
+        "--overwrite-renders",
+    ]
+    print("[render-eval-command] " + shlex.join(command))
+    process = subprocess.run(command, check=False)
+    if process.returncode != 0:
+        raise RuntimeError(f"aligned render evaluator failed with exit code {process.returncode}")
+
     metrics_path = output_dir / "metrics.json"
-    blender_log = output_dir / "blender.log"
-    reference_image = save_metric_reference(
-        condition_image, reference_path, render_resolution
-    )
-    scratch = Path(tempfile.mkdtemp(prefix=".joint_tile_render_", dir=str(output_dir)))
-    try:
-        helper = ensure_blender_helper(scratch)
-        status_path = scratch / "status.json"
-        jobs = [{
-            "input_glb": str(glb_path),
-            "output_png": str(render_path),
-            "status_json": str(status_path),
-            "transform": PIXAL3D_EXPORTED_GLTF_TO_INTERNAL.tolist(),
-            "resolution": int(render_resolution),
-            "fov_rad": float(camera["camera_angle_x"]),
-            "distance": float(camera["distance"] * camera["mesh_scale"]),
-            "samples": int(blender_samples),
-            "light_mode": str(light),
-        }]
-        result = run_blender_jobs(
-            blender_executable=blender,
-            helper_path=helper,
-            jobs=jobs,
-            work_dir=scratch,
-            log_path=blender_log,
-        ).get(str(render_path), {})
-        if result.get("status") != "success" or not render_path.is_file():
-            raise RuntimeError(f"aligned Blender render failed: {result.get('error')}")
-        rendered = save_black_composited_render(render_path, render_resolution)
-        save_comparison(reference_image, rendered, comparison_path)
-        reference_cpu = load_metric_tensor(
-            reference_path, (int(metric_resolution), int(metric_resolution))
-        )
-        evaluator = LPIPSEvaluator(lpips_net, metric_device)
-        metrics = evaluate_render(reference_cpu, render_path, evaluator)
-        payload = {
-            "status": "success",
-            **metrics,
-            "light": light,
-            "render_resolution": int(render_resolution),
-            "metric_resolution": int(metric_resolution),
-            "reference": str(reference_path),
-            "render": str(render_path),
-            "comparison": str(comparison_path),
-            "blender_log": str(blender_log),
-        }
-        atomic_json(metrics_path, payload)
-        print(
-            f"[metrics] PSNR={metrics['psnr_db']:.4f} "
-            f"SSIM={metrics['ssim']:.6f} LPIPS={metrics['lpips']:.6f}"
-        )
-        return payload
-    finally:
-        shutil.rmtree(scratch, ignore_errors=True)
+    csv_path = output_dir / "metrics.csv"
+    if not metrics_path.is_file():
+        raise FileNotFoundError(metrics_path)
+    metrics_payload = json.loads(metrics_path.read_text(encoding="utf-8"))
+    rows = metrics_payload.get("rows", metrics_payload.get("metrics", []))
+    if isinstance(rows, list):
+        for row in rows:
+            if isinstance(row, dict) and row.get("status") == "success":
+                print(
+                    "[metrics] "
+                    f"light={row.get('light')} "
+                    f"PSNR={row.get('psnr_db')} "
+                    f"SSIM={row.get('ssim')} "
+                    f"LPIPS={row.get('lpips')}"
+                )
+    print(f"[render-eval] output={output_dir}")
+    return {
+        "aligned_eval_dir": str(output_dir),
+        "aligned_eval_metrics_json": str(metrics_path),
+        "aligned_eval_metrics_csv": str(csv_path),
+        "aligned_eval_payload": metrics_payload,
+    }
+
+
+def _parse_tile_ids(value: Optional[str]) -> Optional[set[int]]:
+    if value is None or not value.strip():
+        return None
+    return {int(item.strip()) for item in value.split(",") if item.strip()}
+
+
+
+def _active_unique_master_count(expert: TileExpert) -> int:
+    if expert.local_to_master_row is None or expert.active_local_rows is None:
+        return 0
+    active = expert.active_local_rows.to(dtype=torch.long)
+    rows = expert.local_to_master_row.index_select(0, active)
+    return int(torch.unique(rows).numel())
 
 
 def run_experiment(args: argparse.Namespace) -> None:
-    if args.tile_size != DEFAULT_TILE_SIZE or args.tile_stride != DEFAULT_TILE_STRIDE:
-        raise ValueError("master-union v3 requires tile-size=1024 and tile-stride=512")
     if args.steps != 12:
-        raise ValueError("master-union v3 currently requires exactly 12 steps")
-    if not math.isclose(float(args.replace_alpha), 1.0, abs_tol=0.0):
-        raise ValueError(
-            "master-union v3 implements simple hard replacement only; "
-            "use --replace-alpha 1.0"
-        )
+        raise ValueError("this experiment currently requires exactly 12 Euler steps")
+    if args.tile_size != 1024 or args.tile_stride != 512:
+        raise ValueError("this implementation requires tile-size=1024, tile-stride=512")
 
     output_path = Path(args.output).expanduser().resolve()
     trace_dir = Path(args.trace_dir).expanduser().resolve()
     trace_dir.mkdir(parents=True, exist_ok=True)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    pipeline = init_pipeline(args.model_path, device="cuda", low_vram=bool(args.low_vram))
-    source = Image.open(args.image)
-    canonical = pipeline.preprocess_canonical_images(source)
+    pipeline = init_pipeline(
+        args.model_path,
+        device="cuda",
+        low_vram=bool(args.low_vram),
+    )
+    canonical = pipeline.preprocess_canonical_images(Image.open(args.image))
     image_4096: Image.Image = canonical["image_4096"]
     image_1024: Image.Image = canonical["image_1024"]
     image_512: Image.Image = canonical["image_512"]
     image_4096.save(trace_dir / "canonical_4096.png")
     image_1024.save(trace_dir / "canonical_1024.png")
     image_512.save(trace_dir / "canonical_512.png")
+    metric_reference_path = trace_dir / "metric_reference_rgb.png"
+    reference_rgba = image_1024.convert("RGBA")
+    reference_black = Image.new("RGBA", reference_rgba.size, (0, 0, 0, 255))
+    reference_black.alpha_composite(reference_rgba)
+    reference_black.convert("RGB").save(metric_reference_path)
 
     camera = _estimate_camera(
         image_1024=image_1024,
@@ -1935,417 +1804,316 @@ def run_experiment(args: argparse.Namespace) -> None:
         f"distance={camera['distance']:.8f} mesh_scale={camera['mesh_scale']:.8f}"
     )
     sampler_params = _build_sampler_params(args, pipeline)
-    coords32_global, coords64_base, global_lr_flow, _ = _global_initial_support(
+    _, base_coords128, global_lr_flow = _global_initial_support(
         pipeline=pipeline,
         image_512=image_512,
-        image_1024=image_1024,
         camera=camera,
         sampler_params=sampler_params,
         seed=int(args.seed),
+        max_num_tokens=int(args.max_num_tokens),
     )
 
-    # Tile eligibility is determined from the original complete-image C64_base.
-    base_projected_norm, base_projected_depth, base_projection_valid = (
-        pipeline._project_sparse_coords_to_image_norm(
-            image_cond_model=pipeline.image_cond_model_shape_1024,
-            coords=coords64_base,
-            camera_angle_x=camera["camera_angle_x"],
-            distance=camera["distance"],
-            mesh_scale=camera["mesh_scale"],
-            grid_resolution=GRID_HR,
-        )
+    base_camera_points = _global_coords_to_camera(
+        base_coords128,
+        grid_resolution=GRID_MASTER,
+        camera=camera,
     )
-    boxes = pipeline.build_texture_image_tile_layout(
-        canonical_size=CANONICAL_IMAGE_SIZE,
-        tile_size=int(args.tile_size),
-        tile_stride=int(args.tile_stride),
+    base_uv, _, base_valid = _project_camera_points(
+        base_camera_points,
+        float(camera["camera_angle_x"]),
+        CANONICAL_IMAGE_SIZE,
     )
-    base_tile_ids, base_tile_weights, _ = pipeline.assign_texture_tiles(
-        base_projected_norm * float(CANONICAL_IMAGE_SIZE),
-        boxes,
-        canonical_size=CANONICAL_IMAGE_SIZE,
-        max_memberships=4,
-    )
+    base_uv = base_uv[0]
+    base_valid = base_valid[0]
 
-    requested = _parse_tile_ids(args.tile_ids)
+    boxes = _tile_layout(
+        CANONICAL_IMAGE_SIZE,
+        int(args.tile_size),
+        int(args.tile_stride),
+    )
+    selected_ids = _parse_tile_ids(args.tile_ids)
     tile_experts: List[TileExpert] = []
-    tile_metadata: List[Dict[str, Any]] = []
     processed = 0
     for tile_id, box in enumerate(boxes):
-        if requested is not None and tile_id not in requested:
+        if selected_ids is not None and tile_id not in selected_ids:
             continue
-        rows, _ = _tile_rows_and_weights(
-            base_tile_ids, base_tile_weights, tile_id
-        )
+        rows, _ = _rows_and_tent_weights(base_uv, base_valid, box)
         if rows.numel() < int(args.min_tile_tokens):
-            tile_metadata.append({
-                "tile_id": tile_id,
-                "box": list(box),
-                "status": "skipped_min_tokens",
-                "input_tokens": int(rows.numel()),
-            })
+            print(
+                f"[tile-skip] tile={tile_id:02d} tokens={rows.numel():,} "
+                f"< min={args.min_tile_tokens}"
+            )
             continue
         if args.max_tiles is not None and processed >= int(args.max_tiles):
             break
-        processed += 1
-        x0, y0, x1, y1 = box
-        tile_image = image_4096.crop((x0, y0, x1, y1)).convert("RGB")
-        tile_image.save(trace_dir / f"tile_{tile_id:04d}.png")
-        crop_box = (
-            x0 / float(CANONICAL_IMAGE_SIZE),
-            y0 / float(CANONICAL_IMAGE_SIZE),
-            x1 / float(CANONICAL_IMAGE_SIZE),
-            y1 / float(CANONICAL_IMAGE_SIZE),
-        )
-        expert = _prepare_one_tile(
-            pipeline=pipeline,
-            tile_id=tile_id,
-            box=box,
-            projection_crop_box=crop_box,
-            tile_image_1024=tile_image,
-            base_coords64=coords64_base,
-            tile_input_rows=rows,
-            camera=camera,
-            sampler_params=sampler_params,
-            base_seed=int(args.seed) + 10_000,
-            trace_dir=trace_dir / "tile_support_traces",
-            save_lr_trace=not bool(args.no_save_full_tile_traces),
-        )
+        try:
+            expert = _prepare_one_tile(
+                pipeline=pipeline,
+                tile_id=tile_id,
+                box=box,
+                image_4096=image_4096,
+                base_coords128=base_coords128,
+                input_rows=rows,
+                camera=camera,
+                sampler_params=sampler_params,
+                base_seed=int(args.seed) + 1000,
+                trace_dir=trace_dir,
+                save_lr_trace=bool(args.save_tile_lr_traces),
+                extend_pixel=int(args.extend_pixel),
+            )
+        except Exception as exc:
+            if args.strict_tiles:
+                raise
+            print(f"[tile-error] tile={tile_id:02d}: {type(exc).__name__}: {exc}")
+            _empty_cuda_cache()
+            continue
         tile_experts.append(expert)
-        tile_metadata.append({
-            "tile_id": tile_id,
-            "box": list(box),
-            "status": "prepared",
-            "input_tokens": int(expert.input_base_rows.numel()),
-            "local_tokens": int(expert.local_coords64.shape[0]),
-            "lr_trace_path": expert.lr_trace_path,
-        })
-    if not tile_experts:
-        raise RuntimeError("no tile passed --min-tile-tokens")
+        processed += 1
 
-    # Insert every tile-proposed C64 point before the formal 1024 flow.
-    coords64_master, master_stats = _build_master_support(
-        coords64_base, tile_experts
+    if not tile_experts:
+        raise RuntimeError("no usable tile experts were prepared")
+    master_coords128, master_stats = _build_master_support(
+        base_coords128,
+        tile_experts,
+        int(args.max_num_tokens),
     )
     print(
         f"[master-support] base={master_stats['base_tokens']:,} "
         f"added={master_stats['added_unique_tokens']:,} "
         f"master={master_stats['master_tokens']:,}"
     )
-
-    # Reproject the union support. These memberships/weights are the only rows
-    # a tile may replace; all remaining points fall back to global velocity.
-    projected_norm, projected_depth, projection_valid = (
-        pipeline._project_sparse_coords_to_image_norm(
-            image_cond_model=pipeline.image_cond_model_shape_1024,
-            coords=coords64_master,
-            camera_angle_x=camera["camera_angle_x"],
-            distance=camera["distance"],
-            mesh_scale=camera["mesh_scale"],
-            grid_resolution=GRID_HR,
-        )
-    )
-    tile_ids, tile_weights, assignment_uv = pipeline.assign_texture_tiles(
-        projected_norm * float(CANONICAL_IMAGE_SIZE),
-        boxes,
-        canonical_size=CANONICAL_IMAGE_SIZE,
-        max_memberships=4,
-    )
     tile_experts = _bind_tile_experts_to_master(
         tile_experts=tile_experts,
-        master_coords64=coords64_master,
-        master_tile_ids=tile_ids,
-        master_tile_weights=tile_weights,
+        master_coords128=master_coords128,
+        camera=camera,
     )
     if not tile_experts:
-        raise RuntimeError("no prepared tile has positive tent-weighted master rows")
-    expert_by_id = {expert.tile_id: expert for expert in tile_experts}
-    for record in tile_metadata:
-        expert = expert_by_id.get(int(record["tile_id"]))
-        if expert is None:
-            if record.get("status") == "prepared":
-                record["status"] = "skipped_no_positive_tent_rows"
-            continue
-        record["status"] = "complete"
-        record["master_rows"] = int(expert.master_rows.numel())
-        record["active_tent_rows"] = int(expert.active_master_rows.numel())
-    print(
-        f"[tile-prepare] usable_experts={len(tile_experts)} processed_tiles={processed}"
-    )
+        raise RuntimeError("all prepared tiles became inactive after master binding")
 
-    shape_hr_model = pipeline.models["shape_slat_flow_model_1024"]
-    global_shape_noise = SparseTensor(
-        feats=_randn(
-            coords64_master.shape[0],
-            int(shape_hr_model.in_channels),
-            device=pipeline.device,
-            seed=int(args.seed) + 202,
-        ),
-        coords=coords64_master,
-    )
     cond_global_shape = pipeline.get_proj_cond_shape(
         pipeline.image_cond_model_shape_1024,
         [image_1024],
-        coords64_master,
-        camera_angle_x=camera["camera_angle_x"],
-        distance=camera["distance"],
-        mesh_scale=camera["mesh_scale"],
-        grid_resolution_override=GRID_HR,
+        master_coords128,
+        camera_angle_x=float(camera["camera_angle_x"]),
+        distance=float(camera["distance"]),
+        mesh_scale=float(camera["mesh_scale"]),
+        grid_resolution_override=GRID_MASTER,
     )
-    shape_online = _run_online_fused_flow(
+    shape_model = pipeline.models["shape_slat_flow_model_1024"]
+    shape_noise = SparseTensor(
+        feats=_randn(
+            master_coords128.shape[0],
+            int(shape_model.in_channels),
+            device=pipeline.device,
+            seed=int(args.seed) + 202,
+        ),
+        coords=master_coords128,
+    )
+    shape_online = _run_online_master_flow(
         pipeline=pipeline,
         sampler=pipeline.shape_slat_sampler,
-        flow_model=shape_hr_model,
-        global_state=global_shape_noise,
+        flow_model=shape_model,
+        master_state=shape_noise,
         global_condition=cond_global_shape,
         tile_experts=tile_experts,
         sampler_params=sampler_params["shape"],
         replace_last_n=int(args.shape_replace_last_n),
+        replace_alpha=float(args.replace_alpha),
         stage="shape",
+        save_step_states=bool(args.save_step_states),
     )
-    fused_shape_norm = shape_online.samples
-    fused_shape_denorm = _denormalize_sparse(
-        fused_shape_norm, pipeline.shape_slat_normalization
-    )
+    shape_norm = shape_online.samples
+    shape_denorm = _denormalize_sparse(shape_norm, pipeline.shape_slat_normalization)
+    del cond_global_shape, shape_noise
+    _empty_cuda_cache()
 
-    texture_model = pipeline.models["tex_slat_flow_model_1024"]
-    texture_channels = int(texture_model.in_channels) - int(
-        fused_shape_norm.feats.shape[1]
+    cond_global_texture = pipeline.get_proj_cond_shape(
+        pipeline.image_cond_model_tex_1024,
+        [image_1024],
+        master_coords128,
+        camera_angle_x=float(camera["camera_angle_x"]),
+        distance=float(camera["distance"]),
+        mesh_scale=float(camera["mesh_scale"]),
+        grid_resolution_override=GRID_MASTER,
     )
+    texture_model = pipeline.models["tex_slat_flow_model_1024"]
+    texture_channels = int(texture_model.in_channels) - int(shape_norm.feats.shape[1])
     if texture_channels <= 0:
-        raise RuntimeError(f"invalid texture noise channels: {texture_channels}")
-    global_texture_noise = SparseTensor(
+        raise RuntimeError(f"invalid texture noise channel count {texture_channels}")
+    texture_noise = SparseTensor(
         feats=_randn(
-            coords64_master.shape[0],
+            master_coords128.shape[0],
             texture_channels,
             device=pipeline.device,
             seed=int(args.seed) + 303,
         ),
-        coords=coords64_master,
+        coords=master_coords128,
     )
-    cond_global_texture = pipeline.get_proj_cond_shape(
-        pipeline.image_cond_model_tex_1024,
-        [image_1024],
-        coords64_master,
-        camera_angle_x=camera["camera_angle_x"],
-        distance=camera["distance"],
-        mesh_scale=camera["mesh_scale"],
-        grid_resolution_override=GRID_HR,
-    )
-    texture_online = _run_online_fused_flow(
+    texture_online = _run_online_master_flow(
         pipeline=pipeline,
         sampler=pipeline.tex_slat_sampler,
         flow_model=texture_model,
-        global_state=global_texture_noise,
+        master_state=texture_noise,
         global_condition=cond_global_texture,
         tile_experts=tile_experts,
         sampler_params=sampler_params["texture"],
         replace_last_n=int(args.texture_replace_last_n),
+        replace_alpha=float(args.replace_alpha),
         stage="texture",
-        global_concat_cond=fused_shape_norm,
+        global_concat_cond=shape_norm,
+        save_step_states=bool(args.save_step_states),
     )
-    fused_texture_norm = texture_online.samples
-    fused_texture_denorm = _denormalize_sparse(
-        fused_texture_norm, pipeline.tex_slat_normalization
+    texture_norm = texture_online.samples
+    texture_denorm = _denormalize_sparse(texture_norm, pipeline.tex_slat_normalization)
+
+    trace_path = trace_dir / "joint_master128_trace.pt"
+    _save_global_trace(
+        path=trace_path,
+        camera=camera,
+        base_coords128=base_coords128,
+        master_coords128=master_coords128,
+        global_lr_flow=global_lr_flow,
+        tile_experts=tile_experts,
+        shape_flow=shape_online,
+        texture_flow=texture_online,
+        shape_final_norm=shape_norm,
+        texture_final_norm=texture_norm,
+        sampler_params=sampler_params,
+        master_stats=master_stats,
     )
-
-    global_trace_path = trace_dir / "global_joint_trace.pt"
-    temporary_trace = global_trace_path.with_suffix(".pt.tmp")
-    torch.save({
-        "format": "pixal3d_joint_tile_master_union_fusion_v3",
-        "image": str(Path(args.image).expanduser().resolve()),
-        "camera": camera,
-        "canonical_metadata": canonical["metadata"],
-        "sampler_params": sampler_params,
-        "coordinate_policy": {
-            "grid": 64,
-            "base_support_tokens": int(coords64_base.shape[0]),
-            "master_support_tokens": int(coords64_master.shape[0]),
-            "tile_new_points_inserted_before_1024_flow": True,
-            "master_support": "C64_base union all valid C64_local",
-            "tile_input_to_lr": "floor(C64_tile_input / 2), unique",
-            "tile_local_translation": False,
-        },
-        "flow_policy": {
-            "mode": "single_master_state_online_hard_velocity_replacement",
-            "first_steps": "complete-image 1024 condition only",
-            "last_steps": "global plus current-state tile forwards",
-            "tile_private_1024_state": False,
-            "tile_input_state": "current master x_t indexed by tile master rows",
-            "uncovered_fallback": "current global velocity",
-            "overlap_fusion": "normalized 2D tent mean",
-        },
-        "coords32_global": coords32_global.detach().cpu(),
-        "coords64_base": coords64_base.detach().cpu(),
-        "coords64_master": coords64_master.detach().cpu(),
-        "master_stats": master_stats,
-        "projection": {
-            "normalized_xy": projected_norm.detach().cpu(),
-            "assignment_uv_4096": assignment_uv.detach().cpu(),
-            "depth": projected_depth.detach().cpu(),
-            "valid": projection_valid.detach().cpu(),
-            "tile_ids": tile_ids.detach().cpu(),
-            "tile_weights": tile_weights.detach().cpu(),
-            "boxes": [list(box) for box in boxes],
-        },
-        "tiles": tile_metadata,
-        "tile_experts": [
-            {
-                "tile_id": int(expert.tile_id),
-                "local_coords64": expert.local_coords64.detach().cpu(),
-                "master_rows": expert.master_rows.detach().cpu(),
-                "active_local_rows": expert.active_local_rows.detach().cpu(),
-                "active_master_rows": expert.active_master_rows.detach().cpu(),
-                "active_weights": expert.active_weights.detach().cpu(),
-            }
-            for expert in tile_experts
-        ],
-        "global_shape_512": _serialize_trajectory(global_lr_flow),
-        "shape_online": {
-            "times": shape_online.times,
-            "time_intervals": shape_online.time_intervals,
-            "states": shape_online.states,
-            "velocities": shape_online.velocities,
-            "steps": shape_online.step_records,
-            "covered_rows_union": shape_online.covered_rows_union,
-        },
-        "texture_online": {
-            "times": texture_online.times,
-            "time_intervals": texture_online.time_intervals,
-            "states": texture_online.states,
-            "velocities": texture_online.velocities,
-            "steps": texture_online.step_records,
-            "covered_rows_union": texture_online.covered_rows_union,
-        },
-        "fused_shape_normalized": fused_shape_norm.feats.detach().cpu(),
-        "fused_texture_normalized": fused_texture_norm.feats.detach().cpu(),
-        "fused_shape_denormalized": fused_shape_denorm.feats.detach().cpu(),
-        "fused_texture_denormalized": fused_texture_denorm.feats.detach().cpu(),
-    }, temporary_trace)
-    temporary_trace.replace(global_trace_path)
-    print(f"[trace] saved={global_trace_path}")
-
     export_meta: Dict[str, Any] = {}
-    metrics: Optional[Dict[str, Any]] = None
     if not args.no_decode:
         export_meta = _export_glb(
             pipeline=pipeline,
-            shape_slat=fused_shape_denorm,
-            texture_slat=fused_texture_denorm,
+            shape_slat=shape_denorm,
+            texture_slat=texture_denorm,
             output_path=output_path,
             texture_size=int(args.texture_size),
             decimation_target=int(args.decimation_target),
+            postprocess_cache_dir=trace_dir / "postprocess_cache",
+            camera=camera,
+            seed=int(args.seed),
         )
         if args.render_eval:
-            _offload_pipeline_for_render(pipeline)
-            metric_device = torch.device(
-                "cuda" if torch.cuda.is_available() else "cpu"
-            )
-            evaluation_dir = trace_dir / "evaluation" / str(args.light)
-            try:
-                metrics = _render_and_evaluate(
-                    glb_path=output_path,
-                    condition_image=image_1024,
-                    camera=camera,
-                    output_dir=evaluation_dir,
-                    blender=str(args.blender),
+            export_meta.update(
+                _run_aligned_render_eval(
+                    trace_dir=trace_dir,
+                    reference_image=metric_reference_path,
                     light=str(args.light),
                     render_resolution=int(args.render_resolution),
                     metric_resolution=int(args.metric_resolution),
                     blender_samples=int(args.blender_samples),
                     lpips_net=str(args.lpips_net),
-                    metric_device=metric_device,
+                    blender=str(args.blender),
                 )
-            except Exception as exc:
-                metrics = {
-                    "status": "failed",
-                    "error": f"{type(exc).__name__}: {exc}",
-                    "light": str(args.light),
-                    "render_resolution": int(args.render_resolution),
-                    "metric_resolution": int(args.metric_resolution),
-                }
-                atomic_json(evaluation_dir / "metrics.json", metrics)
-                print(f"[evaluation-error] {metrics['error']}")
-                if args.strict_eval:
-                    raise
+            )
     else:
-        print("[Done] --no-decode enabled; master trajectories and fused latents saved")
+        print("[done] --no-decode: fused 2048 latents and trajectories were saved")
 
     summary = {
-        "format": "pixal3d_joint_tile_master_union_summary_v3",
+        "format": "pixal3d_joint_tile_cascade_2048_master128_point_velocity_summary_v1",
         "image": str(Path(args.image).expanduser().resolve()),
         "output": str(output_path),
-        "trace": str(global_trace_path),
+        "trace": str(trace_path),
         "camera": camera,
-        "base_global_tokens": int(coords64_base.shape[0]),
-        "added_tile_tokens": int(master_stats["added_unique_tokens"]),
-        "master_global_tokens": int(coords64_master.shape[0]),
-        "processed_tiles": int(processed),
-        "usable_tile_experts": int(len(tile_experts)),
-        "min_tile_tokens": int(args.min_tile_tokens),
+        "master_stats": master_stats,
+        "processed_tiles": processed,
+        "usable_tile_experts": len(tile_experts),
         "shape_replace_last_n": int(args.shape_replace_last_n),
         "texture_replace_last_n": int(args.texture_replace_last_n),
-        "replacement": "hard normalized tent tile mean; global fallback",
-        "shape_covered_rows": int(shape_online.covered_rows_union),
-        "texture_covered_rows": int(texture_online.covered_rows_union),
-        "tiles": tile_metadata,
+        "replace_alpha": float(args.replace_alpha),
+        "shape_covered_rows": shape_online.covered_rows_union,
+        "texture_covered_rows": texture_online.covered_rows_union,
+        "tile_transforms": [
+            {
+                "tile_id": expert.tile_id,
+                "box": list(expert.box),
+                "local_tokens": int(expert.local_coords64.shape[0]),
+                "active_rows": int(expert.active_local_rows.numel())
+                if expert.active_local_rows is not None
+                else 0,
+                "unique_master_rows": _active_unique_master_count(expert),
+                "transform": asdict(expert.transform),
+                "input_transform_stats": dict(expert.input_transform_stats),
+                "output_transform_stats": dict(expert.output_transform_stats),
+            }
+            for expert in tile_experts
+        ],
         **export_meta,
-        "evaluation": metrics,
     }
-    atomic_json(trace_dir / "summary.json", summary)
+    _atomic_json(trace_dir / "summary.json", summary)
+    print(f"[summary] {trace_dir / 'summary.json'}")
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        description="Pixal3D 2048 master128 + tile-local bidirectional velocity fusion"
+    )
     parser.add_argument("--image", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--trace-dir", required=True)
     parser.add_argument("--model-path", default=MODEL_PATH)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--low-vram", action="store_true")
+    parser.add_argument("--steps", type=int, default=12)
+    parser.add_argument("--max-num-tokens", type=int, default=49152)
+    parser.add_argument("--tile-size", type=int, default=DEFAULT_TILE_SIZE)
+    parser.add_argument("--tile-stride", type=int, default=DEFAULT_TILE_STRIDE)
+    parser.add_argument("--min-tile-tokens", type=int, default=100)
+    parser.add_argument("--tile-ids", default=None, help="comma-separated tile ids")
+    parser.add_argument("--max-tiles", type=int, default=None)
+    parser.add_argument("--strict-tiles", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--tile-scale-multiplier", type=float, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--tile-fit-quantile", type=float, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--tile-fit-margin", type=float, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--shape-replace-last-n", type=int, default=6)
+    parser.add_argument("--texture-replace-last-n", type=int, default=6)
+    parser.add_argument("--replace-alpha", type=float, default=1.0)
+    parser.add_argument("--save-step-states", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--save-tile-lr-traces", action=argparse.BooleanOptionalAction, default=True)
+
     parser.add_argument("--fov", type=float, default=-1.0)
     parser.add_argument("--mesh-scale", type=float, default=1.0)
     parser.add_argument("--extend-pixel", type=int, default=0)
-    parser.add_argument("--camera-image-resolution", type=int, default=512)
+    parser.add_argument("--camera-image-resolution", type=int, default=1024)
 
-    parser.add_argument("--tile-size", type=int, default=1024)
-    parser.add_argument("--tile-stride", type=int, default=512)
-    parser.add_argument("--tile-ids", type=str, default=None)
-    parser.add_argument("--max-tiles", type=int, default=None)
-    parser.add_argument("--min-tile-tokens", type=int, default=100)
-    parser.add_argument("--no-save-full-tile-traces", action="store_true")
-
-    parser.add_argument("--shape-replace-last-n", type=int, default=2)
-    parser.add_argument("--texture-replace-last-n", type=int, default=2)
-    parser.add_argument("--replace-alpha", type=float, default=1.0,
-                        help="Compatibility flag; master-union v3 requires exactly 1.0")
-
-    parser.add_argument("--steps", type=int, default=12)
     parser.add_argument("--ss-guidance-strength", type=float, default=7.5)
-    parser.add_argument("--ss-guidance-rescale", type=float, default=0.7)
-    parser.add_argument("--ss-rescale-t", type=float, default=5.0)
+    parser.add_argument("--ss-guidance-rescale", type=float, default=0.0)
+    parser.add_argument("--ss-rescale-t", type=float, default=1.0)
     parser.add_argument("--shape-guidance-strength", type=float, default=7.5)
-    parser.add_argument("--shape-guidance-rescale", type=float, default=0.5)
-    parser.add_argument("--shape-rescale-t", type=float, default=3.0)
+    parser.add_argument("--shape-guidance-rescale", type=float, default=0.0)
+    parser.add_argument("--shape-rescale-t", type=float, default=1.0)
     parser.add_argument("--texture-guidance-strength", type=float, default=1.0)
     parser.add_argument("--texture-guidance-rescale", type=float, default=0.0)
-    parser.add_argument("--texture-rescale-t", type=float, default=3.0)
+    parser.add_argument("--texture-rescale-t", type=float, default=1.0)
 
-    parser.add_argument("--texture-size", type=int, default=4096)
-    parser.add_argument("--decimation-target", type=int, default=1_000_000)
+    parser.add_argument("--low-vram", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--no-decode", action="store_true")
+    parser.add_argument("--texture-size", type=int, default=4096)
+    parser.add_argument("--decimation-target", type=int, default=0)
 
-    parser.add_argument("--render-eval", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--light", choices=("studio", "three_point", "softbox", "front", "uniform", "dramatic"), default="studio")
+    parser.add_argument("--render-eval", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--light", default="studio")
     parser.add_argument("--render-resolution", type=int, default=2048)
     parser.add_argument("--metric-resolution", type=int, default=1024)
-    parser.add_argument("--blender", default="blender")
     parser.add_argument("--blender-samples", type=int, default=64)
     parser.add_argument("--lpips-net", choices=("alex", "vgg", "squeeze"), default="vgg")
-    parser.add_argument("--strict-eval", action="store_true",
-                        help="Fail the run if Blender rendering or metric computation fails")
+    parser.add_argument("--blender", default="blender")
     return parser
 
 
+def main() -> None:
+    args = build_parser().parse_args()
+    if any(
+        value is not None
+        for value in (args.tile_scale_multiplier, args.tile_fit_quantile, args.tile_fit_margin)
+    ):
+        print(
+            "[deprecated] --tile-scale-multiplier/--tile-fit-quantile/"
+            "--tile-fit-margin are ignored; projective tile recanonicalization "
+            "uses no fitted 3-D cube or depth slab"
+        )
+    run_experiment(args)
+
+
 if __name__ == "__main__":
-    run_experiment(build_parser().parse_args())
+    main()
