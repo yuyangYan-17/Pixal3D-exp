@@ -48,6 +48,9 @@ def get_renderer(sample, **kwargs):
         renderer.rendering_options.far = kwargs.get('far', 100)
         renderer.rendering_options.ssaa = kwargs.get('ssaa', 2)
         renderer.rendering_options.peel_layers = kwargs.get('peel_layers', 8)
+        renderer.rendering_options.face_chunk_size = kwargs.get(
+            'face_chunk_size', 0
+        )
     elif isinstance(sample, Mesh):
         renderer = MeshRenderer()
         renderer.rendering_options.resolution = kwargs.get('resolution', 512)

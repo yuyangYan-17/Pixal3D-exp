@@ -7,6 +7,31 @@ from ..representations.mesh import Mesh, MeshWithVoxel, MeshWithPbrMaterial, Tex
 import torch.nn.functional as F
 
 
+NVDIFFRAST_MAX_SUBTRIANGLES = 1 << 24
+
+
+def _validate_nvdiffrast_face_chunking(
+    face_count: int,
+    face_chunk_size: int,
+) -> None:
+    """Reject a full-mesh call that exceeds CudaRaster's fixed work buffer."""
+    if face_count < 0:
+        raise ValueError("face_count must be non-negative")
+    if face_chunk_size < 0:
+        raise ValueError("face_chunk_size must be non-negative")
+    if face_count < NVDIFFRAST_MAX_SUBTRIANGLES:
+        return
+    if 0 < face_chunk_size < NVDIFFRAST_MAX_SUBTRIANGLES:
+        return
+    raise RuntimeError(
+        "nvdiffrast cannot safely rasterize "
+        f"{face_count:,} faces in one call: its CUDA rasterizer has a fixed "
+        f"{NVDIFFRAST_MAX_SUBTRIANGLES:,}-subtriangle work-buffer limit. "
+        "Set face_chunk_size to a positive value below that limit "
+        "(4,000,000 is recommended for Pixal3D decoder meshes)."
+    )
+
+
 def cube_to_dir(s, x, y):
     if s == 0:   rx, ry, rz = torch.ones_like(x), -x, -y
     elif s == 1: rx, ry, rz = -torch.ones_like(x), x, -y
@@ -225,10 +250,382 @@ class PbrMeshRenderer:
             "far": None,
             "ssaa": 1,
             "peel_layers": 8,
+            "face_chunk_size": 0,
         })
         self.rendering_options.update(rendering_options)
         self.glctx = dr.RasterizeCudaContext(device=device)
         self.device=device
+
+    def _render_mesh_with_voxel_face_chunks(
+        self,
+        mesh: MeshWithVoxel,
+        extrinsics: torch.Tensor,
+        intrinsics: torch.Tensor,
+        envmap: Dict[str, EnvMap],
+        use_envmap_bg: bool,
+        transformation: Optional[torch.Tensor],
+        face_chunk_size: int,
+    ) -> edict:
+        """Rasterize an unchanged mesh in face chunks, then merge global layers.
+
+        Each chunk produces its nearest ``peel_layers`` geometric surfaces.
+        The per-chunk sorted depth sequences are merged pixel-by-pixel into the
+        globally nearest ``peel_layers`` surfaces before any O-Voxel lookup,
+        shading, alpha compositing, or SSAO.  Because a global top-K set can
+        contain at most K faces from any one chunk, retaining K local layers is
+        sufficient for an exact global top-K merge.
+        """
+        if 'dr' not in globals():
+            import nvdiffrast.torch as dr
+        if 'grid_sample_3d' not in globals():
+            from flex_gemm.ops.grid_sample import grid_sample_3d
+
+        resolution = int(self.rendering_options["resolution"])
+        near = float(self.rendering_options["near"])
+        far = float(self.rendering_options["far"])
+        ssaa = int(self.rendering_options["ssaa"])
+        peel_layers = int(self.rendering_options["peel_layers"])
+        render_size = resolution * ssaa
+        num_envmaps = len(envmap)
+
+        rays_o, rays_d = utils3d.torch.get_image_rays(
+            extrinsics, intrinsics, render_size, render_size
+        )
+        perspective = intrinsics_to_projection(intrinsics, near, far)
+        full_proj = (perspective @ extrinsics).unsqueeze(0)
+        extrinsics_batched = extrinsics.unsqueeze(0)
+
+        vertices = mesh.vertices.unsqueeze(0)
+        vertices_orig = vertices
+        vertices_homo = torch.cat(
+            [vertices, torch.ones_like(vertices[..., :1])],
+            dim=-1,
+        )
+        if transformation is not None:
+            vertices_homo = torch.bmm(
+                vertices_homo,
+                transformation.unsqueeze(0).transpose(-1, -2),
+            )
+            vertices = vertices_homo[..., :3].contiguous()
+        vertices_camera = torch.bmm(
+            vertices_homo,
+            extrinsics_batched.transpose(-1, -2),
+        )
+        vertices_clip = torch.bmm(
+            vertices_homo,
+            full_proj.transpose(-1, -2),
+        )
+
+        # Packed per-layer geometry:
+        # camera depth (1), transformed position (3), world normal (3),
+        # original position for O-Voxel lookup (3).
+        packed_channels = 10
+        global_depth = torch.full(
+            (peel_layers, render_size, render_size),
+            float("inf"),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        global_geometry = torch.zeros(
+            (
+                peel_layers,
+                render_size,
+                render_size,
+                packed_channels,
+            ),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        total_faces = int(mesh.faces.shape[0])
+        chunk_count = (total_faces + face_chunk_size - 1) // face_chunk_size
+        print(
+            f"[PbrMeshRenderer] exact face-chunk rasterization: "
+            f"faces={total_faces:,} chunk_size={face_chunk_size:,} "
+            f"chunks={chunk_count} layers={peel_layers} "
+            f"raster={render_size}x{render_size}"
+        )
+
+        for chunk_index, face_start in enumerate(
+            range(0, total_faces, face_chunk_size)
+        ):
+            face_end = min(face_start + face_chunk_size, total_faces)
+            faces = mesh.faces[face_start:face_end].contiguous()
+            v0 = vertices[0, faces[:, 0], :3]
+            v1 = vertices[0, faces[:, 1], :3]
+            v2 = vertices[0, faces[:, 2], :3]
+            face_normal = F.normalize(
+                torch.cross(v1 - v0, v2 - v0, dim=1),
+                dim=1,
+            )
+            normal_faces = torch.arange(
+                face_normal.shape[0],
+                dtype=torch.int32,
+                device=self.device,
+            )[:, None].expand(-1, 3).contiguous()
+
+            chunk_depth_layers = []
+            chunk_geometry_layers = []
+            with dr.DepthPeeler(
+                self.glctx,
+                vertices_clip,
+                faces,
+                (render_size, render_size),
+            ) as peeler:
+                for _ in range(peel_layers):
+                    rast, _ = peeler.rasterize_next_layer()
+                    mask = rast[0, ..., -1:] > 0
+                    raster_depth = torch.where(
+                        mask[..., 0],
+                        rast[0, ..., 2],
+                        torch.full_like(rast[0, ..., 2], float("inf")),
+                    )
+                    pos = dr.interpolate(vertices, rast, faces)[0][0]
+                    pos_orig = dr.interpolate(
+                        vertices_orig,
+                        rast,
+                        faces,
+                    )[0][0]
+                    gb_depth = dr.interpolate(
+                        vertices_camera[..., 2:3].contiguous(),
+                        rast,
+                        faces,
+                    )[0][0]
+                    gb_normal = dr.interpolate(
+                        face_normal.unsqueeze(0),
+                        rast,
+                        normal_faces,
+                    )[0][0]
+                    gb_normal = torch.where(
+                        torch.sum(
+                            gb_normal * (pos - rays_o),
+                            dim=-1,
+                            keepdim=True,
+                        ) > 0,
+                        -gb_normal,
+                        gb_normal,
+                    )
+                    packed = torch.cat(
+                        [gb_depth, pos, gb_normal, pos_orig],
+                        dim=-1,
+                    )
+                    packed = packed * mask.to(packed.dtype)
+                    chunk_depth_layers.append(raster_depth)
+                    chunk_geometry_layers.append(packed)
+                    del rast, mask, pos, pos_orig, gb_depth, gb_normal, packed
+
+            chunk_depth = torch.stack(chunk_depth_layers, dim=0)
+            chunk_geometry = torch.stack(chunk_geometry_layers, dim=0)
+            combined_depth = torch.cat(
+                [global_depth, chunk_depth],
+                dim=0,
+            )
+            combined_geometry = torch.cat(
+                [global_geometry, chunk_geometry],
+                dim=0,
+            )
+            global_depth, selected = torch.topk(
+                combined_depth,
+                k=peel_layers,
+                dim=0,
+                largest=False,
+                sorted=True,
+            )
+            global_geometry = torch.gather(
+                combined_geometry,
+                0,
+                selected[..., None].expand(
+                    -1,
+                    -1,
+                    -1,
+                    packed_channels,
+                ),
+            )
+            print(
+                f"[PbrMeshRenderer] chunk {chunk_index + 1}/{chunk_count}: "
+                f"faces=[{face_start:,},{face_end:,}) merged"
+            )
+            del (
+                faces,
+                v0,
+                v1,
+                v2,
+                face_normal,
+                normal_faces,
+                chunk_depth_layers,
+                chunk_geometry_layers,
+                chunk_depth,
+                chunk_geometry,
+                combined_depth,
+                combined_geometry,
+                selected,
+            )
+
+        out_dict = edict()
+        shaded = torch.zeros(
+            (num_envmaps, render_size, render_size, 3),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        depth = torch.full(
+            (render_size, render_size, 1),
+            1e10,
+            dtype=torch.float32,
+            device=self.device,
+        )
+        normal = torch.zeros(
+            (render_size, render_size, 3),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        max_w = torch.zeros(
+            (render_size, render_size, 1),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        alpha = torch.zeros_like(max_w)
+        rotation = extrinsics_batched[..., :3, :3].reshape(1, 1, 3, 3)
+        ov_coords = torch.cat(
+            [torch.zeros_like(mesh.coords[..., :1]), mesh.coords],
+            dim=-1,
+        )
+
+        for layer_index in range(peel_layers):
+            layer_valid = torch.isfinite(
+                global_depth[layer_index]
+            )[..., None]
+            packed = global_geometry[layer_index]
+            gb_depth = packed[..., 0:1]
+            pos = packed[..., 1:4]
+            gb_normal = packed[..., 4:7]
+            pos_orig = packed[..., 7:10]
+            gb_cam_normal = (
+                rotation @ gb_normal.unsqueeze(-1)
+            ).squeeze(-1)
+
+            xyz = (
+                (pos_orig - mesh.origin) / mesh.voxel_size
+            ).reshape(1, -1, 3)
+            img = grid_sample_3d(
+                mesh.attrs,
+                ov_coords,
+                mesh.voxel_shape,
+                xyz,
+                mode='trilinear',
+            )
+            img = img.reshape(
+                1,
+                render_size,
+                render_size,
+                mesh.attrs.shape[-1],
+            ) * layer_valid.unsqueeze(0).to(img.dtype)
+            gb_basecolor = img[0, ..., mesh.layout['base_color']]
+            gb_metallic = img[0, ..., mesh.layout['metallic']]
+            gb_roughness = img[0, ..., mesh.layout['roughness']]
+            gb_alpha = img[0, ..., mesh.layout['alpha']]
+
+            if layer_index == 0:
+                out_dict.normal = -gb_cam_normal * 0.5 + 0.5
+                out_dict.mask = layer_valid.to(torch.float32)
+                out_dict.base_color = gb_basecolor
+                out_dict.metallic = gb_metallic
+                out_dict.roughness = gb_roughness
+                out_dict.alpha = gb_alpha
+
+            basecolor_linear = torch.clamp(
+                gb_basecolor, 0.0, 1.0
+            ) ** 2.2
+            metallic = torch.clamp(gb_metallic, 0.0, 1.0)
+            roughness = torch.clamp(gb_roughness, 0.0, 1.0)
+            layer_alpha = torch.clamp(gb_alpha, 0.0, 1.0)
+            gb_orm = torch.cat(
+                [
+                    torch.zeros_like(metallic),
+                    roughness,
+                    metallic,
+                ],
+                dim=-1,
+            )
+            gb_shaded = torch.stack(
+                [
+                    value.shade(
+                        pos.unsqueeze(0),
+                        gb_normal.unsqueeze(0),
+                        basecolor_linear.unsqueeze(0),
+                        gb_orm.unsqueeze(0),
+                        rays_o,
+                        specular=True,
+                    )[0]
+                    for value in envmap.values()
+                ],
+                dim=0,
+            )
+            w = (1 - alpha) * layer_alpha
+            depth = torch.where(w > max_w, gb_depth, depth)
+            normal = torch.where(w > max_w, gb_cam_normal, normal)
+            max_w = torch.maximum(max_w, w)
+            shaded += w * gb_shaded
+            alpha += w
+            del (
+                layer_valid,
+                packed,
+                gb_depth,
+                pos,
+                gb_normal,
+                pos_orig,
+                gb_cam_normal,
+                xyz,
+                img,
+                gb_basecolor,
+                gb_metallic,
+                gb_roughness,
+                gb_alpha,
+                basecolor_linear,
+                metallic,
+                roughness,
+                layer_alpha,
+                gb_orm,
+                gb_shaded,
+                w,
+            )
+
+        f_occ = screen_space_ambient_occlusion(
+            depth,
+            normal,
+            perspective,
+            intensity=1.5,
+        )
+        shaded *= (1 - f_occ)
+        out_dict.clay = (1 - f_occ)
+        if use_envmap_bg:
+            bg = torch.stack(
+                [value.sample(rays_d) for value in envmap.values()],
+                dim=0,
+            )
+            shaded += (1 - alpha) * bg
+        for env_name_index, env_name in enumerate(envmap.keys()):
+            shaded_key = (
+                f"shaded_{env_name}" if env_name != '' else "shaded"
+            )
+            out_dict[shaded_key] = shaded[env_name_index]
+
+        for key in out_dict.keys():
+            if ssaa > 1:
+                out_dict[key] = F.interpolate(
+                    out_dict[key].unsqueeze(0).permute(0, 3, 1, 2),
+                    (resolution, resolution),
+                    mode='bilinear',
+                    align_corners=False,
+                    antialias=True,
+                )
+            else:
+                out_dict[key] = out_dict[key].permute(2, 0, 1)
+            out_dict[key] = out_dict[key].squeeze()
+        for env_name in envmap.keys():
+            shaded_key = (
+                f"shaded_{env_name}" if env_name != '' else "shaded"
+            )
+            out_dict[shaded_key] = linear_to_srgb(out_dict[shaded_key])
+        return out_dict
         
     def render(
             self,
@@ -293,6 +690,28 @@ class PbrMeshRenderer:
                 shaded_key = f"shaded_{k}" if k != '' else "shaded"
                 out_dict[shaded_key] = torch.zeros((3, resolution, resolution), dtype=torch.float32, device=self.device)
             return out_dict
+
+        face_chunk_size = int(
+            self.rendering_options.get("face_chunk_size", 0) or 0
+        )
+        _validate_nvdiffrast_face_chunking(
+            face_count=int(mesh.faces.shape[0]),
+            face_chunk_size=face_chunk_size,
+        )
+        if (
+            isinstance(mesh, MeshWithVoxel)
+            and face_chunk_size > 0
+            and mesh.faces.shape[0] > face_chunk_size
+        ):
+            return self._render_mesh_with_voxel_face_chunks(
+                mesh=mesh,
+                extrinsics=extrinsics,
+                intrinsics=intrinsics,
+                envmap=envmap,
+                use_envmap_bg=use_envmap_bg,
+                transformation=transformation,
+                face_chunk_size=face_chunk_size,
+            )
             
         rays_o, rays_d = utils3d.torch.get_image_rays(
             extrinsics, intrinsics, resolution * ssaa, resolution * ssaa

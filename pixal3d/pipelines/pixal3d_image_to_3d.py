@@ -681,6 +681,7 @@ class Pixal3DImageTo3DPipeline(Pipeline):
         resolution: int,
         num_samples: int = 1,
         sampler_params: dict = {},
+        noise: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Sample sparse structures with the given conditioning.
@@ -690,12 +691,26 @@ class Pixal3DImageTo3DPipeline(Pipeline):
             resolution (int): The resolution of the sparse structure.
             num_samples (int): The number of samples to generate.
             sampler_params (dict): Additional parameters for the sampler.
+            noise (torch.Tensor, optional): Explicit dense flow noise. This is
+                used by canonical global/local synchronization so overlapping
+                camera cells can read the same spatial white-noise realization.
         """
         # Sample sparse structure latent
         flow_model = self.models['sparse_structure_flow_model']
         reso = flow_model.resolution
         in_channels = flow_model.in_channels
-        noise = torch.randn(num_samples, in_channels, reso, reso, reso).to(self.device)
+        if noise is None:
+            noise = torch.randn(
+                num_samples, in_channels, reso, reso, reso
+            ).to(self.device)
+        else:
+            expected = (num_samples, in_channels, reso, reso, reso)
+            if tuple(noise.shape) != expected:
+                raise ValueError(
+                    f"explicit sparse-structure noise has shape "
+                    f"{tuple(noise.shape)}, expected {expected}"
+                )
+            noise = noise.to(self.device)
         sampler_params = {**self.sparse_structure_sampler_params, **sampler_params}
         if self.low_vram:
             flow_model.to(self.device)
@@ -1023,6 +1038,7 @@ class Pixal3DImageTo3DPipeline(Pipeline):
         shape_slat: SparseTensor,
         tex_slat: SparseTensor,
         resolution: int,
+        debug_point_cloud_path: Optional[Union[str, Path]] = None,
     ) -> List[MeshWithVoxel]:
         """
         Decode the latent codes.
@@ -1031,13 +1047,16 @@ class Pixal3DImageTo3DPipeline(Pipeline):
             shape_slat (SparseTensor): The structured latent for shape.
             tex_slat (SparseTensor): The structured latent for texture.
             resolution (int): The resolution of the output.
+            debug_point_cloud_path (str or Path, optional): Export the decoded
+                texture voxels as a PLY only when an explicit path is supplied.
         """
         meshes, subs = self.decode_shape_slat(shape_slat, resolution)
         tex_voxels = self.decode_tex_slat(tex_slat, subs)
-        self.export_tex_voxel_point_cloud(
-            tex_voxels[0],
-            out_path="tex_voxel_point_cloud.ply",
-        )
+        if debug_point_cloud_path is not None:
+            self.export_tex_voxel_point_cloud(
+                tex_voxels[0],
+                out_path=str(debug_point_cloud_path),
+            )
         out_mesh = []
         torch.cuda.synchronize()
         for m, v in zip(meshes, tex_voxels):
