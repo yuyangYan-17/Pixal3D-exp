@@ -1,73 +1,48 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Evaluate an ordinary global Pixal3D 1024 baseline and two tile-to-global routes.
+"""Global Pixal3D-1024 baseline and an O-Voxel tile encode/decode test.
 
-Global baseline:
+This script intentionally contains only two routes:
 
-    global SS C32 -> shape512 -> learned C64 -> shape1024 -> texture1024
-    -> global decode -> full-image render and metrics
+1. The ordinary Pixal3D ``1024_cascade`` image-to-3D route.
+2. A reconstruction test driven by the O-Voxels decoded by route 1:
 
-Route A: local SLAT returned to one global decode
+   global O-Voxel index
+   -> global object-space cell center
+   -> global q
+   -> project to a canonical-4096 image tile
+   -> exact centered local-camera q
+   -> local object-space cell center / local O-Voxel index
+   -> shape and PBR VAE encoders
+   -> common C64 latent support
+   -> ordinary Pixal3D shape/PBR decoders
+   -> exact local-to-global camera transform
+   -> comparison with the corresponding part of the original global mesh.
 
-    global shape1024 latent
-    -> decoder learned subdivision to dense global C1024 support
-    -> project global C1024 support to the canonical 4096 image
-    -> select C1024 source rows inside each overlapping 1024 tile
-    -> exact global-camera / crop / centered-tile-camera recanonicalization
-    -> quantize only after the transform, directly to unique local C64
-    -> tile shape1024 flow and tile texture1024 flow
-    -> gather each local SLAT feature back to its source global C1024 rows
-    -> quantize those source rows to global C64 only at return time
-    -> keep one candidate per global C64 token by closest tile center
-    -> assemble global shape/texture SLAT and decode once globally
+The camera mapping follows ``GLOBAL_MOGE_TO_LOCAL_TILE_CAMERA.md``.  No point
+cloud centering, bounding-box normalization, clipping, or affine shortcut is
+used.  A tile is reconstructed only when more than 1000 decoded global
+O-Voxel centers project into it (the default threshold is therefore 1001).
 
-Route B: full local decode returned to global object space
-
-    use the same complete local C64 shape/texture SLAT from every successful tile
-    -> decode the complete local latent without deleting losing/edge tokens first
-    -> convert decoder object coordinates to local q
-    -> invert the tile camera mapping to global q and global object coordinates
-    -> assign triangles by nearest-tile-center ownership regions
-    -> retain an O-Voxel ownership halo, requantize on a global 1024^3 lattice
-    -> weld geometry, resolve O-Voxel conflicts by closest tile center
-    -> render the merged MeshWithVoxel with the global camera
-
-The important ordering follows the working projected-global tile experiment:
-C1024 is transformed continuously into the tile camera before the only local C64
-quantization. The code never uses C1024 -> global C64 -> local C64 as tile input.
-
-The tile route does not run tile sparse-structure sampling, tile shape512 flow,
-tile-native learned C64 upsampling, or projected/native support fusion. Points
-outside the centered local canonical cube are dropped rather than clipped.
-
-Decoded outputs remain native MeshWithVoxel objects and are rendered with
-Pixal3D's official render_utils.render_frames / PbrMeshRenderer path. No UVs,
-GLB, atlas, Blender process, or Cycles shader reconstruction are involved.
-
-Place this script in the Pixal3D repository root beside inference.py and
-render_pixal3d_raw_ovoxel.py.
+The shape encoder cannot infer geometry from PBR O-Voxel attributes alone.
+Consequently it encodes the part of the original global mesh owned by the
+same tile, while the PBR encoder encodes the transformed O-Voxels.  Their
+encoded C64 supports are intersected and put in the same deterministic order
+before the normal joint decoder is called.
 """
 
 from __future__ import annotations
 
 import argparse
-import copy
-import csv
 import gc
 import json
 import math
 import os
+import tempfile
 import time
-import warnings
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
-
-import numpy as np
-import torch
-import torch.nn.functional as F
-from PIL import Image, ImageDraw
 
 os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
@@ -78,30 +53,41 @@ os.environ.setdefault(
 )
 os.environ.setdefault("FLEX_GEMM_AUTOTUNER_VERBOSE", "1")
 
-from inference import (  # noqa: E402
+import numpy as np
+import o_voxel
+import torch
+import torch.nn.functional as F
+from PIL import Image, ImageDraw
+
+import pixal3d.models as pixal3d_models
+from inference import (
     MODEL_PATH,
     distance_from_fov,
     get_camera_params_wild_moge,
     init_pipeline,
     load_moge_model,
 )
-from pixal3d.modules.sparse import SparseTensor  # noqa: E402
-from render_pixal3d_raw_ovoxel import (  # noqa: E402
+from pixal3d.modules.sparse import SparseTensor
+from pixal3d.representations import MeshWithVoxel
+from render_pixal3d_raw_ovoxel import (
+    image_to_tensor,
     load_envmap,
+    psnr_metric,
     render_and_evaluate_mesh,
+    ssim_metric,
 )
 
 
-GRID_SS = 32
-GRID_SHAPE_1024 = 64
-GRID_GLOBAL_UPSAMPLED = 1024
-IMAGE_LR = 512
-GLOBAL_CAMERA_IMAGE_SIZE = 1024
-IMAGE_CANONICAL = 4096
-IMAGE_FLOW = 1024
-DECODE_TILE = 1024
-DEFAULT_TILE_SIZE = 1024
-DEFAULT_TILE_STRIDE = 512
+GLOBAL_IMAGE_SIZE = 1024
+CANONICAL_IMAGE_SIZE = 4096
+TILE_SIZE = 1024
+TILE_STRIDE = 512
+OVOXEL_RESOLUTION = 1024
+LATENT_RESOLUTION = 64
+DEFAULT_ENCODER_ROOT = Path(
+    "/home/nvme04/yyyan/download/model/TRELLIS.2-4B/"
+    "microsoft/TRELLIS___2-4B/ckpts"
+)
 
 
 @dataclass(frozen=True)
@@ -110,97 +96,37 @@ class TileCameraTransform:
     box: Tuple[int, int, int, int]
     output_width: int
     output_height: int
-
-    # Centered camera consumed by Pixal3D and used to render transformed local geometry.
     camera_angle_x: float
     camera_angle_y: float
     distance: float
     mesh_scale: float
     global_distance: float
     global_mesh_scale: float
-    local_recanonicalization_scale: float
-    fx: float
-    fy: float
-    cx: float
-    cy: float
-
-    # Exact off-axis crop camera for rendering untransformed global geometry.
-    offaxis_cx: float
-    offaxis_cy: float
-    offaxis_shift_x: float
-    offaxis_shift_y: float
-
-    # Resolution/crop bookkeeping.
     global_fx_1024: float
     global_fy_1024: float
     full_fx_4096: float
     full_fy_4096: float
-    global_to_full_scale_x: float
-    global_to_full_scale_y: float
+    full_cx_4096: float
+    full_cy_4096: float
     crop_to_output_scale_x: float
     crop_to_output_scale_y: float
+    fx: float
+    fy: float
+    cx: float
+    cy: float
+    offaxis_cx: float
+    offaxis_cy: float
     tile_center_full_x: float
     tile_center_full_y: float
 
 
 @dataclass
-class ShapeResult:
-    shape_norm: SparseTensor
-    shape_denorm: SparseTensor
-    shape512_seconds: float
-    shape1024_seconds: float
-
-
-@dataclass
-class GlobalBaselineResult:
-    shape_norm: SparseTensor
-    shape_denorm: SparseTensor
-    texture_norm: SparseTensor
-    texture_denorm: SparseTensor
-    global_c32_tokens: int
-    global_c64_tokens: int
-    shape512_seconds: float
-    shape1024_seconds: float
-    texture1024_seconds: float
-
-
-@dataclass
-class ModelResult:
-    shape_norm: SparseTensor
-    shape_denorm: SparseTensor
-    texture_norm: SparseTensor
-    texture_denorm: SparseTensor
-    tile_projective_c32_tokens: int
-    tile_ss_c32_tokens: int
-    tile_c32_overlap_tokens: int
-    tile_c32_tokens: int
-    tile_projective_c64_tokens: int
-    tile_native_c64_tokens: int
-    tile_c64_overlap_tokens: int
-    tile_c64_tokens: int
-    tile_ss_seconds: float
-    shape512_seconds: float
-    shape1024_seconds: float
-    texture1024_seconds: float
-
-
-@dataclass
-class TileSupportMapping:
-    local_coords64: torch.Tensor
-    source_global_coords1024: torch.Tensor
-    source_global_coords64: torch.Tensor
-    source_to_local_index: torch.Tensor
-    tile_center_distance_pixels: torch.Tensor
+class LocalOVoxelMapping:
+    local_coords: torch.Tensor
+    local_attrs: torch.Tensor
+    source_global_rows: torch.Tensor
+    local_q: torch.Tensor
     stats: Dict[str, Any]
-
-
-@dataclass
-class TileLocalDecodePayload:
-    tile_id: int
-    transform: TileCameraTransform
-    local_coords64: torch.Tensor
-    local_shape_denorm_feats: torch.Tensor
-    local_texture_denorm_feats: torch.Tensor
 
 
 def _empty_cuda_cache() -> None:
@@ -221,59 +147,130 @@ def _seed_everything(seed: int) -> None:
         torch.cuda.manual_seed_all(int(seed))
 
 
-def _randn(
-    rows: int,
-    channels: int,
-    *,
-    device: torch.device,
-    seed: int,
-    dtype: torch.dtype = torch.float32,
-) -> torch.Tensor:
-    if rows <= 0 or channels <= 0:
-        raise ValueError(f"invalid random tensor shape ({rows}, {channels})")
-    generator = torch.Generator(device=device)
-    generator.manual_seed(int(seed))
-    return torch.randn(
-        rows,
-        channels,
-        generator=generator,
-        device=device,
-        dtype=dtype,
-    )
+def _atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        delete=False,
+    ) as handle:
+        json.dump(payload, handle, indent=2, ensure_ascii=False, allow_nan=True)
+        handle.write("\n")
+        temporary = Path(handle.name)
+    os.replace(temporary, path)
 
 
-def _normalization(
-    values: Mapping[str, Sequence[float]],
-    device: torch.device,
-    dtype: torch.dtype,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    std = torch.as_tensor(values["std"], device=device, dtype=dtype)[None]
-    mean = torch.as_tensor(values["mean"], device=device, dtype=dtype)[None]
-    return std, mean
+def _tensor_range(value: torch.Tensor) -> Dict[str, List[float]]:
+    if value.numel() == 0:
+        return {"min": [], "max": []}
+    return {
+        "min": [float(v) for v in value.amin(dim=0).detach().cpu().tolist()],
+        "max": [float(v) for v in value.amax(dim=0).detach().cpu().tolist()],
+    }
 
 
-def _denormalize_sparse(
-    value: SparseTensor,
-    normalization: Mapping[str, Sequence[float]],
-) -> SparseTensor:
-    std, mean = _normalization(normalization, value.device, value.dtype)
-    return value.replace(value.feats * std + mean)
+def _tile_layout(
+    canonical_size: int = CANONICAL_IMAGE_SIZE,
+    tile_size: int = TILE_SIZE,
+    stride: int = TILE_STRIDE,
+) -> List[Tuple[int, int, int, int]]:
+    if canonical_size <= 0 or tile_size <= 0 or stride <= 0:
+        raise ValueError("canonical size, tile size, and stride must be positive")
+    starts = list(range(0, canonical_size - tile_size + 1, stride))
+    if not starts or starts[-1] != canonical_size - tile_size:
+        raise ValueError("tile layout does not land exactly on the canonical edge")
+    return [
+        (x0, y0, x0 + tile_size, y0 + tile_size)
+        for y0 in starts
+        for x0 in starts
+    ]
 
 
-def _endpoint_indices_to_q(indices: torch.Tensor, resolution: int) -> torch.Tensor:
-    if resolution <= 1:
-        raise ValueError("resolution must exceed one")
-    return indices.to(torch.float32) * (2.0 / float(resolution - 1)) - 1.0
-
-
-def _q_to_endpoint_indices(q: torch.Tensor, resolution: int) -> torch.Tensor:
-    if resolution <= 1:
-        raise ValueError("resolution must exceed one")
-    return torch.round((q + 1.0) * (float(resolution - 1) / 2.0)).to(torch.int32)
+def _parse_tile_ids(value: Optional[str]) -> Optional[set[int]]:
+    if value is None or not value.strip():
+        return None
+    return {int(item.strip()) for item in value.split(",") if item.strip()}
 
 
 def _focal_pixels(camera_angle: float, resolution: int) -> float:
     return float(resolution) / (2.0 * math.tan(float(camera_angle) / 2.0))
+
+
+def _derive_tile_camera(
+    *,
+    tile_id: int,
+    box: Sequence[int],
+    global_camera: Mapping[str, float],
+    extend_pixel: int,
+) -> TileCameraTransform:
+    x0, y0, x1, y1 = (int(v) for v in box)
+    crop_width = x1 - x0
+    crop_height = y1 - y0
+    if crop_width <= 0 or crop_height <= 0:
+        raise ValueError("tile crop has non-positive dimensions")
+
+    rx = TILE_SIZE / float(crop_width)
+    ry = TILE_SIZE / float(crop_height)
+    global_fx = _focal_pixels(
+        float(global_camera["camera_angle_x"]), GLOBAL_IMAGE_SIZE
+    )
+    global_fy = global_fx
+    full_fx = global_fx * CANONICAL_IMAGE_SIZE / GLOBAL_IMAGE_SIZE
+    full_fy = global_fy * CANONICAL_IMAGE_SIZE / GLOBAL_IMAGE_SIZE
+    full_cx = CANONICAL_IMAGE_SIZE / 2.0
+    full_cy = CANONICAL_IMAGE_SIZE / 2.0
+
+    local_fx = full_fx * rx
+    local_fy = full_fy * ry
+    local_cx = TILE_SIZE / 2.0
+    local_cy = TILE_SIZE / 2.0
+    angle_x = 2.0 * math.atan(TILE_SIZE / (2.0 * local_fx))
+    angle_y = 2.0 * math.atan(TILE_SIZE / (2.0 * local_fy))
+    mesh_scale = float(global_camera["mesh_scale"])
+    distance = distance_from_fov(
+        angle_x,
+        torch.tensor([-1.0, 0.0, 0.0]),
+        torch.tensor(
+            [
+                0.0 - float(extend_pixel),
+                TILE_SIZE - 1.0 + float(extend_pixel),
+            ]
+        ),
+        mesh_scale,
+        TILE_SIZE,
+    )["distance_from_x"]
+
+    return TileCameraTransform(
+        tile_id=int(tile_id),
+        box=(x0, y0, x1, y1),
+        output_width=TILE_SIZE,
+        output_height=TILE_SIZE,
+        camera_angle_x=float(angle_x),
+        camera_angle_y=float(angle_y),
+        distance=float(distance),
+        mesh_scale=mesh_scale,
+        global_distance=float(global_camera["distance"]),
+        global_mesh_scale=mesh_scale,
+        global_fx_1024=float(global_fx),
+        global_fy_1024=float(global_fy),
+        full_fx_4096=float(full_fx),
+        full_fy_4096=float(full_fy),
+        full_cx_4096=float(full_cx),
+        full_cy_4096=float(full_cy),
+        crop_to_output_scale_x=float(rx),
+        crop_to_output_scale_y=float(ry),
+        fx=float(local_fx),
+        fy=float(local_fy),
+        cx=float(local_cx),
+        cy=float(local_cy),
+        offaxis_cx=float((full_cx - x0) * rx),
+        offaxis_cy=float((full_cy - y0) * ry),
+        tile_center_full_x=float(x0 + local_cx / rx),
+        tile_center_full_y=float(y0 + local_cy / ry),
+    )
 
 
 def _camera_q_to_points(
@@ -282,12 +279,7 @@ def _camera_q_to_points(
     distance: float,
     mesh_scale: float,
 ) -> torch.Tensor:
-    """Pixal3D q coordinates -> camera-space points; camera looks along -Z."""
-    center = torch.tensor(
-        [0.0, 0.0, -float(distance)],
-        device=q.device,
-        dtype=q.dtype,
-    )
+    center = q.new_tensor([0.0, 0.0, -float(distance)])
     return center[None] + q / (2.0 * float(mesh_scale))
 
 
@@ -297,861 +289,1348 @@ def _camera_points_to_q(
     distance: float,
     mesh_scale: float,
 ) -> torch.Tensor:
-    center = torch.tensor(
-        [0.0, 0.0, -float(distance)],
-        device=points.device,
-        dtype=points.dtype,
-    )
+    center = points.new_tensor([0.0, 0.0, -float(distance)])
     return (points - center[None]) * (2.0 * float(mesh_scale))
 
 
-def _project_points_with_intrinsics(
-    camera_points: torch.Tensor,
+def _project_points(
+    points: torch.Tensor,
     *,
     fx: float,
     fy: float,
     cx: float,
     cy: float,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    points = camera_points
-    if points.ndim == 2:
-        points = points.unsqueeze(0)
-    if points.ndim != 3 or points.shape[-1] != 3:
-        raise ValueError("camera_points must be [K,3] or [B,K,3]")
-
-    depth = -points[..., 2]
-    denom = depth.clamp_min(1e-8)
-    u = float(fx) * points[..., 0] / denom + float(cx)
-    v = -float(fy) * points[..., 1] / denom + float(cy)
-    uv = torch.stack([u, v], dim=-1)
-    finite = (depth > 0) & torch.isfinite(uv).all(dim=-1)
+    depth = -points[:, 2]
+    finite = torch.isfinite(points).all(dim=1) & torch.isfinite(depth) & (depth > 0)
+    safe_depth = torch.where(finite, depth, torch.ones_like(depth))
+    u = float(fx) * points[:, 0] / safe_depth + float(cx)
+    v = -float(fy) * points[:, 1] / safe_depth + float(cy)
+    uv = torch.stack((u, v), dim=1)
+    finite &= torch.isfinite(uv).all(dim=1)
     return uv, depth, finite
 
 
-def _backproject_pixels_with_depth(
-    uv: torch.Tensor,
-    depth: torch.Tensor,
-    *,
-    fx: float,
-    fy: float,
-    cx: float,
-    cy: float,
-) -> torch.Tensor:
-    if uv.ndim != 2 or uv.shape[1] != 2:
-        raise ValueError("uv must be [N,2]")
-    if depth.ndim != 1 or depth.shape[0] != uv.shape[0]:
-        raise ValueError("depth must be [N] and match uv")
-    x = (uv[:, 0] - float(cx)) * depth / float(fx)
-    y = -(uv[:, 1] - float(cy)) * depth / float(fy)
-    z = -depth
-    return torch.stack([x, y, z], dim=1)
-
-
-def _tile_layout(
-    canonical_size: int,
-    tile_size: int,
-    tile_stride: int,
-) -> List[Tuple[int, int, int, int]]:
-    starts = list(range(0, canonical_size - tile_size + 1, tile_stride))
-    if not starts or starts[-1] != canonical_size - tile_size:
-        raise ValueError("tile layout does not land on the final image edge")
-    return [
-        (x0, y0, x0 + tile_size, y0 + tile_size)
-        for y0 in starts
-        for x0 in starts
-    ]
-
-
-def _derive_tile_camera(
-    *,
-    tile_id: int,
-    box: Sequence[int],
-    global_camera: Mapping[str, float],
-    global_image_width: int = GLOBAL_CAMERA_IMAGE_SIZE,
-    global_image_height: int = GLOBAL_CAMERA_IMAGE_SIZE,
-    full_width: int = IMAGE_CANONICAL,
-    full_height: int = IMAGE_CANONICAL,
-    output_width: int = IMAGE_FLOW,
-    output_height: int = IMAGE_FLOW,
-    extend_pixel: int = 0,
-    offaxis_shift_y_sign: int = 1,
-) -> TileCameraTransform:
-    """Derive both exact off-axis crop intrinsics and centered local intrinsics.
-
-    The global camera was estimated on the 1024 canonical image. Coordinates are
-    first scaled continuously to the 4096 canonical grid. A 4096 crop is then
-    mapped to the 1024 tile input.
-
-    The centered local camera keeps the crop focal length, puts its principal
-    point at the tile center, and recomputes the Pixal3D distance for a complete
-    local normalized cube. Global/local conversion preserves normalized q_z.
-    """
-    if offaxis_shift_y_sign not in (-1, 1):
-        raise ValueError("offaxis_shift_y_sign must be +1 or -1")
-
-    x0, y0, x1, y1 = (int(v) for v in box)
-    crop_w = x1 - x0
-    crop_h = y1 - y0
-    if crop_w <= 0 or crop_h <= 0:
-        raise ValueError(f"invalid tile box {tuple(box)}")
-
-    global_to_full_x = float(full_width) / float(global_image_width)
-    global_to_full_y = float(full_height) / float(global_image_height)
-    crop_to_output_x = float(output_width) / float(crop_w)
-    crop_to_output_y = float(output_height) / float(crop_h)
-
-    global_fx_1024 = _focal_pixels(
-        float(global_camera["camera_angle_x"]),
-        int(global_image_width),
-    )
-    global_fy_1024 = global_fx_1024
-    full_fx = global_fx_1024 * global_to_full_x
-    full_fy = global_fy_1024 * global_to_full_y
-
-    tile_fx = full_fx * crop_to_output_x
-    tile_fy = full_fy * crop_to_output_y
-    tile_fov_x = 2.0 * math.atan(float(output_width) / (2.0 * tile_fx))
-    tile_fov_y = 2.0 * math.atan(float(output_height) / (2.0 * tile_fy))
-    tile_mesh_scale = float(global_camera["mesh_scale"])
-    tile_distance = distance_from_fov(
-        float(tile_fov_x),
-        torch.tensor([-1.0, 0.0, 0.0]),
-        torch.tensor(
-            [
-                0 - int(extend_pixel),
-                int(output_width) - 1 + int(extend_pixel),
-            ]
-        ),
-        float(tile_mesh_scale),
-        int(output_width),
-    )["distance_from_x"]
-    global_effective_distance = (
-        float(global_camera["distance"])
-        * float(global_camera["mesh_scale"])
-    )
-    tile_effective_distance = float(tile_distance) * float(tile_mesh_scale)
-    if global_effective_distance <= 0.0:
-        raise ValueError("global camera distance * mesh_scale must be positive")
-    local_recanonicalization_scale = (
-        tile_effective_distance / global_effective_distance
-    )
-
-    # Exact off-axis crop principal point for untransformed global geometry.
-    full_cx = float(full_width) / 2.0
-    full_cy = float(full_height) / 2.0
-    offaxis_cx = (full_cx - float(x0)) * crop_to_output_x
-    offaxis_cy = (full_cy - float(y0)) * crop_to_output_y
-    shift_x = (float(output_width) / 2.0 - offaxis_cx) / float(output_width)
-    shift_y = (
-        (offaxis_cy - float(output_height) / 2.0)
-        / float(output_width)
-        * float(offaxis_shift_y_sign)
-    )
-
-    return TileCameraTransform(
-        tile_id=int(tile_id),
-        box=(x0, y0, x1, y1),
-        output_width=int(output_width),
-        output_height=int(output_height),
-        camera_angle_x=float(tile_fov_x),
-        camera_angle_y=float(tile_fov_y),
-        distance=float(tile_distance),
-        mesh_scale=float(tile_mesh_scale),
-        global_distance=float(global_camera["distance"]),
-        global_mesh_scale=float(global_camera["mesh_scale"]),
-        local_recanonicalization_scale=float(local_recanonicalization_scale),
-        fx=float(tile_fx),
-        fy=float(tile_fy),
-        cx=float(output_width) / 2.0,
-        cy=float(output_height) / 2.0,
-        offaxis_cx=float(offaxis_cx),
-        offaxis_cy=float(offaxis_cy),
-        offaxis_shift_x=float(shift_x),
-        offaxis_shift_y=float(shift_y),
-        global_fx_1024=float(global_fx_1024),
-        global_fy_1024=float(global_fy_1024),
-        full_fx_4096=float(full_fx),
-        full_fy_4096=float(full_fy),
-        global_to_full_scale_x=float(global_to_full_x),
-        global_to_full_scale_y=float(global_to_full_y),
-        crop_to_output_scale_x=float(crop_to_output_x),
-        crop_to_output_scale_y=float(crop_to_output_y),
-        tile_center_full_x=(float(x0) + float(x1)) / 2.0,
-        tile_center_full_y=(float(y0) + float(y1)) / 2.0,
-    )
-
-
-def _project_global_q_to_1024_and_4096(
+def _project_global_q_to_4096(
     q_global: torch.Tensor,
     *,
     global_camera: Mapping[str, float],
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     points = _camera_q_to_points(
         q_global,
         distance=float(global_camera["distance"]),
         mesh_scale=float(global_camera["mesh_scale"]),
     )
-    fx = _focal_pixels(
-        float(global_camera["camera_angle_x"]),
-        GLOBAL_CAMERA_IMAGE_SIZE,
-    )
-    uv_1024, depth, finite = _project_points_with_intrinsics(
+    focal = _focal_pixels(
+        float(global_camera["camera_angle_x"]), GLOBAL_IMAGE_SIZE
+    ) * (CANONICAL_IMAGE_SIZE / GLOBAL_IMAGE_SIZE)
+    return _project_points(
         points,
-        fx=fx,
-        fy=fx,
-        cx=GLOBAL_CAMERA_IMAGE_SIZE / 2.0,
-        cy=GLOBAL_CAMERA_IMAGE_SIZE / 2.0,
+        fx=focal,
+        fy=focal,
+        cx=CANONICAL_IMAGE_SIZE / 2.0,
+        cy=CANONICAL_IMAGE_SIZE / 2.0,
     )
-    uv_1024 = uv_1024[0]
-    depth = depth[0]
-    finite = finite[0]
-    scale = torch.tensor(
-        [
-            IMAGE_CANONICAL / GLOBAL_CAMERA_IMAGE_SIZE,
-            IMAGE_CANONICAL / GLOBAL_CAMERA_IMAGE_SIZE,
-        ],
-        device=uv_1024.device,
-        dtype=uv_1024.dtype,
-    )
-    uv_4096 = uv_1024 * scale[None]
-    return points, uv_1024, uv_4096, depth, finite
 
 
-def _rows_inside_tile(
-    uv_full: torch.Tensor,
-    valid: torch.Tensor,
-    box: Sequence[int],
-) -> torch.Tensor:
-    x0, y0, x1, y1 = (float(value) for value in box)
-    mask = (
-        valid
-        & (uv_full[:, 0] >= x0)
-        & (uv_full[:, 0] < x1)
-        & (uv_full[:, 1] >= y0)
-        & (uv_full[:, 1] < y1)
-    )
-    return torch.where(mask)[0]
-
-
-def _global_q_to_centered_tile_q(
+def _global_q_to_local_q(
     q_global: torch.Tensor,
     *,
     global_camera: Mapping[str, float],
     transform: TileCameraTransform,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, Any]]:
-    """Exact project/crop/back-project mapping into the centered tile camera.
-
-    This is deliberately not a point-cloud normalization. The translation in X/Y
-    is depth dependent and is fixed by the tile center ray; the scale is fixed by
-    the focal/FOV ratio.
-    """
-    if q_global.ndim != 2 or q_global.shape[1] != 3:
-        raise ValueError("q_global must be [N,3]")
-
-    global_points, uv_1024, uv_4096, depth, finite = (
-        _project_global_q_to_1024_and_4096(
-            q_global,
-            global_camera=global_camera,
-        )
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    uv_full, _, finite = _project_global_q_to_4096(
+        q_global, global_camera=global_camera
     )
     if not bool(finite.all().item()):
-        raise RuntimeError("selected rows contain invalid global camera projections")
+        raise RuntimeError("global-to-local input contains invalid camera projections")
 
     x0, y0, _, _ = transform.box
-    uv_tile = torch.stack(
-        [
-            (uv_4096[:, 0] - float(x0))
-            * float(transform.crop_to_output_scale_x),
-            (uv_4096[:, 1] - float(y0))
-            * float(transform.crop_to_output_scale_y),
-        ],
-        dim=1,
-    )
+    uv_tile = torch.empty_like(uv_full)
+    uv_tile[:, 0] = (
+        uv_full[:, 0] - float(x0)
+    ) * transform.crop_to_output_scale_x
+    uv_tile[:, 1] = (
+        uv_full[:, 1] - float(y0)
+    ) * transform.crop_to_output_scale_y
 
     qz = q_global[:, 2]
-    local_depth = float(transform.distance) - (
-        qz / (2.0 * float(transform.mesh_scale))
+    local_depth = float(transform.distance) - qz / (
+        2.0 * float(transform.mesh_scale)
     )
-    if bool((local_depth <= 0).any().item()):
-        raise RuntimeError("local recanonicalized depth became non-positive")
-    local_points = _backproject_pixels_with_depth(
-        uv_tile,
-        local_depth,
-        fx=float(transform.fx),
-        fy=float(transform.fy),
-        cx=float(transform.cx),
-        cy=float(transform.cy),
+    x = (uv_tile[:, 0] - float(transform.cx)) * local_depth / float(
+        transform.fx
     )
+    y = -(uv_tile[:, 1] - float(transform.cy)) * local_depth / float(
+        transform.fy
+    )
+    local_points = torch.stack((x, y, -local_depth), dim=1)
     q_local = _camera_points_to_q(
         local_points,
         distance=float(transform.distance),
         mesh_scale=float(transform.mesh_scale),
     )
-
-    # Exact pixel-domain closure test.
-    uv_reproject, depth_reproject, finite_reproject = _project_points_with_intrinsics(
-        local_points,
-        fx=float(transform.fx),
-        fy=float(transform.fy),
-        cx=float(transform.cx),
-        cy=float(transform.cy),
-    )
-    uv_reproject = uv_reproject[0]
-    depth_reproject = depth_reproject[0]
-    finite_reproject = finite_reproject[0]
-    pixel_error = torch.linalg.vector_norm(uv_reproject - uv_tile, dim=1)
-    depth_error = (depth_reproject - local_depth).abs()
-
-    # Closed form: q_z is preserved, while X/Y use the ratio between local
-    # and global ray depths plus the tile-center principal-point offset.
-    full_cx = IMAGE_CANONICAL / 2.0
-    full_cy = IMAGE_CANONICAL / 2.0
-    dx_camera = (
-        (full_cx - float(transform.tile_center_full_x))
-        / float(transform.full_fx_4096)
-    )
-    dy_camera = (
-        (float(transform.tile_center_full_y) - full_cy)
-        / float(transform.full_fy_4096)
-    )
-    global_scale = float(global_camera["mesh_scale"])
-    local_scale = float(transform.mesh_scale)
-    qx_closed = 2.0 * local_scale * local_depth * (
-        q_global[:, 0] / (2.0 * global_scale * depth)
-        + float(dx_camera)
-    )
-    qy_closed = 2.0 * local_scale * local_depth * (
-        q_global[:, 1] / (2.0 * global_scale * depth)
-        + float(dy_camera)
-    )
-    q_closed = torch.stack([qx_closed, qy_closed, qz], dim=1)
-    q_closed_error = (q_closed - q_local).abs()
-    normalized_depth_error = (q_local[:, 2] - qz).abs()
-
-    overflow = (q_local.abs() - 1.0).clamp_min(0.0)
-    outside = (overflow > 0).any(dim=1)
-    stats = {
-        "rows": int(q_local.shape[0]),
-        "raw_outside_rows": int(outside.sum().item()),
-        "raw_outside_fraction": float(outside.float().mean().item()),
-        "raw_max_overflow": float(overflow.max().item()),
-        "q_global_min": [
-            float(v) for v in q_global.amin(dim=0).detach().cpu().tolist()
-        ],
-        "q_global_max": [
-            float(v) for v in q_global.amax(dim=0).detach().cpu().tolist()
-        ],
-        "q_local_min": [
-            float(v) for v in q_local.amin(dim=0).detach().cpu().tolist()
-        ],
-        "q_local_max": [
-            float(v) for v in q_local.amax(dim=0).detach().cpu().tolist()
-        ],
-        "pixel_roundtrip_mean": float(pixel_error.mean().item()),
-        "pixel_roundtrip_max": float(pixel_error.max().item()),
-        "local_depth_roundtrip_max": float(depth_error.max().item()),
-        "normalized_depth_q_error_max": float(
-            normalized_depth_error.max().item()
-        ),
-        "closed_form_q_error_max": float(q_closed_error.max().item()),
-        "tile_center_camera_slope_x": float(dx_camera),
-        "tile_center_camera_slope_y": float(dy_camera),
-        "finite_reprojection_rows": int(finite_reproject.sum().item()),
-        "local_recanonicalization_scale": float(
-            transform.local_recanonicalization_scale
-        ),
-    }
-    return q_local, uv_tile, uv_reproject, stats
+    return q_local, uv_tile
 
 
-def _centered_tile_q_to_global_q(
+def _local_q_to_global_q(
     q_local: torch.Tensor,
     *,
     global_camera: Mapping[str, float],
     transform: TileCameraTransform,
-    validate_roundtrip: bool = True,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, Any]]:
-    """Invert the centered local recanonicalization point by point.
-
-    The local point supplies the tile pixel and preserved normalized q_z.
-    Global physical depth is reconstructed from q_z and the MoGe global
-    camera, then the full-image pixel is back-projected with global K.
-    """
-    if q_local.ndim != 2 or q_local.shape[1] != 3:
-        raise ValueError("q_local must be [N,3]")
+) -> Tuple[torch.Tensor, torch.Tensor]:
     local_points = _camera_q_to_points(
         q_local,
         distance=float(transform.distance),
         mesh_scale=float(transform.mesh_scale),
     )
-    uv_tile, _, finite_local = _project_points_with_intrinsics(
+    uv_tile, _, finite = _project_points(
         local_points,
         fx=float(transform.fx),
         fy=float(transform.fy),
         cx=float(transform.cx),
         cy=float(transform.cy),
     )
-    uv_tile = uv_tile[0]
-    finite_local = finite_local[0]
-    if not bool(finite_local.all().item()):
-        raise RuntimeError("local q contains invalid camera projections")
+    if not bool(finite.all().item()):
+        raise RuntimeError("local-to-global input contains invalid camera projections")
 
     x0, y0, _, _ = transform.box
-    uv_full = torch.stack(
-        [
-            uv_tile[:, 0] / float(transform.crop_to_output_scale_x)
-            + float(x0),
-            uv_tile[:, 1] / float(transform.crop_to_output_scale_y)
-            + float(y0),
-        ],
-        dim=1,
+    uv_full = torch.empty_like(uv_tile)
+    uv_full[:, 0] = (
+        uv_tile[:, 0] / transform.crop_to_output_scale_x + float(x0)
     )
+    uv_full[:, 1] = (
+        uv_tile[:, 1] / transform.crop_to_output_scale_y + float(y0)
+    )
+
     qz = q_local[:, 2]
     global_scale = float(global_camera["mesh_scale"])
-    global_depth = float(global_camera["distance"]) - (
-        qz / (2.0 * global_scale)
+    global_depth = float(global_camera["distance"]) - qz / (2.0 * global_scale)
+    focal = transform.full_fx_4096
+    x = (uv_full[:, 0] - transform.full_cx_4096) * global_depth / focal
+    y = -(uv_full[:, 1] - transform.full_cy_4096) * global_depth / (
+        transform.full_fy_4096
     )
-    if bool((global_depth <= 0).any().item()):
-        raise RuntimeError("inverse global depth became non-positive")
-    global_points = _backproject_pixels_with_depth(
-        uv_full,
-        global_depth,
-        fx=float(transform.full_fx_4096),
-        fy=float(transform.full_fy_4096),
-        cx=IMAGE_CANONICAL / 2.0,
-        cy=IMAGE_CANONICAL / 2.0,
-    )
+    global_points = torch.stack((x, y, -global_depth), dim=1)
     q_global = _camera_points_to_q(
         global_points,
         distance=float(global_camera["distance"]),
         mesh_scale=global_scale,
     )
-
-    stats: Dict[str, Any] = {"rows": int(q_local.shape[0])}
-    if validate_roundtrip:
-        q_local_check, uv_tile_check, _, _ = (
-            _global_q_to_centered_tile_q(
-                q_global,
-                global_camera=global_camera,
-                transform=transform,
-            )
-        )
-        stats.update(
-            {
-                "q_roundtrip_max_abs": float(
-                    (q_local_check - q_local).abs().max().item()
-                ),
-                "pixel_roundtrip_max": float(
-                    torch.linalg.vector_norm(
-                        uv_tile_check - uv_tile,
-                        dim=1,
-                    ).max().item()
-                ),
-                "normalized_depth_q_error_max": float(
-                    (q_global[:, 2] - qz).abs().max().item()
-                ),
-            }
-        )
-    return q_global, global_points, uv_full, stats
+    return q_global, uv_full
 
 
-
-def _quantize_local_q_without_geometry_clip(
-    q_local: torch.Tensor,
-    *,
-    resolution: int,
-    lattice_name: str,
-    epsilon: float,
-) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, Any]]:
-    """Quantize only points already inside the requested local lattice.
-
-    Both hard overflow and epsilon-sized numerical overflow are dropped. No
-    point is clipped or compressed onto a lattice boundary.
-    """
-    if resolution <= 1:
-        raise ValueError("resolution must exceed one")
-    if epsilon < 0:
-        raise ValueError("epsilon must be non-negative")
-    if q_local.ndim != 2 or q_local.shape[1] != 3:
-        raise ValueError("q_local must be [N,3]")
-
-    overflow = (q_local.abs() - 1.0).clamp_min(0.0)
-    strict_inside = (q_local.abs() <= 1.0).all(dim=1)
-    hard_outside = (overflow > float(epsilon)).any(dim=1)
-    numeric_outside = (~strict_inside) & (~hard_outside)
-    kept = strict_inside
-    if not bool(kept.any().item()):
-        raise RuntimeError(
-            f"all projected rows lie outside the local {lattice_name} canonical cube"
-        )
-
-    q_kept = q_local[kept]
-    ids = _q_to_endpoint_indices(q_kept, int(resolution))
-    if bool(((ids < 0) | (ids >= int(resolution))).any().item()):
-        raise RuntimeError(f"{lattice_name} quantization produced out-of-range indices")
-
-    coords_per_source = torch.cat(
-        [
-            torch.zeros(
-                (ids.shape[0], 1),
-                device=ids.device,
-                dtype=torch.int32,
-            ),
-            ids,
-        ],
-        dim=1,
-    )
-    coords_unique = torch.unique(coords_per_source, dim=0)
-    stats = {
-        "lattice_name": str(lattice_name),
-        "lattice_resolution": int(resolution),
-        "input_rows": int(q_local.shape[0]),
-        "hard_outside_rows_dropped": int(hard_outside.sum().item()),
-        "hard_outside_fraction": float(hard_outside.float().mean().item()),
-        "numeric_boundary_rows_dropped": int(numeric_outside.sum().item()),
-        "boundary_epsilon_for_hard_outside_reporting": float(epsilon),
-        "rows_before_unique": int(coords_per_source.shape[0]),
-        "unique_tokens": int(coords_unique.shape[0]),
-        "quantization_merge_rows": int(
-            coords_per_source.shape[0] - coords_unique.shape[0]
-        ),
-    }
-    return coords_unique, kept, stats
-
-def _atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False),
-        encoding="utf-8",
-    )
-    temporary.replace(path)
-
-
-def _write_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
-    rows = list(rows)
-    if not rows:
-        return
-    fields: List[str] = []
-    for row in rows:
-        for key in row:
-            if key not in fields:
-                fields.append(key)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    with temporary.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
-        writer.writeheader()
-        writer.writerows(rows)
-    temporary.replace(path)
-
-
-def _depth_color(values: np.ndarray) -> np.ndarray:
-    values = np.clip(values.astype(np.float32), 0.0, 1.0)
-    r = np.clip(1.5 - np.abs(4.0 * values - 3.0), 0.0, 1.0)
-    g = np.clip(1.5 - np.abs(4.0 * values - 2.0), 0.0, 1.0)
-    b = np.clip(1.5 - np.abs(4.0 * values - 1.0), 0.0, 1.0)
-    return np.stack([r, g, b], axis=1)
-
-
-def _draw_uv_points(
-    image: Image.Image,
+def _inside_tile(
     uv: torch.Tensor,
-    qz: torch.Tensor,
-    output: Path,
-    title: str,
-    max_points: int = 16000,
-) -> None:
-    canvas = image.convert("RGB").copy()
-    draw = ImageDraw.Draw(canvas, "RGBA")
-    uv_cpu = uv.detach().cpu().float().numpy()
-    qz_cpu = qz.detach().cpu().float().numpy()
-    original_count = uv_cpu.shape[0]
-    if original_count > max_points:
-        ids = np.linspace(0, original_count - 1, max_points).round().astype(np.int64)
-        uv_cpu = uv_cpu[ids]
-        qz_cpu = qz_cpu[ids]
-    colors = (_depth_color((qz_cpu + 1.0) * 0.5) * 255.0).astype(np.uint8)
-    for (u, v), color in zip(uv_cpu, colors):
-        if not np.isfinite(u) or not np.isfinite(v):
-            continue
-        x, y = int(round(float(u))), int(round(float(v)))
-        if 0 <= x < canvas.width and 0 <= y < canvas.height:
-            draw.ellipse(
-                (x - 2, y - 2, x + 2, y + 2),
-                fill=tuple(color.tolist()) + (190,),
-            )
-    draw.rectangle((0, 0, canvas.width, 38), fill=(0, 0, 0, 195))
-    draw.text(
-        (8, 9),
-        f"{title} | points={original_count:,}",
-        fill=(255, 255, 255, 255),
-    )
-    output.parent.mkdir(parents=True, exist_ok=True)
-    canvas.save(output)
-
-
-def _save_density_image(
-    uv: torch.Tensor,
-    output: Path,
-    *,
-    resolution: int,
-    bins: int = 128,
-) -> None:
-    array = uv.detach().cpu().float().numpy()
-    array = array[np.isfinite(array).all(axis=1)]
-    hist, _, _ = np.histogram2d(
-        array[:, 1] if len(array) else np.empty(0),
-        array[:, 0] if len(array) else np.empty(0),
-        bins=bins,
-        range=[[0, resolution], [0, resolution]],
-    )
-    hist = np.log1p(hist)
-    if hist.max() > 0:
-        hist /= hist.max()
-    rgb = (
-        _depth_color(hist.reshape(-1)).reshape(bins, bins, 3) * 255.0
-    ).astype(np.uint8)
-    image = Image.fromarray(rgb, mode="RGB").resize(
-        (resolution, resolution),
-        Image.Resampling.NEAREST,
-    )
-    output.parent.mkdir(parents=True, exist_ok=True)
-    image.save(output)
-
-
-def _save_quantization_error_image(
-    reference: Image.Image,
-    uv_source: torch.Tensor,
-    uv_quantized: torch.Tensor,
-    output: Path,
-    max_lines: int = 1000,
-) -> None:
-    canvas = reference.convert("RGB").copy()
-    draw = ImageDraw.Draw(canvas, "RGBA")
-    source = uv_source.detach().cpu().float().numpy()
-    target = uv_quantized.detach().cpu().float().numpy()
-    count = source.shape[0]
-    if count > max_lines:
-        ids = np.linspace(0, count - 1, max_lines).round().astype(np.int64)
-        source = source[ids]
-        target = target[ids]
-    for src, dst in zip(source, target):
-        if not np.isfinite(src).all() or not np.isfinite(dst).all():
-            continue
-        x0, y0 = float(src[0]), float(src[1])
-        x1, y1 = float(dst[0]), float(dst[1])
-        if max(abs(x1 - x0), abs(y1 - y0)) > 0.2:
-            draw.line((x0, y0, x1, y1), fill=(255, 230, 0, 150), width=1)
-        draw.ellipse((x0 - 1, y0 - 1, x0 + 1, y0 + 1), fill=(255, 40, 40, 210))
-        draw.ellipse((x1 - 1, y1 - 1, x1 + 1, y1 + 1), fill=(40, 255, 255, 210))
-    draw.rectangle((0, 0, canvas.width, 38), fill=(0, 0, 0, 200))
-    draw.text(
-        (8, 8),
-        "red=continuous local projection, cyan=quantized tile C64 projection",
-        fill=(255, 255, 255, 255),
-    )
-    output.parent.mkdir(parents=True, exist_ok=True)
-    canvas.save(output)
-
-
-def _composite_on_black(image: Image.Image) -> Image.Image:
-    rgba = image.convert("RGBA")
-    background = Image.new("RGBA", rgba.size, (0, 0, 0, 255))
-    background.alpha_composite(rgba)
-    return background.convert("RGB")
-
-
-def _save_extra_comparisons(
-    reference_path: Path,
-    render_path: Path,
-    output_dir: Path,
-) -> Dict[str, str]:
-    reference = _composite_on_black(Image.open(reference_path))
-    rendered = _composite_on_black(Image.open(render_path))
-    if rendered.size != reference.size:
-        rendered = rendered.resize(reference.size, Image.Resampling.LANCZOS)
-
-    ref = np.asarray(reference, dtype=np.float32)
-    pred = np.asarray(rendered, dtype=np.float32)
-    overlay = Image.blend(reference, rendered, 0.5)
-    diff = np.abs(ref - pred).mean(axis=2) / 255.0
-    heat = (
-        _depth_color(diff.reshape(-1)).reshape(diff.shape[0], diff.shape[1], 3)
-        * 255.0
-    ).astype(np.uint8)
-    diff_image = Image.fromarray(heat, mode="RGB")
-
-    output_dir.mkdir(parents=True, exist_ok=True)
-    overlay_path = output_dir / "overlay_50.png"
-    diff_path = output_dir / "abs_diff_heatmap.png"
-    triptych_path = output_dir / "triptych_reference_render_diff.png"
-    overlay.save(overlay_path)
-    diff_image.save(diff_path)
-
-    w, h = reference.size
-    triptych = Image.new("RGB", (w * 3, h + 34), (18, 18, 18))
-    triptych.paste(reference, (0, 34))
-    triptych.paste(rendered, (w, 34))
-    triptych.paste(diff_image, (w * 2, 34))
-    draw = ImageDraw.Draw(triptych)
-    draw.text((8, 10), "reference", fill=(255, 255, 255))
-    draw.text((w + 8, 10), "render", fill=(255, 255, 255))
-    draw.text((w * 2 + 8, 10), "absolute RGB error", fill=(255, 255, 255))
-    triptych.save(triptych_path)
-    return {
-        "overlay_png": str(overlay_path),
-        "diff_heatmap_png": str(diff_path),
-        "triptych_png": str(triptych_path),
-    }
-
-
-def _image_to_metric_tensor(
-    path: Path,
-    *,
-    resolution: int,
+    finite: torch.Tensor,
+    box: Sequence[int],
 ) -> torch.Tensor:
-    with Image.open(path) as image:
-        rgb = _composite_on_black(image)
-    target = (int(resolution), int(resolution))
-    if rgb.size != target:
-        rgb = rgb.resize(target, Image.Resampling.LANCZOS)
-    array = np.asarray(rgb, dtype=np.float32) / 255.0
-    return torch.from_numpy(array).permute(2, 0, 1).contiguous()
+    x0, y0, x1, y1 = (float(v) for v in box)
+    return (
+        finite
+        & (uv[:, 0] >= x0)
+        & (uv[:, 0] < x1)
+        & (uv[:, 1] >= y0)
+        & (uv[:, 1] < y1)
+    )
 
 
-def _psnr_metric(reference: torch.Tensor, prediction: torch.Tensor) -> float:
-    mse = float(F.mse_loss(prediction, reference).item())
-    return float("inf") if mse <= 0.0 else float(10.0 * math.log10(1.0 / mse))
-
-
-def _gaussian_kernel(
-    window_size: int,
-    sigma: float,
+def _to_vec3(
+    value: Any,
+    *,
     device: torch.device,
     dtype: torch.dtype,
 ) -> torch.Tensor:
-    coordinates = torch.arange(window_size, device=device, dtype=dtype)
-    coordinates = coordinates - (window_size - 1) / 2.0
-    kernel = torch.exp(-(coordinates**2) / (2.0 * sigma**2))
-    kernel = kernel / kernel.sum()
-    return kernel[:, None] * kernel[None, :]
+    tensor = torch.as_tensor(value, device=device, dtype=dtype).reshape(-1)
+    if tensor.numel() == 1:
+        tensor = tensor.repeat(3)
+    if tensor.numel() != 3:
+        raise ValueError(f"expected scalar or length-3 value, got {tensor.tolist()}")
+    return tensor
 
 
-def _ssim_metric(
-    reference: torch.Tensor,
-    prediction: torch.Tensor,
-    window_size: int = 11,
-    sigma: float = 1.5,
-) -> float:
-    x = reference.unsqueeze(0).float()
-    y = prediction.unsqueeze(0).float()
-    channels = int(x.shape[1])
-    kernel = _gaussian_kernel(
-        window_size, sigma, x.device, x.dtype
-    )[None, None].expand(channels, 1, window_size, window_size)
-    padding = window_size // 2
-    mu_x = F.conv2d(x, kernel, padding=padding, groups=channels)
-    mu_y = F.conv2d(y, kernel, padding=padding, groups=channels)
-    mu_x_sq, mu_y_sq, mu_xy = mu_x**2, mu_y**2, mu_x * mu_y
-    sigma_x_sq = (
-        F.conv2d(x * x, kernel, padding=padding, groups=channels) - mu_x_sq
+def _spatial_shape3(value: Any, *, device: torch.device) -> torch.Tensor:
+    shape = torch.as_tensor(value, device=device, dtype=torch.int64).reshape(-1)
+    if shape.numel() == 1:
+        shape = shape.repeat(3)
+    elif shape.numel() >= 3:
+        shape = shape[-3:]
+    else:
+        raise ValueError("voxel shape must contain one or at least three entries")
+    if bool((shape <= 0).any().item()):
+        raise ValueError("voxel shape dimensions must be positive")
+    return shape
+
+
+def _ovoxel_indices_to_object(
+    coords: torch.Tensor,
+    *,
+    origin: Any,
+    voxel_size: Any,
+) -> torch.Tensor:
+    origin3 = _to_vec3(origin, device=coords.device, dtype=torch.float32)
+    size3 = _to_vec3(voxel_size, device=coords.device, dtype=torch.float32)
+    return origin3[None] + (coords.to(torch.float32) + 0.5) * size3[None]
+
+
+def _object_to_nearest_ovoxel_indices(
+    points: torch.Tensor,
+    *,
+    origin: Any,
+    voxel_size: Any,
+    voxel_shape: Any,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    origin3 = _to_vec3(origin, device=points.device, dtype=points.dtype)
+    size3 = _to_vec3(voxel_size, device=points.device, dtype=points.dtype)
+    shape3 = _spatial_shape3(voxel_shape, device=points.device)
+    continuous = (points - origin3[None]) / size3[None] - 0.5
+    coords = torch.round(continuous).to(torch.int64)
+    valid = (
+        torch.isfinite(points).all(dim=1)
+        & ((coords >= 0) & (coords < shape3[None])).all(dim=1)
     )
-    sigma_y_sq = (
-        F.conv2d(y * y, kernel, padding=padding, groups=channels) - mu_y_sq
-    )
-    sigma_xy = (
-        F.conv2d(x * y, kernel, padding=padding, groups=channels) - mu_xy
-    )
-    c1, c2 = 0.01**2, 0.03**2
-    value = ((2.0 * mu_xy + c1) * (2.0 * sigma_xy + c2)) / (
-        (mu_x_sq + mu_y_sq + c1)
-        * (sigma_x_sq + sigma_y_sq + c2)
-        + 1e-12
-    )
-    return float(value.mean().item())
+    centers = origin3[None] + (coords.to(points.dtype) + 0.5) * size3[None]
+    error = torch.linalg.vector_norm(points - centers, dim=1)
+    return coords.to(torch.int32), valid, error
 
 
-class _LPIPSEvaluator:
-    def __init__(self, network: str, device: torch.device):
-        try:
-            import lpips
-        except ImportError as exc:
-            raise RuntimeError("The lpips package is required: pip install lpips") from exc
-        self.device = device
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            self.model = lpips.LPIPS(net=network).eval().to(device)
+def _linear_keys(coords: torch.Tensor, resolution: int) -> torch.Tensor:
+    xyz = coords.to(torch.int64)
+    return (
+        (xyz[:, 0] * int(resolution) + xyz[:, 1]) * int(resolution)
+        + xyz[:, 2]
+    )
 
-    @torch.inference_mode()
-    def evaluate(
-        self,
-        reference: torch.Tensor,
-        prediction: torch.Tensor,
-    ) -> float:
-        x = reference.unsqueeze(0).to(self.device)
-        y = prediction.unsqueeze(0).to(self.device)
-        return float(
-            self.model(x * 2.0 - 1.0, y * 2.0 - 1.0).mean().item()
+
+def _unique_by_key_then_error(
+    coords: torch.Tensor,
+    error: torch.Tensor,
+) -> torch.Tensor:
+    if coords.shape[0] == 0:
+        return torch.empty(0, device=coords.device, dtype=torch.long)
+    resolution = int(coords.to(torch.int64).amax().item()) + 1
+    keys = _linear_keys(coords, max(resolution, 1))
+    by_error = torch.argsort(error, stable=True)
+    by_key_relative = torch.argsort(keys[by_error], stable=True)
+    order = by_error[by_key_relative]
+    sorted_keys = keys[order]
+    keep = torch.ones(order.shape[0], dtype=torch.bool, device=coords.device)
+    keep[1:] = sorted_keys[1:] != sorted_keys[:-1]
+    return order[keep]
+
+
+def _map_global_ovoxels_to_local(
+    *,
+    global_mesh: MeshWithVoxel,
+    global_q: torch.Tensor,
+    global_uv_4096: torch.Tensor,
+    finite_projection: torch.Tensor,
+    global_camera: Mapping[str, float],
+    transform: TileCameraTransform,
+) -> LocalOVoxelMapping:
+    selected_mask = _inside_tile(
+        global_uv_4096, finite_projection, transform.box
+    )
+    selected_rows = torch.where(selected_mask)[0]
+    if selected_rows.numel() == 0:
+        return LocalOVoxelMapping(
+            local_coords=torch.empty((0, 3), dtype=torch.int32),
+            local_attrs=torch.empty((0, global_mesh.attrs.shape[1])),
+            source_global_rows=torch.empty(0, dtype=torch.long),
+            local_q=torch.empty((0, 3)),
+            stats={"projected_global_ovoxels": 0},
         )
 
+    q_selected = global_q.index_select(0, selected_rows)
+    q_local, uv_tile = _global_q_to_local_q(
+        q_selected,
+        global_camera=global_camera,
+        transform=transform,
+    )
+    local_object = q_local / (2.0 * float(transform.mesh_scale))
+    local_coords, valid_grid, quantization_error = (
+        _object_to_nearest_ovoxel_indices(
+            local_object,
+            origin=[-0.5, -0.5, -0.5],
+            voxel_size=1.0 / OVOXEL_RESOLUTION,
+            voxel_shape=[OVOXEL_RESOLUTION] * 3,
+        )
+    )
+    inside_cube = ((q_local >= -1.0) & (q_local <= 1.0)).all(dim=1)
+    valid = (
+        valid_grid
+        & inside_cube
+        & torch.isfinite(q_local).all(dim=1)
+        & torch.isfinite(quantization_error)
+    )
+    valid_rows = torch.where(valid)[0]
+    coords_valid = local_coords.index_select(0, valid_rows)
+    errors_valid = quantization_error.index_select(0, valid_rows)
+    keep_relative = _unique_by_key_then_error(coords_valid, errors_valid)
+    kept_selected_rows = valid_rows.index_select(0, keep_relative)
+    source_rows = selected_rows.index_select(0, kept_selected_rows)
+    local_coords_unique = local_coords.index_select(0, kept_selected_rows)
+    local_attrs = global_mesh.attrs.index_select(0, source_rows).to(torch.float32)
+    local_q_unique = q_local.index_select(0, kept_selected_rows)
 
-def _prepare_global_baseline_tile_crop(
+    roundtrip, _ = _local_q_to_global_q(
+        local_q_unique,
+        global_camera=global_camera,
+        transform=transform,
+    )
+    roundtrip_error = (
+        roundtrip
+        - global_q.index_select(0, source_rows).to(roundtrip.device)
+    ).abs()
+    stats = {
+        "projected_global_ovoxels": int(selected_rows.numel()),
+        "local_cube_valid_rows": int(valid_rows.numel()),
+        "local_cube_dropped_rows": int(selected_rows.numel() - valid_rows.numel()),
+        "unique_local_ovoxels": int(local_coords_unique.shape[0]),
+        "local_quantization_collisions": int(
+            valid_rows.numel() - local_coords_unique.shape[0]
+        ),
+        "local_quantization_error_object_mean": float(
+            errors_valid.index_select(0, keep_relative).mean().item()
+        ),
+        "local_quantization_error_object_max": float(
+            errors_valid.index_select(0, keep_relative).max().item()
+        ),
+        "global_local_global_q_max_abs_error": float(roundtrip_error.max().item()),
+        "global_local_global_q_mean_abs_error": float(roundtrip_error.mean().item()),
+        "selected_tile_uv_range": _tensor_range(
+            uv_tile.index_select(0, kept_selected_rows)
+        ),
+        "local_q_range": _tensor_range(local_q_unique),
+    }
+    return LocalOVoxelMapping(
+        local_coords=local_coords_unique.to(device="cpu", dtype=torch.int32),
+        local_attrs=local_attrs.to(device="cpu", dtype=torch.float32),
+        source_global_rows=source_rows.to(device="cpu", dtype=torch.long),
+        local_q=local_q_unique.to(device="cpu", dtype=torch.float32),
+        stats=stats,
+    )
+
+
+def _project_face_centers(
+    vertices: torch.Tensor,
+    faces: torch.Tensor,
     *,
-    global_render_path: Path,
-    reference_path: Path,
-    box: Sequence[int],
-    output_dir: Path,
+    mesh_scale: float,
+    global_camera: Mapping[str, float],
+    chunk_size: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if chunk_size <= 0:
+        raise ValueError("face projection chunk size must be positive")
+    uv_chunks: List[torch.Tensor] = []
+    valid_chunks: List[torch.Tensor] = []
+    for start in range(0, int(faces.shape[0]), int(chunk_size)):
+        chunk = faces[start : start + chunk_size].to(torch.long)
+        centers = vertices.index_select(0, chunk.reshape(-1)).reshape(
+            -1, 3, 3
+        ).mean(dim=1)
+        q = centers * (2.0 * float(mesh_scale))
+        uv, _, valid = _project_global_q_to_4096(
+            q, global_camera=global_camera
+        )
+        uv_chunks.append(uv.to(device="cpu", dtype=torch.float32))
+        valid_chunks.append(valid.to(device="cpu"))
+    return torch.cat(uv_chunks, dim=0), torch.cat(valid_chunks, dim=0)
+
+
+def _compact_submesh(
+    vertices: torch.Tensor,
+    faces: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if faces.numel() == 0:
+        raise RuntimeError("cannot compact an empty face set")
+    vertex_ids, inverse = torch.unique(
+        faces.reshape(-1).to(torch.long),
+        sorted=True,
+        return_inverse=True,
+    )
+    compact_vertices = vertices.index_select(0, vertex_ids)
+    compact_faces = inverse.reshape(-1, 3).to(torch.int32)
+    return compact_vertices, compact_faces, vertex_ids
+
+
+def _prepare_tile_geometry(
+    *,
+    global_vertices: torch.Tensor,
+    global_faces: torch.Tensor,
+    global_face_uv: torch.Tensor,
+    global_face_finite: torch.Tensor,
+    global_camera: Mapping[str, float],
+    transform: TileCameraTransform,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, Any]]:
+    face_mask = _inside_tile(
+        global_face_uv, global_face_finite, transform.box
+    )
+    projected_face_ids = torch.where(face_mask)[0]
+    if projected_face_ids.numel() == 0:
+        raise RuntimeError("no global mesh face centroid projects into the tile")
+    projected_faces = global_faces.index_select(0, projected_face_ids).to(torch.long)
+
+    _, face_local0, vertex_ids0 = _compact_submesh(
+        global_vertices, projected_faces
+    )
+    q_global0 = (
+        global_vertices.index_select(0, vertex_ids0)
+        * (2.0 * float(global_camera["mesh_scale"]))
+    )
+    q_local0, _ = _global_q_to_local_q(
+        q_global0,
+        global_camera=global_camera,
+        transform=transform,
+    )
+    vertex_inside = (
+        torch.isfinite(q_local0).all(dim=1)
+        & ((q_local0 >= -1.0) & (q_local0 <= 1.0)).all(dim=1)
+    )
+    face_encodable = vertex_inside.index_select(
+        0, face_local0.to(torch.long).reshape(-1)
+    ).reshape(-1, 3).all(dim=1)
+    encodable_faces = projected_faces.index_select(
+        0, torch.where(face_encodable)[0]
+    )
+    if encodable_faces.numel() == 0:
+        raise RuntimeError(
+            "no projected global faces have all vertices inside the local cube"
+        )
+
+    reference_vertices, reference_faces, final_vertex_ids = _compact_submesh(
+        global_vertices, encodable_faces
+    )
+    q_global = reference_vertices * (
+        2.0 * float(global_camera["mesh_scale"])
+    )
+    q_local, _ = _global_q_to_local_q(
+        q_global,
+        global_camera=global_camera,
+        transform=transform,
+    )
+    local_vertices = q_local / (2.0 * float(transform.mesh_scale))
+
+    triangles = local_vertices.index_select(
+        0, reference_faces.to(torch.long).reshape(-1)
+    ).reshape(-1, 3, 3)
+    twice_area = torch.linalg.vector_norm(
+        torch.linalg.cross(
+            triangles[:, 1] - triangles[:, 0],
+            triangles[:, 2] - triangles[:, 0],
+            dim=1,
+        ),
+        dim=1,
+    )
+    nondegenerate = torch.isfinite(twice_area) & (twice_area > 1e-12)
+    if not bool(nondegenerate.all().item()):
+        surviving = reference_faces.index_select(
+            0, torch.where(nondegenerate)[0]
+        )
+        reference_vertices, reference_faces, relative_ids = _compact_submesh(
+            reference_vertices, surviving
+        )
+        final_vertex_ids = final_vertex_ids.index_select(0, relative_ids)
+        q_global = reference_vertices * (
+            2.0 * float(global_camera["mesh_scale"])
+        )
+        q_local, _ = _global_q_to_local_q(
+            q_global,
+            global_camera=global_camera,
+            transform=transform,
+        )
+        local_vertices = q_local / (2.0 * float(transform.mesh_scale))
+
+    stats = {
+        "projected_global_faces": int(projected_faces.shape[0]),
+        "local_cube_encodable_faces": int(reference_faces.shape[0]),
+        "local_cube_dropped_faces": int(
+            projected_faces.shape[0] - reference_faces.shape[0]
+        ),
+        "reference_vertices": int(reference_vertices.shape[0]),
+        "local_vertex_range": _tensor_range(local_vertices),
+        "source_global_vertex_ids": int(final_vertex_ids.shape[0]),
+    }
+    return (
+        local_vertices.to(device="cpu", dtype=torch.float32),
+        reference_faces.to(device="cpu", dtype=torch.int64),
+        reference_vertices.to(device="cpu", dtype=torch.float32),
+        reference_faces.to(device="cpu", dtype=torch.int32),
+        stats,
+    )
+
+
+def _encode_local_shape(
+    *,
+    encoder: torch.nn.Module,
+    vertices: torch.Tensor,
+    faces: torch.Tensor,
+    device: torch.device,
+    low_vram: bool,
+) -> Tuple[SparseTensor, Dict[str, Any]]:
+    started = time.perf_counter()
+    voxel_indices, dual_vertices, intersected = (
+        o_voxel.convert.mesh_to_flexible_dual_grid(
+            vertices=vertices.to(device="cpu", dtype=torch.float32),
+            faces=faces.to(device="cpu", dtype=torch.long),
+            grid_size=OVOXEL_RESOLUTION,
+            aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
+            face_weight=1.0,
+            boundary_weight=0.2,
+            regularization_weight=1e-2,
+            timing=True,
+        )
+    )
+    if voxel_indices.shape[0] == 0:
+        raise RuntimeError("local mesh produced an empty flexible dual grid")
+    dual_features = (
+        dual_vertices.to(torch.float32) * OVOXEL_RESOLUTION
+        - voxel_indices.to(torch.float32)
+    )
+    coords = torch.cat(
+        [
+            torch.zeros_like(voxel_indices[:, :1]),
+            voxel_indices,
+        ],
+        dim=1,
+    ).to(torch.int32)
+    vertex_sparse = SparseTensor(dual_features, coords).to(device)
+    intersected_sparse = vertex_sparse.replace(intersected).to(device)
+    if low_vram:
+        encoder.to(device)
+    with torch.no_grad():
+        latent = encoder(
+            vertex_sparse,
+            intersected_sparse,
+            sample_posterior=False,
+        )
+    _sync_cuda()
+    if low_vram:
+        encoder.cpu()
+    if not torch.isfinite(latent.feats).all():
+        raise RuntimeError("shape encoder produced non-finite latent features")
+    stats = {
+        "dual_grid_entries": int(voxel_indices.shape[0]),
+        "shape_latent_tokens_before_alignment": int(latent.feats.shape[0]),
+        "shape_encoder_seconds": float(time.perf_counter() - started),
+    }
+    del vertex_sparse, intersected_sparse, dual_vertices, intersected
+    _empty_cuda_cache()
+    return latent, stats
+
+
+def _encode_local_pbr(
+    *,
+    encoder: torch.nn.Module,
+    coords: torch.Tensor,
+    attrs: torch.Tensor,
+    device: torch.device,
+    low_vram: bool,
+) -> Tuple[SparseTensor, Dict[str, Any]]:
+    started = time.perf_counter()
+    coords4 = torch.cat(
+        [torch.zeros_like(coords[:, :1]), coords], dim=1
+    ).to(device=device, dtype=torch.int32)
+    # The released PBR encoder was trained on attributes in [-1, 1].
+    feats = (attrs.to(device=device, dtype=torch.float32) * 2.0 - 1.0).clamp(
+        -1.0, 1.0
+    )
+    sparse = SparseTensor(feats, coords4)
+    if low_vram:
+        encoder.to(device)
+    with torch.no_grad():
+        latent = encoder(sparse, sample_posterior=False)
+    _sync_cuda()
+    if low_vram:
+        encoder.cpu()
+    if not torch.isfinite(latent.feats).all():
+        raise RuntimeError("PBR encoder produced non-finite latent features")
+    stats = {
+        "pbr_encoder_input_ovoxels": int(coords.shape[0]),
+        "pbr_latent_tokens_before_alignment": int(latent.feats.shape[0]),
+        "pbr_encoder_seconds": float(time.perf_counter() - started),
+    }
+    del sparse, feats
+    _empty_cuda_cache()
+    return latent, stats
+
+
+def _align_latent_supports(
+    shape_latent: SparseTensor,
+    pbr_latent: SparseTensor,
+) -> Tuple[SparseTensor, SparseTensor, Dict[str, Any]]:
+    shape_coords = shape_latent.coords.to(torch.int64)
+    pbr_coords = pbr_latent.coords.to(torch.int64)
+    if shape_coords.shape[1] != 4 or pbr_coords.shape[1] != 4:
+        raise ValueError("encoded latent coordinates must have shape [N,4]")
+    if bool((shape_coords[:, 0] != 0).any().item()) or bool(
+        (pbr_coords[:, 0] != 0).any().item()
+    ):
+        raise ValueError("only batch zero is supported")
+
+    shape_keys = _linear_keys(shape_coords[:, 1:], LATENT_RESOLUTION)
+    pbr_keys = _linear_keys(pbr_coords[:, 1:], LATENT_RESOLUTION)
+    shape_order = torch.argsort(shape_keys)
+    pbr_order = torch.argsort(pbr_keys)
+    shape_sorted = shape_keys[shape_order]
+    pbr_sorted = pbr_keys[pbr_order]
+    positions = torch.searchsorted(pbr_sorted, shape_sorted)
+    in_bounds = positions < pbr_sorted.shape[0]
+    safe_positions = positions.clamp_max(max(0, pbr_sorted.shape[0] - 1))
+    common = in_bounds & (
+        pbr_sorted.index_select(0, safe_positions) == shape_sorted
+    )
+    shape_rows = shape_order.index_select(0, torch.where(common)[0])
+    pbr_rows = pbr_order.index_select(
+        0, positions.index_select(0, torch.where(common)[0])
+    )
+    if shape_rows.numel() == 0:
+        raise RuntimeError("shape and PBR encoders have no common C64 support")
+
+    aligned_coords = shape_coords.index_select(0, shape_rows).to(torch.int32)
+    aligned_shape = SparseTensor(
+        shape_latent.feats.index_select(0, shape_rows),
+        aligned_coords,
+    )
+    aligned_pbr = SparseTensor(
+        pbr_latent.feats.index_select(0, pbr_rows),
+        aligned_coords,
+    )
+    if not torch.equal(aligned_shape.coords, aligned_pbr.coords):
+        raise RuntimeError("aligned shape/PBR latent coordinates differ")
+    stats = {
+        "shape_latent_tokens_before_alignment": int(shape_coords.shape[0]),
+        "pbr_latent_tokens_before_alignment": int(pbr_coords.shape[0]),
+        "common_latent_tokens": int(aligned_coords.shape[0]),
+        "shape_only_tokens_dropped": int(
+            shape_coords.shape[0] - aligned_coords.shape[0]
+        ),
+        "pbr_only_tokens_dropped": int(
+            pbr_coords.shape[0] - aligned_coords.shape[0]
+        ),
+        "latent_resolution": LATENT_RESOLUTION,
+        "alignment": "exact C64 coordinate intersection; common sorted order",
+    }
+    return aligned_shape, aligned_pbr, stats
+
+
+def _validate_mesh(mesh: Any, label: str) -> MeshWithVoxel:
+    if not isinstance(mesh, MeshWithVoxel):
+        raise TypeError(f"{label}: expected MeshWithVoxel, got {type(mesh)!r}")
+    if mesh.vertices.ndim != 2 or mesh.vertices.shape[1] != 3:
+        raise ValueError(f"{label}: vertices must have shape [N,3]")
+    if mesh.faces.ndim != 2 or mesh.faces.shape[1] != 3:
+        raise ValueError(f"{label}: faces must have shape [M,3]")
+    if mesh.coords.ndim != 2 or mesh.coords.shape[1] != 3:
+        raise ValueError(f"{label}: O-Voxel coords must have shape [L,3]")
+    if mesh.attrs.ndim != 2 or mesh.attrs.shape[0] != mesh.coords.shape[0]:
+        raise ValueError(f"{label}: O-Voxel attrs and coords are not aligned")
+    if mesh.vertices.shape[0] == 0 or mesh.faces.shape[0] == 0:
+        raise RuntimeError(f"{label}: decoded mesh is empty")
+    if not torch.isfinite(mesh.vertices).all() or not torch.isfinite(
+        mesh.attrs
+    ).all():
+        raise RuntimeError(f"{label}: mesh contains non-finite tensors")
+    return mesh
+
+
+def _make_mesh_with_voxel(
+    *,
+    vertices: torch.Tensor,
+    faces: torch.Tensor,
+    coords: torch.Tensor,
+    attrs: torch.Tensor,
+    template: MeshWithVoxel,
+) -> MeshWithVoxel:
+    return MeshWithVoxel(
+        vertices=vertices.to(torch.float32),
+        faces=faces.to(torch.int32),
+        origin=torch.as_tensor(template.origin).detach().cpu().tolist(),
+        voxel_size=float(torch.as_tensor(template.voxel_size).item()),
+        coords=coords.to(torch.int32),
+        attrs=attrs.to(torch.float32),
+        voxel_shape=torch.Size(template.voxel_shape),
+        layout=dict(template.layout),
+    )
+
+
+def _make_reference_tile_mesh(
+    *,
+    vertices: torch.Tensor,
+    faces: torch.Tensor,
+    mapping: LocalOVoxelMapping,
+    global_mesh: MeshWithVoxel,
+) -> MeshWithVoxel:
+    source_rows = mapping.source_global_rows.to(torch.long)
+    coords = global_mesh.coords.index_select(0, source_rows)
+    attrs = global_mesh.attrs.index_select(0, source_rows)
+    return _make_mesh_with_voxel(
+        vertices=vertices,
+        faces=faces,
+        coords=coords,
+        attrs=attrs,
+        template=global_mesh,
+    )
+
+
+def _return_decoded_mesh_to_global(
+    *,
+    local_mesh: MeshWithVoxel,
+    global_template: MeshWithVoxel,
+    global_camera: Mapping[str, float],
+    transform: TileCameraTransform,
+    face_chunk_size: int,
+) -> Tuple[MeshWithVoxel, Dict[str, Any]]:
+    local_vertices = local_mesh.vertices.to(torch.float32)
+    q_local_vertices = local_vertices * (2.0 * float(transform.mesh_scale))
+    q_global_vertices, _ = _local_q_to_global_q(
+        q_local_vertices,
+        global_camera=global_camera,
+        transform=transform,
+    )
+    global_vertices = q_global_vertices / (
+        2.0 * float(global_camera["mesh_scale"])
+    )
+
+    uv_faces, valid_faces = _project_face_centers(
+        global_vertices,
+        local_mesh.faces,
+        mesh_scale=float(global_camera["mesh_scale"]),
+        global_camera=global_camera,
+        chunk_size=face_chunk_size,
+    )
+    owned_face_mask = _inside_tile(uv_faces, valid_faces, transform.box)
+    owned_faces = local_mesh.faces.to(device="cpu").index_select(
+        0, torch.where(owned_face_mask)[0]
+    )
+    if owned_faces.numel() == 0:
+        raise RuntimeError("returned local decode has no face owned by the tile")
+    compact_vertices, compact_faces, _ = _compact_submesh(
+        global_vertices.to(device="cpu"), owned_faces
+    )
+
+    local_ovoxel_object = _ovoxel_indices_to_object(
+        local_mesh.coords,
+        origin=local_mesh.origin,
+        voxel_size=local_mesh.voxel_size,
+    )
+    q_local_ovoxel = local_ovoxel_object * (
+        2.0 * float(transform.mesh_scale)
+    )
+    q_global_ovoxel, uv_global_ovoxel = _local_q_to_global_q(
+        q_local_ovoxel,
+        global_camera=global_camera,
+        transform=transform,
+    )
+    global_ovoxel_object = q_global_ovoxel / (
+        2.0 * float(global_camera["mesh_scale"])
+    )
+    global_coords, valid_grid, quant_error = _object_to_nearest_ovoxel_indices(
+        global_ovoxel_object,
+        origin=global_template.origin,
+        voxel_size=global_template.voxel_size,
+        voxel_shape=global_template.voxel_shape,
+    )
+    finite_projection = torch.isfinite(uv_global_ovoxel).all(dim=1)
+    owned_voxel = valid_grid & _inside_tile(
+        uv_global_ovoxel, finite_projection, transform.box
+    )
+    owned_rows = torch.where(owned_voxel)[0]
+    if owned_rows.numel() == 0:
+        raise RuntimeError("returned local decode has no global O-Voxel in the tile")
+    coords_owned = global_coords.index_select(0, owned_rows)
+    error_owned = quant_error.index_select(0, owned_rows)
+    keep_relative = _unique_by_key_then_error(coords_owned, error_owned)
+    kept_rows = owned_rows.index_select(0, keep_relative)
+    coords_unique = global_coords.index_select(0, kept_rows)
+    attrs_unique = local_mesh.attrs.index_select(0, kept_rows)
+
+    returned = _make_mesh_with_voxel(
+        vertices=compact_vertices,
+        faces=compact_faces,
+        coords=coords_unique.to(device="cpu"),
+        attrs=attrs_unique.to(device="cpu"),
+        template=global_template,
+    )
+    stats = {
+        "local_decoder_vertices": int(local_mesh.vertices.shape[0]),
+        "local_decoder_faces": int(local_mesh.faces.shape[0]),
+        "local_decoder_ovoxels": int(local_mesh.coords.shape[0]),
+        "returned_global_vertices": int(returned.vertices.shape[0]),
+        "returned_global_faces": int(returned.faces.shape[0]),
+        "returned_global_ovoxels": int(returned.coords.shape[0]),
+        "faces_outside_tile_dropped": int(
+            local_mesh.faces.shape[0] - returned.faces.shape[0]
+        ),
+        "returned_ovoxel_quantization_collisions": int(
+            owned_rows.numel() - coords_unique.shape[0]
+        ),
+        "returned_ovoxel_quantization_error_object_mean": float(
+            error_owned.index_select(0, keep_relative).mean().item()
+        ),
+        "returned_ovoxel_quantization_error_object_max": float(
+            error_owned.index_select(0, keep_relative).max().item()
+        ),
+        "returned_global_vertex_range": _tensor_range(returned.vertices),
+    }
+    return returned, stats
+
+
+def _sample_mesh_surface(
+    vertices: torch.Tensor,
+    faces: torch.Tensor,
+    *,
+    samples: int,
+    seed: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if samples <= 0:
+        raise ValueError("surface sample count must be positive")
+    triangles = vertices.index_select(
+        0, faces.to(torch.long).reshape(-1)
+    ).reshape(-1, 3, 3)
+    cross = torch.linalg.cross(
+        triangles[:, 1] - triangles[:, 0],
+        triangles[:, 2] - triangles[:, 0],
+        dim=1,
+    )
+    twice_area = torch.linalg.vector_norm(cross, dim=1)
+    valid = torch.isfinite(twice_area) & (twice_area > 1e-14)
+    triangles = triangles[valid]
+    cross = cross[valid]
+    twice_area = twice_area[valid]
+    if triangles.shape[0] == 0:
+        raise RuntimeError("mesh has no non-degenerate triangle for sampling")
+    generator = torch.Generator(device=vertices.device)
+    generator.manual_seed(int(seed))
+    # torch.multinomial rejects more than 2^24 categories.  A low-step smoke
+    # generation can legitimately produce that many decoded triangles, so
+    # sample the same area distribution through its CDF without that limit.
+    area_cdf = torch.cumsum(twice_area.to(torch.float32), dim=0)
+    total_area = area_cdf[-1]
+    if not torch.isfinite(total_area) or float(total_area.item()) <= 0.0:
+        raise RuntimeError("mesh has invalid total surface area")
+    draws = torch.rand(
+        samples,
+        device=vertices.device,
+        generator=generator,
+        dtype=area_cdf.dtype,
+    ) * total_area
+    face_rows = torch.searchsorted(area_cdf, draws, right=False).clamp_max(
+        triangles.shape[0] - 1
+    )
+    selected = triangles.index_select(0, face_rows)
+    u = torch.rand(
+        (samples, 1), device=vertices.device, generator=generator
+    )
+    v = torch.rand(
+        (samples, 1), device=vertices.device, generator=generator
+    )
+    sqrt_u = torch.sqrt(u)
+    bary0 = 1.0 - sqrt_u
+    bary1 = sqrt_u * (1.0 - v)
+    bary2 = sqrt_u * v
+    points = (
+        bary0 * selected[:, 0]
+        + bary1 * selected[:, 1]
+        + bary2 * selected[:, 2]
+    )
+    normals = F.normalize(cross.index_select(0, face_rows), dim=1)
+    return points, normals
+
+
+def _nearest_distances(
+    source: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    chunk_size: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if chunk_size <= 0:
+        raise ValueError("nearest-neighbor chunk size must be positive")
+    distances: List[torch.Tensor] = []
+    indices: List[torch.Tensor] = []
+    for start in range(0, int(source.shape[0]), int(chunk_size)):
+        matrix = torch.cdist(
+            source[start : start + chunk_size].to(torch.float32),
+            target.to(torch.float32),
+        )
+        values, rows = matrix.min(dim=1)
+        distances.append(values)
+        indices.append(rows)
+        del matrix
+    return torch.cat(distances), torch.cat(indices)
+
+
+def _mesh_surface_similarity(
+    reference: MeshWithVoxel,
+    prediction: MeshWithVoxel,
+    *,
+    samples: int,
+    chunk_size: int,
+    seed: int,
+    device: torch.device,
 ) -> Dict[str, Any]:
-    with Image.open(global_render_path) as image:
-        global_render = _composite_on_black(image)
-
-    x0, y0, x1, y1 = (int(value) for value in box)
-    scale_x = float(global_render.width) / float(IMAGE_CANONICAL)
-    scale_y = float(global_render.height) / float(IMAGE_CANONICAL)
-    crop_box = (
-        int(round(x0 * scale_x)),
-        int(round(y0 * scale_y)),
-        int(round(x1 * scale_x)),
-        int(round(y1 * scale_y)),
+    ref_points, ref_normals = _sample_mesh_surface(
+        reference.vertices.to(device),
+        reference.faces.to(device),
+        samples=samples,
+        seed=seed,
     )
-    crop_box = (
-        max(0, min(global_render.width - 1, crop_box[0])),
-        max(0, min(global_render.height - 1, crop_box[1])),
-        max(1, min(global_render.width, crop_box[2])),
-        max(1, min(global_render.height, crop_box[3])),
+    pred_points, pred_normals = _sample_mesh_surface(
+        prediction.vertices.to(device),
+        prediction.faces.to(device),
+        samples=samples,
+        seed=seed + 1,
     )
-    if crop_box[2] <= crop_box[0] or crop_box[3] <= crop_box[1]:
-        raise RuntimeError(f"invalid baseline crop box {crop_box} for {global_render.size}")
-
-    crop = global_render.crop(crop_box).resize(
-        (IMAGE_FLOW, IMAGE_FLOW),
-        Image.Resampling.LANCZOS,
+    ref_to_pred, ref_nn = _nearest_distances(
+        ref_points, pred_points, chunk_size=chunk_size
     )
-    output_dir.mkdir(parents=True, exist_ok=True)
-    crop_path = output_dir / "global_baseline_1024_crop.png"
-    crop.save(crop_path)
-    extras = _save_extra_comparisons(
-        reference_path,
-        crop_path,
-        output_dir / "comparisons",
+    pred_to_ref, pred_nn = _nearest_distances(
+        pred_points, ref_points, chunk_size=chunk_size
     )
-    metadata = {
-        "baseline_render_png": str(crop_path),
-        "baseline_overlay_png": extras["overlay_png"],
-        "baseline_diff_heatmap_png": extras["diff_heatmap_png"],
-        "baseline_triptych_png": extras["triptych_png"],
-        "baseline_source_render_png": str(global_render_path),
-        "baseline_source_size": list(global_render.size),
-        "baseline_crop_box_pixels": list(crop_box),
-        "canonical_tile_box": [x0, y0, x1, y1],
-        "baseline_view_method": (
-            "crop the full global-camera render by the canonical tile box; "
-            "this is ray-equivalent to the corresponding off-axis crop camera"
+    ref_normal_cos = (
+        ref_normals
+        * pred_normals.index_select(0, ref_nn)
+    ).sum(dim=1)
+    pred_normal_cos = (
+        pred_normals
+        * ref_normals.index_select(0, pred_nn)
+    ).sum(dim=1)
+    voxel_size = float(torch.as_tensor(reference.voxel_size).item())
+    metrics: Dict[str, Any] = {
+        "surface_samples_per_mesh": int(samples),
+        "chamfer_l1_object": float(
+            0.5 * (ref_to_pred.mean() + pred_to_ref.mean()).item()
+        ),
+        "chamfer_l2_object": float(
+            0.5
+            * (
+                ref_to_pred.square().mean()
+                + pred_to_ref.square().mean()
+            ).item()
+        ),
+        "reference_to_reconstruction_mean_object": float(
+            ref_to_pred.mean().item()
+        ),
+        "reconstruction_to_reference_mean_object": float(
+            pred_to_ref.mean().item()
+        ),
+        "symmetric_p95_object": float(
+            torch.cat((ref_to_pred, pred_to_ref)).quantile(0.95).item()
+        ),
+        "symmetric_hausdorff_object": float(
+            torch.maximum(ref_to_pred.max(), pred_to_ref.max()).item()
+        ),
+        "normal_cosine_oriented_mean": float(
+            0.5
+            * (ref_normal_cos.mean() + pred_normal_cos.mean()).item()
+        ),
+        "normal_cosine_absolute_mean": float(
+            0.5
+            * (
+                ref_normal_cos.abs().mean()
+                + pred_normal_cos.abs().mean()
+            ).item()
         ),
     }
-    _atomic_json(output_dir / "baseline_crop.json", metadata)
-    return metadata
+    metrics["chamfer_l1_in_global_voxels"] = (
+        metrics["chamfer_l1_object"] / voxel_size
+    )
+    metrics["symmetric_p95_in_global_voxels"] = (
+        metrics["symmetric_p95_object"] / voxel_size
+    )
+    for cells in (1, 2, 4, 8):
+        threshold = cells * voxel_size
+        recall = float((ref_to_pred <= threshold).float().mean().item())
+        precision = float((pred_to_ref <= threshold).float().mean().item())
+        fscore = (
+            0.0
+            if precision + recall == 0.0
+            else 2.0 * precision * recall / (precision + recall)
+        )
+        metrics[f"precision_at_{cells}_global_voxels"] = precision
+        metrics[f"recall_at_{cells}_global_voxels"] = recall
+        metrics[f"fscore_at_{cells}_global_voxels"] = fscore
+    del ref_points, pred_points, ref_normals, pred_normals
+    _empty_cuda_cache()
+    return metrics
+
+
+def _ovoxel_support_similarity(
+    reference_coords: torch.Tensor,
+    prediction_coords: torch.Tensor,
+) -> Dict[str, Any]:
+    ref_keys = torch.unique(
+        _linear_keys(reference_coords.to(torch.int64), OVOXEL_RESOLUTION)
+    )
+    pred_keys = torch.unique(
+        _linear_keys(prediction_coords.to(torch.int64), OVOXEL_RESOLUTION)
+    )
+    ref_sorted = ref_keys.sort().values
+    pred_sorted = pred_keys.sort().values
+    positions = torch.searchsorted(pred_sorted, ref_sorted)
+    valid = positions < pred_sorted.shape[0]
+    safe = positions.clamp_max(max(0, pred_sorted.shape[0] - 1))
+    intersection = int(
+        (valid & (pred_sorted.index_select(0, safe) == ref_sorted)).sum().item()
+    )
+    ref_count = int(ref_sorted.shape[0])
+    pred_count = int(pred_sorted.shape[0])
+    union = ref_count + pred_count - intersection
+    precision = 0.0 if pred_count == 0 else intersection / pred_count
+    recall = 0.0 if ref_count == 0 else intersection / ref_count
+    return {
+        "reference_global_ovoxels": ref_count,
+        "reconstructed_global_ovoxels": pred_count,
+        "global_ovoxel_intersection": intersection,
+        "global_ovoxel_union": union,
+        "global_ovoxel_iou": 0.0 if union == 0 else intersection / union,
+        "global_ovoxel_precision": precision,
+        "global_ovoxel_recall": recall,
+        "global_ovoxel_fscore": (
+            0.0
+            if precision + recall == 0.0
+            else 2.0 * precision * recall / (precision + recall)
+        ),
+    }
+
+
+def _save_projection_overlay(
+    image_4096: Image.Image,
+    uv: torch.Tensor,
+    output_path: Path,
+    title: str,
+) -> None:
+    canvas = image_4096.convert("RGB").copy()
+    draw = ImageDraw.Draw(canvas)
+    points = uv.detach().to(device="cpu", dtype=torch.float32).numpy()
+    for x, y in points:
+        if np.isfinite(x) and np.isfinite(y):
+            draw.ellipse(
+                (float(x) - 2, float(y) - 2, float(x) + 2, float(y) + 2),
+                fill=(0, 255, 255),
+            )
+    draw.rectangle((0, 0, canvas.width, 34), fill=(0, 0, 0))
+    draw.text((8, 9), title, fill=(255, 255, 255))
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    canvas.save(output_path)
+
+
+def _depth_gradient_rgb(
+    depth: np.ndarray,
+) -> Tuple[np.ndarray, float, float]:
+    """Map positive camera depth to a near-warm / far-cool color gradient."""
+    finite = np.isfinite(depth)
+    if not finite.any():
+        raise RuntimeError("depth visualization has no finite values")
+    finite_depth = depth[finite].astype(np.float32, copy=False)
+    depth_near = float(np.quantile(finite_depth, 0.01))
+    depth_far = float(np.quantile(finite_depth, 0.99))
+    if not math.isfinite(depth_near) or not math.isfinite(depth_far):
+        raise RuntimeError("depth visualization range is non-finite")
+    if depth_far <= depth_near:
+        depth_far = depth_near + 1e-6
+    normalized = np.clip(
+        (depth.astype(np.float32, copy=False) - depth_near)
+        / (depth_far - depth_near),
+        0.0,
+        1.0,
+    )
+
+    # near -> far: yellow/red -> green -> cyan -> blue/purple
+    stops = np.asarray(
+        [
+            [255, 240, 40],
+            [255, 70, 30],
+            [60, 210, 80],
+            [35, 210, 230],
+            [50, 90, 255],
+            [155, 60, 220],
+        ],
+        dtype=np.float32,
+    )
+    scaled = normalized * float(stops.shape[0] - 1)
+    left = np.floor(scaled).astype(np.int64)
+    right = np.minimum(left + 1, stops.shape[0] - 1)
+    alpha = (scaled - left.astype(np.float32))[:, None]
+    colors = stops[left] * (1.0 - alpha) + stops[right] * alpha
+    return np.clip(colors, 0, 255).astype(np.uint8), depth_near, depth_far
+
+
+def _rasterize_points(
+    canvas: np.ndarray,
+    *,
+    uv: np.ndarray,
+    colors: np.ndarray,
+    depth: np.ndarray,
+) -> Tuple[int, int]:
+    """Rasterize every record as one pixel; nearer rows win pixel collisions."""
+    height, width = canvas.shape[:2]
+    x = np.rint(uv[:, 0]).astype(np.int64)
+    y = np.rint(uv[:, 1]).astype(np.int64)
+    valid = (
+        np.isfinite(uv).all(axis=1)
+        & np.isfinite(depth)
+        & (x >= 0)
+        & (x < width)
+        & (y >= 0)
+        & (y < height)
+    )
+    x = x[valid]
+    y = y[valid]
+    colors = colors[valid]
+    valid_depth = depth[valid]
+    # Paint far-to-near so the physically nearest O-Voxel remains visible
+    # when several projections round to the same output pixel.
+    order = np.argsort(valid_depth)[::-1]
+    canvas[y[order], x[order]] = colors[order]
+    occupied = np.unique(y * width + x).shape[0]
+    return int(valid.sum()), int(occupied)
+
+
+def _draw_crosses(
+    canvas: np.ndarray,
+    *,
+    uv: np.ndarray,
+    valid: np.ndarray,
+) -> int:
+    """Draw small outlined × marks for projected C64 latent activations."""
+    height, width = canvas.shape[:2]
+    x = np.rint(uv[:, 0]).astype(np.int64)
+    y = np.rint(uv[:, 1]).astype(np.int64)
+    valid = (
+        valid.astype(bool, copy=False)
+        & np.isfinite(uv).all(axis=1)
+        & (x >= 0)
+        & (x < width)
+        & (y >= 0)
+        & (y < height)
+    )
+    x = x[valid]
+    y = y[valid]
+
+    def paint(offsets: Sequence[Tuple[int, int]], color: Sequence[int]) -> None:
+        for dx, dy in offsets:
+            xx = x + int(dx)
+            yy = y + int(dy)
+            inside = (xx >= 0) & (xx < width) & (yy >= 0) & (yy < height)
+            canvas[yy[inside], xx[inside]] = np.asarray(color, dtype=np.uint8)
+
+    # A black 5x5 diagonal outline keeps the marker readable over every
+    # O-Voxel depth color; the inner 3x3 × is white.
+    paint(
+        (
+            (-2, -2),
+            (-1, -1),
+            (0, 0),
+            (1, 1),
+            (2, 2),
+            (-2, 2),
+            (-1, 1),
+            (1, -1),
+            (2, -2),
+        ),
+        (0, 0, 0),
+    )
+    paint(
+        ((-1, -1), (0, 0), (1, 1), (-1, 1), (1, -1)),
+        (255, 255, 255),
+    )
+    return int(valid.sum())
+
+
+def _project_local_latent_to_tile(
+    coords: torch.Tensor,
+    *,
+    transform: TileCameraTransform,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if coords.ndim != 2 or coords.shape[1] != 4:
+        raise ValueError("encoded latent coordinates must have shape [N,4]")
+    if bool((coords[:, 0] != 0).any().item()):
+        raise ValueError("only batch-zero encoded latent visualization is supported")
+    local_object = (
+        coords[:, 1:4].to(torch.float32) + 0.5
+    ) / float(LATENT_RESOLUTION) - 0.5
+    local_q = local_object * (2.0 * float(transform.mesh_scale))
+    local_points = _camera_q_to_points(
+        local_q,
+        distance=float(transform.distance),
+        mesh_scale=float(transform.mesh_scale),
+    )
+    return _project_points(
+        local_points,
+        fx=float(transform.fx),
+        fy=float(transform.fy),
+        cx=float(transform.cx),
+        cy=float(transform.cy),
+    )
+
+
+def _save_selected_ovoxel_visualizations(
+    *,
+    tile_image: Image.Image,
+    ovoxel_uv: torch.Tensor,
+    ovoxel_depth: torch.Tensor,
+    output_dir: Path,
+    tile_id: int,
+    latent_coords: Optional[torch.Tensor] = None,
+    transform: Optional[TileCameraTransform] = None,
+) -> Dict[str, Any]:
+    """Save depth-colored O-Voxel points and an optional encoded-latent overlay."""
+    uv_np = ovoxel_uv.detach().to(device="cpu", dtype=torch.float32).numpy()
+    depth_np = (
+        ovoxel_depth.detach().to(device="cpu", dtype=torch.float32).numpy()
+    )
+    colors, depth_near, depth_far = _depth_gradient_rgb(depth_np)
+    base = np.asarray(tile_image.convert("RGB"), dtype=np.uint8).copy()
+    rasterized_rows, occupied_pixels = _rasterize_points(
+        base,
+        uv=uv_np,
+        colors=colors,
+        depth=depth_np,
+    )
+    selected_path = output_dir / "selected_global_ovoxels.png"
+    selected_projection = Image.fromarray(base)
+    selected_image = Image.new(
+        "RGB",
+        (selected_projection.width, selected_projection.height + 50),
+        (0, 0, 0),
+    )
+    selected_image.paste(selected_projection, (0, 50))
+    selected_draw = ImageDraw.Draw(selected_image)
+    selected_draw.text(
+        (8, 7),
+        (
+            f"tile {tile_id:02d}: global O-Voxel projection "
+            "(one record -> one pixel; near warm, far cool)"
+        ),
+        fill=(255, 255, 255),
+    )
+    selected_draw.text(
+        (8, 27),
+        f"near D={depth_near:.5f}    far D={depth_far:.5f}",
+        fill=(220, 220, 220),
+    )
+    selected_path.parent.mkdir(parents=True, exist_ok=True)
+    selected_image.save(selected_path)
+
+    stats: Dict[str, Any] = {
+        "selected_global_ovoxels_png": str(selected_path),
+        "ovoxel_records": int(ovoxel_uv.shape[0]),
+        "ovoxel_records_rasterized": rasterized_rows,
+        "ovoxel_occupied_pixels": occupied_pixels,
+        "ovoxel_projection_pixel_collisions": int(
+            rasterized_rows - occupied_pixels
+        ),
+        "depth_convention": "positive global camera depth D=-Pz",
+        "depth_near_p01": depth_near,
+        "depth_far_p99": depth_far,
+        "depth_color": "near warm (yellow/red), far cool (blue/purple)",
+    }
+    if latent_coords is None:
+        return stats
+    if transform is None:
+        raise ValueError("transform is required when latent_coords are provided")
+
+    latent_uv, _, latent_valid = _project_local_latent_to_tile(
+        latent_coords,
+        transform=transform,
+    )
+    overlay = base.copy()
+    latent_drawn = _draw_crosses(
+        overlay,
+        uv=latent_uv.detach().to(device="cpu", dtype=torch.float32).numpy(),
+        valid=latent_valid.detach().to(device="cpu").numpy(),
+    )
+    overlay_path = output_dir / "selected_global_ovoxels_with_encoded_latent.png"
+    overlay_projection = Image.fromarray(overlay)
+    overlay_image = Image.new(
+        "RGB",
+        (overlay_projection.width, overlay_projection.height + 50),
+        (0, 0, 0),
+    )
+    overlay_image.paste(overlay_projection, (0, 50))
+    overlay_draw = ImageDraw.Draw(overlay_image)
+    overlay_draw.text(
+        (8, 7),
+        (
+            f"tile {tile_id:02d}: depth-colored O-Voxels + "
+            "common encoded C64 latent"
+        ),
+        fill=(255, 255, 255),
+    )
+    overlay_draw.text(
+        (8, 27),
+        "colored pixel = global O-Voxel    white outlined × = active C64 latent",
+        fill=(220, 220, 220),
+    )
+    overlay_image.save(overlay_path)
+    stats.update(
+        {
+            "selected_global_ovoxels_with_encoded_latent_png": str(
+                overlay_path
+            ),
+            "encoded_common_c64_latent_points": int(latent_coords.shape[0]),
+            "encoded_common_c64_latent_points_projected": latent_drawn,
+            "latent_marker": "small white × with black outline",
+            "latent_projection": (
+                "C64 cell center -> local object -> local q -> centered "
+                "tile-camera projection"
+            ),
+        }
+    )
+    return stats
+
+
+def _tile_crop_render_metrics(
+    *,
+    reference_render: Path,
+    prediction_render: Path,
+    box: Sequence[int],
+    output_dir: Path,
+    metric_resolution: int,
+) -> Dict[str, Any]:
+    with Image.open(reference_render) as image:
+        reference = image.convert("RGB")
+    with Image.open(prediction_render) as image:
+        prediction = image.convert("RGB")
+    if reference.size != prediction.size:
+        prediction = prediction.resize(reference.size, Image.Resampling.LANCZOS)
+    width, height = reference.size
+    x0, y0, x1, y1 = (float(v) for v in box)
+    crop = (
+        int(round(x0 * width / CANONICAL_IMAGE_SIZE)),
+        int(round(y0 * height / CANONICAL_IMAGE_SIZE)),
+        int(round(x1 * width / CANONICAL_IMAGE_SIZE)),
+        int(round(y1 * height / CANONICAL_IMAGE_SIZE)),
+    )
+    reference_crop = reference.crop(crop)
+    prediction_crop = prediction.crop(crop)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    reference_path = output_dir / "reference_tile_render.png"
+    prediction_path = output_dir / "reconstructed_tile_render.png"
+    comparison_path = output_dir / "comparison.png"
+    reference_crop.save(reference_path)
+    prediction_crop.save(prediction_path)
+    comparison = Image.new(
+        "RGB",
+        (reference_crop.width * 2, reference_crop.height),
+        (0, 0, 0),
+    )
+    comparison.paste(reference_crop, (0, 0))
+    comparison.paste(prediction_crop, (reference_crop.width, 0))
+    comparison.save(comparison_path)
+
+    size = (int(metric_resolution), int(metric_resolution))
+    reference_tensor = image_to_tensor(reference_crop, size)
+    prediction_tensor = image_to_tensor(prediction_crop, size)
+    return {
+        "tile_render_psnr_db": psnr_metric(reference_tensor, prediction_tensor),
+        "tile_render_ssim": ssim_metric(reference_tensor, prediction_tensor),
+        "reference_tile_render_png": str(reference_path),
+        "reconstructed_tile_render_png": str(prediction_path),
+        "tile_render_comparison_png": str(comparison_path),
+        "render_crop_pixels": list(crop),
+    }
 
 
 def _estimate_camera(
@@ -1161,627 +1640,95 @@ def _estimate_camera(
     manual_fov: float,
     mesh_scale: float,
     extend_pixel: int,
-    image_resolution: int,
     moge_model_path: Optional[str],
 ) -> Dict[str, float]:
-    if manual_fov > 0:
+    if manual_fov > 0.0:
         distance = distance_from_fov(
             float(manual_fov),
             torch.tensor([-1.0, 0.0, 0.0]),
-            torch.tensor([0 - extend_pixel, image_resolution - 1 + extend_pixel]),
+            torch.tensor(
+                [
+                    0.0 - float(extend_pixel),
+                    GLOBAL_IMAGE_SIZE - 1.0 + float(extend_pixel),
+                ]
+            ),
             float(mesh_scale),
-            int(image_resolution),
+            GLOBAL_IMAGE_SIZE,
         )["distance_from_x"]
         return {
             "camera_angle_x": float(manual_fov),
             "distance": float(distance),
             "mesh_scale": float(mesh_scale),
+            "source": "manual_fov",
         }
 
-    output_dir.mkdir(parents=True, exist_ok=True)
-    temporary = output_dir / f"_projective_tile_moge_{time.time_ns()}.png"
+    temporary = output_dir / f"_moge_input_{time.time_ns()}.png"
     image_1024.save(temporary)
-    load_kwargs: Dict[str, Any] = {"device": "cuda"}
-    if moge_model_path:
-        load_kwargs["model_name"] = str(moge_model_path)
-    model = load_moge_model(**load_kwargs)
     try:
+        if moge_model_path:
+            model = load_moge_model(device="cuda", model_name=moge_model_path)
+        else:
+            model = load_moge_model(device="cuda")
         params = get_camera_params_wild_moge(
             str(temporary),
             model,
             device="cuda",
             mesh_scale=float(mesh_scale),
             extend_pixel=int(extend_pixel),
-            image_resolution=int(image_resolution),
+            image_resolution=GLOBAL_IMAGE_SIZE,
         )
-    finally:
         model.cpu()
         del model
-        temporary.unlink(missing_ok=True)
         _empty_cuda_cache()
+    finally:
+        temporary.unlink(missing_ok=True)
     return {
         "camera_angle_x": float(params["camera_angle_x"]),
         "distance": float(params["distance"]),
         "mesh_scale": float(params["mesh_scale"]),
+        "source": "moge2_global_canonical_1024",
     }
 
 
-def _sampler_params(
-    args: argparse.Namespace,
-    pipeline: Any,
-) -> Dict[str, Dict[str, Any]]:
-    return {
-        "ss": {
-            **pipeline.sparse_structure_sampler_params,
+def _sampler_overrides(args: argparse.Namespace) -> Tuple[Dict[str, Any], ...]:
+    return (
+        {
             "steps": int(args.ss_steps),
             "guidance_strength": float(args.ss_guidance_strength),
             "guidance_rescale": float(args.ss_guidance_rescale),
             "rescale_t": float(args.ss_rescale_t),
         },
-        "shape": {
-            **pipeline.shape_slat_sampler_params,
+        {
             "steps": int(args.shape_steps),
             "guidance_strength": float(args.shape_guidance_strength),
             "guidance_rescale": float(args.shape_guidance_rescale),
             "rescale_t": float(args.shape_rescale_t),
         },
-        "texture": {
-            **pipeline.tex_slat_sampler_params,
+        {
             "steps": int(args.texture_steps),
             "guidance_strength": float(args.texture_guidance_strength),
             "guidance_rescale": float(args.texture_guidance_rescale),
             "rescale_t": float(args.texture_rescale_t),
         },
-    }
+    )
 
 
-def _extract_samples(result: Any, description: str) -> SparseTensor:
-    samples = getattr(result, "samples", result)
-    if not isinstance(samples, SparseTensor):
-        raise TypeError(f"{description}: sampler did not return SparseTensor samples")
-    return samples
-
-
-def _run_sampler_full(
+def _render(
+    mesh: MeshWithVoxel,
     *,
-    pipeline: Any,
-    sampler: Any,
-    model: torch.nn.Module,
-    noise: SparseTensor,
-    condition: Mapping[str, Any],
-    params: Mapping[str, Any],
-    description: str,
-    concat_cond: Optional[SparseTensor] = None,
-) -> Tuple[SparseTensor, float]:
-    if concat_cond is not None and not torch.equal(noise.coords, concat_cond.coords):
-        raise RuntimeError(f"{description}: noise and concat coordinates differ")
-    if pipeline.low_vram:
-        model.to(pipeline.device)
-
-    call: Dict[str, Any] = {
-        **condition,
-        **dict(params),
-        "verbose": True,
-        "tqdm_desc": description,
-        "record_trajectory": False,
-        "return_model_history": False,
-    }
-    if concat_cond is not None:
-        call["concat_cond"] = concat_cond
-
-    started = time.perf_counter()
-    result = sampler.sample(model, noise, **call)
-    _sync_cuda()
-    elapsed = time.perf_counter() - started
-    samples = _extract_samples(result, description)
-    if not torch.equal(samples.coords, noise.coords):
-        raise RuntimeError(f"{description}: sampler changed sparse coordinates")
-
-    if pipeline.low_vram:
-        model.cpu()
-        _empty_cuda_cache()
-    print(
-        f"[flow] {description}: tokens={noise.feats.shape[0]:,} "
-        f"channels={noise.feats.shape[1]} seconds={elapsed:.3f}"
-    )
-    return samples, elapsed
-
-
-def _quantize_shape512_candidates_to_c64(candidates: torch.Tensor) -> torch.Tensor:
-    if candidates.ndim != 2 or candidates.shape[1] != 4:
-        raise ValueError(f"decoder candidates must be [N,4], got {tuple(candidates.shape)}")
-    xyz = torch.round(
-        (candidates[:, 1:].to(torch.float32) + 0.5)
-        / float(IMAGE_LR)
-        * float(GRID_SHAPE_1024 - 1)
-    ).to(torch.int32)
-    quantized = torch.cat([candidates[:, :1].to(torch.int32), xyz], dim=1)
-    valid = (
-        (quantized[:, 1:] >= 0)
-        & (quantized[:, 1:] < GRID_SHAPE_1024)
-    ).all(dim=1)
-    quantized = torch.unique(quantized[valid], dim=0)
-    if quantized.numel() == 0:
-        raise RuntimeError("shape512 learned upsample produced no valid C64 coordinates")
-    return quantized
-
-
-def _learned_upsample_shape512_to_c64(
-    pipeline: Any,
-    shape512_denorm: SparseTensor,
-) -> torch.Tensor:
-    decoder = pipeline.models["shape_slat_decoder"]
-    if pipeline.low_vram:
-        decoder.to(pipeline.device)
-        decoder.low_vram = True
-    try:
-        candidates = decoder.upsample(shape512_denorm, upsample_times=4)
-    finally:
-        if pipeline.low_vram:
-            decoder.cpu()
-            decoder.low_vram = False
-            _empty_cuda_cache()
-    return _quantize_shape512_candidates_to_c64(candidates)
-
-
-def _learned_upsample_shape1024_to_c1024(
-    pipeline: Any,
-    shape1024_denorm: SparseTensor,
-) -> Tuple[torch.Tensor, Dict[str, Any]]:
-    decoder = pipeline.models["shape_slat_decoder"]
-    if pipeline.low_vram:
-        decoder.to(pipeline.device)
-        decoder.low_vram = True
-    try:
-        candidates = decoder.upsample(shape1024_denorm, upsample_times=4)
-    finally:
-        if pipeline.low_vram:
-            decoder.cpu()
-            decoder.low_vram = False
-            _empty_cuda_cache()
-
-    if candidates.ndim != 2 or candidates.shape[1] != 4:
-        raise RuntimeError(
-            "shape_slat_decoder.upsample(..., upsample_times=4) must return "
-            f"[N,4], got {tuple(candidates.shape)}"
-        )
-    if not torch.isfinite(candidates.to(torch.float32)).all():
-        raise RuntimeError("one-step shape1024 upsample returned non-finite coordinates")
-
-    rounded = torch.round(candidates[:, 1:].to(torch.float32))
-    max_fractional_error = float(
-        (candidates[:, 1:].to(torch.float32) - rounded).abs().max().item()
-    )
-    xyz = rounded.to(torch.int32)
-    coords1024_all = torch.cat([candidates[:, :1].to(torch.int32), xyz], dim=1)
-    valid = (
-        (coords1024_all[:, 1:] >= 0)
-        & (coords1024_all[:, 1:] < GRID_GLOBAL_UPSAMPLED)
-    ).all(dim=1)
-    coords1024 = torch.unique(coords1024_all[valid], dim=0)
-    if coords1024.numel() == 0:
-        raise RuntimeError("shape1024 one-step upsample produced no valid C1024 coordinates")
-
-    stats = {
-        "source_c64_tokens": int(shape1024_denorm.coords.shape[0]),
-        "candidate_rows": int(candidates.shape[0]),
-        "valid_candidate_rows": int(valid.sum().item()),
-        "discarded_out_of_range_rows": int((~valid).sum().item()),
-        "unique_c1024_tokens": int(coords1024.shape[0]),
-        "unique_merge_rows": int(valid.sum().item() - coords1024.shape[0]),
-        "max_fractional_coordinate_error": max_fractional_error,
-        "min_xyz": [
-            int(v) for v in coords1024[:, 1:].amin(dim=0).detach().cpu().tolist()
-        ],
-        "max_xyz": [
-            int(v) for v in coords1024[:, 1:].amax(dim=0).detach().cpu().tolist()
-        ],
-    }
-    return coords1024, stats
-
-
-
-def _run_shape512_and_upsample_c64(
-    *,
-    pipeline: Any,
-    image_512: Image.Image,
-    coords32: torch.Tensor,
-    camera: Mapping[str, float],
-    params: Mapping[str, Mapping[str, Any]],
-    seed: int,
-    description: str,
-) -> Tuple[torch.Tensor, float]:
-    condition = pipeline.get_proj_cond_shape(
-        pipeline.image_cond_model_shape_512,
-        [image_512.convert("RGB")],
-        coords32,
-        camera_angle_x=float(camera["camera_angle_x"]),
-        distance=float(camera["distance"]),
-        mesh_scale=float(camera["mesh_scale"]),
-        grid_resolution_override=GRID_SS,
-    )
-    model = pipeline.models["shape_slat_flow_model_512"]
-    noise = SparseTensor(
-        feats=_randn(
-            coords32.shape[0],
-            int(model.in_channels),
-            device=pipeline.device,
-            seed=int(seed),
-        ),
-        coords=coords32,
-    )
-    shape512_norm, elapsed = _run_sampler_full(
-        pipeline=pipeline,
-        sampler=pipeline.shape_slat_sampler,
-        model=model,
-        noise=noise,
-        condition=condition,
-        params=params["shape"],
-        description=description,
-    )
-    shape512_denorm = _denormalize_sparse(
-        shape512_norm,
-        pipeline.shape_slat_normalization,
-    )
-    coords64 = _learned_upsample_shape512_to_c64(pipeline, shape512_denorm)
-    del condition, noise, shape512_norm, shape512_denorm
-    _empty_cuda_cache()
-    return coords64, elapsed
-
-def _run_shape1024(
-    *,
-    pipeline: Any,
-    image_1024: Image.Image,
-    coords64: torch.Tensor,
-    camera: Mapping[str, float],
-    params: Mapping[str, Mapping[str, Any]],
-    seed: int,
-    description: str,
-) -> Tuple[SparseTensor, SparseTensor, float]:
-    condition = pipeline.get_proj_cond_shape(
-        pipeline.image_cond_model_shape_1024,
-        [image_1024],
-        coords64,
-        camera_angle_x=float(camera["camera_angle_x"]),
-        distance=float(camera["distance"]),
-        mesh_scale=float(camera["mesh_scale"]),
-        grid_resolution_override=GRID_SHAPE_1024,
-    )
-    model = pipeline.models["shape_slat_flow_model_1024"]
-    noise = SparseTensor(
-        feats=_randn(
-            coords64.shape[0],
-            int(model.in_channels),
-            device=pipeline.device,
-            seed=int(seed),
-        ),
-        coords=coords64,
-    )
-    shape_norm, elapsed = _run_sampler_full(
-        pipeline=pipeline,
-        sampler=pipeline.shape_slat_sampler,
-        model=model,
-        noise=noise,
-        condition=condition,
-        params=params["shape"],
-        description=description,
-    )
-    shape_denorm = _denormalize_sparse(
-        shape_norm,
-        pipeline.shape_slat_normalization,
-    )
-    del condition, noise
-    _empty_cuda_cache()
-    return shape_norm, shape_denorm, elapsed
-
-
-def _run_texture1024(
-    *,
-    pipeline: Any,
-    image_1024: Image.Image,
-    coords64: torch.Tensor,
-    camera: Mapping[str, float],
-    shape_norm: SparseTensor,
-    params: Mapping[str, Mapping[str, Any]],
-    seed: int,
-    description: str,
-) -> Tuple[SparseTensor, SparseTensor, float]:
-    texture_condition = pipeline.get_proj_cond_shape(
-        pipeline.image_cond_model_tex_1024,
-        [image_1024.convert("RGB")],
-        coords64,
-        camera_angle_x=float(camera["camera_angle_x"]),
-        distance=float(camera["distance"]),
-        mesh_scale=float(camera["mesh_scale"]),
-        grid_resolution_override=GRID_SHAPE_1024,
-    )
-    texture_model = pipeline.models["tex_slat_flow_model_1024"]
-    texture_channels = int(texture_model.in_channels) - int(
-        shape_norm.feats.shape[1]
-    )
-    if texture_channels <= 0:
-        raise RuntimeError(f"invalid texture noise channel count {texture_channels}")
-    texture_noise = SparseTensor(
-        feats=_randn(
-            coords64.shape[0],
-            texture_channels,
-            device=pipeline.device,
-            seed=int(seed),
-        ),
-        coords=coords64,
-    )
-    texture_norm, elapsed = _run_sampler_full(
-        pipeline=pipeline,
-        sampler=pipeline.tex_slat_sampler,
-        model=texture_model,
-        noise=texture_noise,
-        condition=texture_condition,
-        params=params["texture"],
-        description=description,
-        concat_cond=shape_norm,
-    )
-    texture_denorm = _denormalize_sparse(
-        texture_norm,
-        pipeline.tex_slat_normalization,
-    )
-    del texture_condition, texture_noise
-    _empty_cuda_cache()
-    return texture_norm, texture_denorm, elapsed
-
-
-def _run_global_official_geometry_to_shape1024(
-    *,
-    pipeline: Any,
-    image_512: Image.Image,
-    image_1024: Image.Image,
-    camera: Mapping[str, float],
-    params: Mapping[str, Mapping[str, Any]],
-    seed: int,
-    max_tokens: int,
-) -> Tuple[torch.Tensor, torch.Tensor, ShapeResult]:
-    condition_ss = pipeline.get_proj_cond_ss(
-        [image_512],
-        camera_angle_x=float(camera["camera_angle_x"]),
-        distance=float(camera["distance"]),
-        mesh_scale=float(camera["mesh_scale"]),
-    )
-    _seed_everything(seed)
-    coords32 = pipeline.sample_sparse_structure(
-        condition_ss,
-        resolution=GRID_SS,
-        sampler_params=dict(params["ss"]),
-    )
-    del condition_ss
-    if coords32.shape[0] == 0:
-        raise RuntimeError("global sparse structure is empty")
-    print(f"[global] C32 tokens={coords32.shape[0]:,}")
-
-    coords64, shape512_seconds = _run_shape512_and_upsample_c64(
-        pipeline=pipeline,
-        image_512=image_512,
-        coords32=coords32,
-        camera=camera,
-        params=params,
-        seed=seed + 101,
-        description="Global official shape 512",
-    )
-    if coords64.shape[0] > max_tokens:
-        raise RuntimeError(
-            f"global C64 support has {coords64.shape[0]:,} tokens; "
-            f"exceeds --max-num-tokens={max_tokens:,}"
-        )
-    print(f"[global] learned C64 tokens={coords64.shape[0]:,}")
-
-    shape_norm, shape_denorm, shape1024_seconds = _run_shape1024(
-        pipeline=pipeline,
-        image_1024=image_1024,
-        coords64=coords64,
-        camera=camera,
-        params=params,
-        seed=seed + 201,
-        description="Global official shape 1024",
-    )
-    return coords32, coords64, ShapeResult(
-        shape_norm=shape_norm,
-        shape_denorm=shape_denorm,
-        shape512_seconds=shape512_seconds,
-        shape1024_seconds=shape1024_seconds,
-    )
-
-
-
-
-def _run_tile_projected_c64_only(
-    *,
-    pipeline: Any,
-    tile_image: Image.Image,
-    projected_coords64: torch.Tensor,
-    tile_camera: Mapping[str, float],
-    params: Mapping[str, Mapping[str, Any]],
-    seed: int,
-    label: str,
-    max_tokens: int,
-) -> ModelResult:
-    """Run tile shape1024/texture1024 on mapping-aligned local C64 support.
-
-    The coordinate order is preserved exactly because ``source_to_local_index``
-    refers to this order when tile SLAT features are returned to global tokens.
-    """
-    tile_1024 = tile_image.convert("RGB")
-    coords64 = projected_coords64.to(
-        device=pipeline.device,
-        dtype=torch.int32,
-    ).contiguous()
-    if coords64.ndim != 2 or coords64.shape[1] != 4:
-        raise ValueError(f"{label}: local C64 coordinates must be [N,4]")
-    if coords64.numel() == 0:
-        raise RuntimeError(f"{label}: local C64 support is empty")
-    if bool((coords64[:, 0] != 0).any().item()):
-        raise RuntimeError(f"{label}: local C64 support contains nonzero batch ids")
-    if bool(
-        (
-            (coords64[:, 1:] < 0)
-            | (coords64[:, 1:] >= GRID_SHAPE_1024)
-        ).any().item()
-    ):
-        raise RuntimeError(f"{label}: local C64 support contains out-of-grid rows")
-    unique_count = int(torch.unique(coords64, dim=0).shape[0])
-    if unique_count != int(coords64.shape[0]):
-        raise RuntimeError(
-            f"{label}: local C64 support must already be unique; "
-            f"rows={coords64.shape[0]:,}, unique={unique_count:,}"
-        )
-    if coords64.shape[0] > int(max_tokens):
-        raise RuntimeError(
-            f"{label}: local C64 support has {coords64.shape[0]:,} tokens; "
-            f"exceeds --max-num-tokens={int(max_tokens):,}"
-        )
-
-    print(
-        f"[tile-local-c64-flow] {label}: "
-        f"local_C64={coords64.shape[0]:,} order_preserved=true"
-    )
-
-    shape_norm, shape_denorm, shape1024_seconds = _run_shape1024(
-        pipeline=pipeline,
-        image_1024=tile_1024,
-        coords64=coords64,
-        camera=tile_camera,
-        params=params,
-        seed=seed + 201,
-        description=f"{label} shape 1024",
-    )
-
-    texture_norm, texture_denorm, texture1024_seconds = _run_texture1024(
-        pipeline=pipeline,
-        image_1024=tile_1024,
-        coords64=coords64,
-        camera=tile_camera,
-        shape_norm=shape_norm,
-        params=params,
-        seed=seed + 301,
-        description=f"{label} texture 1024",
-    )
-    _empty_cuda_cache()
-    return ModelResult(
-        shape_norm=shape_norm,
-        shape_denorm=shape_denorm,
-        texture_norm=texture_norm,
-        texture_denorm=texture_denorm,
-        tile_projective_c32_tokens=0,
-        tile_ss_c32_tokens=0,
-        tile_c32_overlap_tokens=0,
-        tile_c32_tokens=0,
-        tile_projective_c64_tokens=int(coords64.shape[0]),
-        tile_native_c64_tokens=0,
-        tile_c64_overlap_tokens=0,
-        tile_c64_tokens=int(coords64.shape[0]),
-        tile_ss_seconds=0.0,
-        shape512_seconds=0.0,
-        shape1024_seconds=float(shape1024_seconds),
-        texture1024_seconds=float(texture1024_seconds),
-    )
-
-def _decode_normal_mesh_with_ovoxel(
-    *,
-    pipeline: Any,
-    shape_latent: SparseTensor,
-    texture_latent: SparseTensor,
-    label: str,
-) -> Tuple[List[Any], Any]:
-    """Run the normal decoder once and retain its native ``MeshWithVoxel``."""
-    decoded = pipeline.decode_latent(
-        shape_latent,
-        texture_latent,
-        DECODE_TILE,
-    )
-    if len(decoded) != 1:
-        raise RuntimeError(
-            f"{label}: normal decoder returned {len(decoded)} meshes; expected one"
-        )
-    mesh_with_ovoxel = decoded[0]
-    required = (
-        "vertices",
-        "faces",
-        "coords",
-        "attrs",
-        "origin",
-        "voxel_size",
-        "voxel_shape",
-    )
-    missing = [
-        name for name in required if not hasattr(mesh_with_ovoxel, name)
-    ]
-    if missing:
-        raise RuntimeError(
-            f"{label}: normal decoder output is missing {', '.join(missing)}"
-        )
-    if mesh_with_ovoxel.vertices.ndim != 2 or mesh_with_ovoxel.vertices.shape[1] != 3:
-        raise ValueError(f"{label}: decoded vertices must be [N,3]")
-    if mesh_with_ovoxel.faces.ndim != 2 or mesh_with_ovoxel.faces.shape[1] != 3:
-        raise ValueError(f"{label}: decoded faces must be [M,3]")
-    if mesh_with_ovoxel.coords.ndim != 2 or mesh_with_ovoxel.coords.shape[1] != 3:
-        raise ValueError(f"{label}: decoded O-Voxel coords must be [L,3]")
-    if (
-        mesh_with_ovoxel.attrs.ndim != 2
-        or mesh_with_ovoxel.attrs.shape[0] != mesh_with_ovoxel.coords.shape[0]
-    ):
-        raise ValueError(
-            f"{label}: decoded O-Voxel attrs must be [L,C] and align with coords"
-        )
-    print(
-        f"[normal-decoder] {label}: "
-        f"vertices={mesh_with_ovoxel.vertices.shape[0]:,} "
-        f"faces={mesh_with_ovoxel.faces.shape[0]:,} "
-        f"ovoxel_entries={mesh_with_ovoxel.coords.shape[0]:,}"
-    )
-    return decoded, mesh_with_ovoxel
-
-
-def _evaluate_tile_result(
-    *,
-    pipeline: Any,
-    result: ModelResult,
     output_dir: Path,
     camera: Mapping[str, float],
-    global_camera: Mapping[str, float],
-    transform: TileCameraTransform,
-    seed: int,
-    label: str,
-    reference_image: Path,
+    reference_image: Optional[Path],
     args: argparse.Namespace,
     envmap: Any,
 ) -> Dict[str, Any]:
-    meshes, mesh = _decode_normal_mesh_with_ovoxel(
-        pipeline=pipeline,
-        shape_latent=result.shape_denorm,
-        texture_latent=result.texture_denorm,
-        label=label,
-    )
-    decoder_metadata = {
-        "decoder_vertices": int(mesh.vertices.shape[0]),
-        "decoder_faces": int(mesh.faces.shape[0]),
-        "active_voxels": int(mesh.coords.shape[0]),
-        "sample_type": type(mesh).__name__,
-        "renderer": "pixal3d.utils.render_utils.render_frames",
-        "camera_params": dict(camera),
-        "global_camera_params": dict(global_camera),
-        "tile_camera_transform": asdict(transform),
-        "seed": int(seed),
-    }
-
-    # The decoded MeshWithVoxel owns the tensors needed by the official renderer.
-    result.shape_norm = None  # type: ignore[assignment]
-    result.shape_denorm = None  # type: ignore[assignment]
-    result.texture_norm = None  # type: ignore[assignment]
-    result.texture_denorm = None  # type: ignore[assignment]
-    _empty_cuda_cache()
-
-    metric_row = render_and_evaluate_mesh(
-        mesh,
+    device = torch.device("cuda")
+    live_mesh = mesh.to(device)
+    result = render_and_evaluate_mesh(
+        live_mesh,
         camera_angle_x=float(camera["camera_angle_x"]),
         distance=float(camera["distance"]),
-        output_dir=output_dir / "aligned_eval",
+        output_dir=output_dir,
         reference_image=reference_image,
         resolution=int(args.render_resolution),
         metric_resolution=int(args.metric_resolution),
@@ -1789,1727 +1736,45 @@ def _evaluate_tile_result(
         envmap_name=str(args.envmap),
         ssaa=int(args.render_ssaa),
         peel_layers=int(args.render_peel_layers),
+        face_chunk_size=int(args.render_face_chunk_size),
         use_envmap_bg=bool(args.use_envmap_bg),
         lpips_net=str(args.lpips_net),
-        metric_device=str(args.metric_device),
+        metric_device="cuda",
         skip_lpips=bool(args.skip_lpips),
     )
-    extras = _save_extra_comparisons(
-        Path(metric_row["original_png"]),
-        Path(metric_row["render_png"]),
-        output_dir / "comparisons",
-    )
-    del meshes, mesh
+    del live_mesh
     _empty_cuda_cache()
-    return {**decoder_metadata, **metric_row, **extras}
-
-
-def _parse_tile_ids(value: Optional[str]) -> Optional[set[int]]:
-    if value is None or not value.strip():
-        return None
-    return {int(item.strip()) for item in value.split(",") if item.strip()}
-
-
-def _prepare_tile_reference(
-    image_4096: Image.Image,
-    box: Tuple[int, int, int, int],
-    tile_dir: Path,
-) -> Image.Image:
-    tile = image_4096.crop(box).convert("RGBA")
-    if tile.size != (IMAGE_FLOW, IMAGE_FLOW):
-        tile = tile.resize((IMAGE_FLOW, IMAGE_FLOW), Image.Resampling.LANCZOS)
-    reference = _composite_on_black(tile)
-    tile_dir.mkdir(parents=True, exist_ok=True)
-    reference.save(tile_dir / "reference_tile.png")
-    return reference
-
-
-def _project_grid_coords_to_tile_uv(
-    coords: torch.Tensor,
-    *,
-    resolution: int,
-    transform: TileCameraTransform,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    q = _endpoint_indices_to_q(coords[:, 1:4], int(resolution)).to(coords.device)
-    points = _camera_q_to_points(
-        q,
-        distance=float(transform.distance),
-        mesh_scale=float(transform.mesh_scale),
-    )
-    uv, _, valid = _project_points_with_intrinsics(
-        points,
-        fx=float(transform.fx),
-        fy=float(transform.fy),
-        cx=float(transform.cx),
-        cy=float(transform.cy),
-    )
-    return uv[0], q, valid[0]
-
-
-
-
-def _quantize_global_c1024_support_to_c64(
-    coords1024: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, Any]]:
-    """Quantize dense global C1024 support to unique global C64 support.
-
-    The returned inverse index maps every C1024 source row to its unique global
-    C64 token. Only coordinates are transferred; no global SLAT feature is used
-    as a tile feature.
-    """
-    if coords1024.ndim != 2 or coords1024.shape[1] != 4:
-        raise ValueError(
-            f"global C1024 support must be [N,4], got {tuple(coords1024.shape)}"
-        )
-    q1024 = _endpoint_indices_to_q(
-        coords1024[:, 1:4],
-        GRID_GLOBAL_UPSAMPLED,
-    ).to(coords1024.device)
-    ids64 = _q_to_endpoint_indices(q1024, GRID_SHAPE_1024)
-    coords64_per_source = torch.cat(
-        [coords1024[:, :1].to(torch.int32), ids64],
-        dim=1,
-    )
-    valid = (
-        (coords64_per_source[:, 0] == 0)
-        & (coords64_per_source[:, 1:] >= 0).all(dim=1)
-        & (coords64_per_source[:, 1:] < GRID_SHAPE_1024).all(dim=1)
-    )
-    if not bool(valid.all().item()):
-        coords64_per_source = coords64_per_source[valid]
-    coords64_unique, inverse = torch.unique(
-        coords64_per_source,
-        dim=0,
-        return_inverse=True,
-    )
-    if coords64_unique.numel() == 0:
-        raise RuntimeError("global C1024 -> global C64 quantization is empty")
-    stats = {
-        "input_global_c1024_rows": int(coords1024.shape[0]),
-        "valid_global_c1024_rows": int(coords64_per_source.shape[0]),
-        "unique_global_c64_tokens": int(coords64_unique.shape[0]),
-        "c1024_rows_merged_by_global_c64_quantization": int(
-            coords64_per_source.shape[0] - coords64_unique.shape[0]
-        ),
-        "global_c64_resolution": int(GRID_SHAPE_1024),
-    }
-    return coords64_unique, inverse, stats
-
-
-def _prepare_global_c1024_tile_mapping(
-    *,
-    reference: Image.Image,
-    selected_global_coords1024: torch.Tensor,
-    selected_global_uv_4096: torch.Tensor,
-    global_camera: Mapping[str, float],
-    transform: TileCameraTransform,
-    output_dir: Path,
-    boundary_epsilon: float,
-) -> TileSupportMapping:
-    """Transform dense global C1024 source rows directly to unique local C64.
-
-    This preserves the ordering used by the successful single-tile experiment:
-
-        global C1024 -> continuous camera transform -> local C64 quantization.
-
-    ``source_to_local_index`` maps every retained global C1024 source row to the
-    unique local C64 token whose flow feature must be returned to that source.
-    A global C64 coordinate is computed only for the return/global-decode route;
-    it is never used to construct the local support.
-    """
-    if selected_global_coords1024.ndim != 2 or selected_global_coords1024.shape[1] != 4:
-        raise ValueError("selected_global_coords1024 must be [N,4]")
-    if (
-        selected_global_uv_4096.ndim != 2
-        or selected_global_uv_4096.shape[1] != 2
-        or selected_global_uv_4096.shape[0] != selected_global_coords1024.shape[0]
-    ):
-        raise ValueError("selected_global_uv_4096 must be [N,2] and align with C1024")
-
-    q_global = _endpoint_indices_to_q(
-        selected_global_coords1024[:, 1:4],
-        GRID_GLOBAL_UPSAMPLED,
-    ).to(selected_global_coords1024.device)
-    q_local, uv_tile_continuous, _, transform_stats = (
-        _global_q_to_centered_tile_q(
-            q_global,
-            global_camera=global_camera,
-            transform=transform,
-        )
-    )
-
-    overflow = (q_local.abs() - 1.0).clamp_min(0.0)
-    strict_inside = (q_local.abs() <= 1.0).all(dim=1)
-    hard_outside = (overflow > float(boundary_epsilon)).any(dim=1)
-    numeric_outside = (~strict_inside) & (~hard_outside)
-    kept = strict_inside
-    if not bool(kept.any().item()):
-        raise RuntimeError("all selected global C1024 rows leave the local cube")
-
-    q_global_kept = q_global[kept]
-    q_local_kept = q_local[kept]
-    coords1024_kept = selected_global_coords1024[kept].to(torch.int32)
-    global_uv_kept = selected_global_uv_4096[kept]
-    uv_tile_kept = uv_tile_continuous[kept]
-
-    local_ids_per_source = _q_to_endpoint_indices(
-        q_local_kept,
-        GRID_SHAPE_1024,
-    )
-    local_coords_per_source = torch.cat(
-        [
-            torch.zeros(
-                (local_ids_per_source.shape[0], 1),
-                device=local_ids_per_source.device,
-                dtype=torch.int32,
-            ),
-            local_ids_per_source,
-        ],
-        dim=1,
-    )
-    local_coords_unique, source_to_local = torch.unique(
-        local_coords_per_source,
-        dim=0,
-        return_inverse=True,
-    )
-    if local_coords_unique.numel() == 0:
-        raise RuntimeError("local C64 support is empty after direct C1024 transform")
-
-    global_ids64_per_source = _q_to_endpoint_indices(
-        q_global_kept,
-        GRID_SHAPE_1024,
-    )
-    source_global_coords64 = torch.cat(
-        [coords1024_kept[:, :1], global_ids64_per_source],
-        dim=1,
-    ).to(torch.int32)
-    valid_global64 = (
-        (source_global_coords64[:, 0] == 0)
-        & (source_global_coords64[:, 1:] >= 0).all(dim=1)
-        & (source_global_coords64[:, 1:] < GRID_SHAPE_1024).all(dim=1)
-    )
-    if not bool(valid_global64.all().item()):
-        raise RuntimeError("C1024 return mapping produced invalid global C64 coordinates")
-
-    tile_center = torch.tensor(
-        [transform.tile_center_full_x, transform.tile_center_full_y],
-        device=global_uv_kept.device,
-        dtype=global_uv_kept.dtype,
-    )
-    center_distance = torch.linalg.vector_norm(
-        global_uv_kept - tile_center[None],
-        dim=1,
-    )
-
-    q_quantized_per_source = _endpoint_indices_to_q(
-        local_ids_per_source,
-        GRID_SHAPE_1024,
-    ).to(q_local_kept.device)
-    quantized_points = _camera_q_to_points(
-        q_quantized_per_source,
-        distance=float(transform.distance),
-        mesh_scale=float(transform.mesh_scale),
-    )
-    uv_quantized, _, quantized_valid = _project_points_with_intrinsics(
-        quantized_points,
-        fx=float(transform.fx),
-        fy=float(transform.fy),
-        cx=float(transform.cx),
-        cy=float(transform.cy),
-    )
-    uv_quantized = uv_quantized[0]
-    quantized_valid = quantized_valid[0]
-    pixel_error = torch.linalg.vector_norm(
-        uv_quantized - uv_tile_kept,
-        dim=1,
-    )
-
-    unique_uv, unique_q, unique_valid = _project_grid_coords_to_tile_uv(
-        local_coords_unique,
-        resolution=GRID_SHAPE_1024,
-        transform=transform,
-    )
-
-    output_dir.mkdir(parents=True, exist_ok=True)
-    _draw_uv_points(
-        reference,
-        uv_tile_kept,
-        q_global_kept[:, 2],
-        output_dir / "continuous_global_c1024_to_local_projection.png",
-        "selected global C1024 transformed into centered tile coordinates",
-    )
-    _draw_uv_points(
-        reference,
-        unique_uv[unique_valid],
-        unique_q[:, 2][unique_valid],
-        output_dir / "local_c64_support_overlay.png",
-        "global C1024 transformed first, then quantized to unique local C64",
-    )
-    _save_density_image(
-        unique_uv[unique_valid],
-        output_dir / "local_c64_support_density.png",
-        resolution=IMAGE_FLOW,
-    )
-    _save_quantization_error_image(
-        reference,
-        uv_tile_kept[quantized_valid],
-        uv_quantized[quantized_valid],
-        output_dir / "global_c1024_to_local_c64_quantization_error.png",
-    )
-
-    stats = {
-        "support_mode": "global_c1024_direct_to_local_c64",
-        "selected_global_c1024_rows": int(selected_global_coords1024.shape[0]),
-        "kept_source_global_c1024_rows": int(coords1024_kept.shape[0]),
-        "unique_return_global_c64_tokens": int(
-            torch.unique(source_global_coords64, dim=0).shape[0]
-        ),
-        "unique_local_c64_tokens": int(local_coords_unique.shape[0]),
-        "source_rows_merged_by_local_quantization": int(
-            coords1024_kept.shape[0] - local_coords_unique.shape[0]
-        ),
-        "hard_outside_rows_dropped": int(hard_outside.sum().item()),
-        "hard_outside_fraction": float(hard_outside.float().mean().item()),
-        "numeric_boundary_rows_dropped": int(numeric_outside.sum().item()),
-        "boundary_epsilon": float(boundary_epsilon),
-        "tile_center_distance_pixels_min": float(center_distance.min().item()),
-        "tile_center_distance_pixels_mean": float(center_distance.mean().item()),
-        "tile_center_distance_pixels_max": float(center_distance.max().item()),
-        "quantization_pixel_error_mean": float(pixel_error.mean().item()),
-        "quantization_pixel_error_p95": float(torch.quantile(pixel_error, 0.95).item()),
-        "quantization_pixel_error_max": float(pixel_error.max().item()),
-        "transform_stats": transform_stats,
-        "tile_camera": asdict(transform),
-    }
-    _atomic_json(output_dir / "support_stats.json", stats)
-    torch.save(
-        {
-            "selected_global_coords1024": selected_global_coords1024.detach().cpu(),
-            "selected_global_uv_4096": selected_global_uv_4096.detach().cpu(),
-            "kept_mask": kept.detach().cpu(),
-            "source_global_coords1024": coords1024_kept.detach().cpu(),
-            "source_global_coords64_return": source_global_coords64.detach().cpu(),
-            "local_coords64_unique": local_coords_unique.detach().cpu(),
-            "source_to_local_index": source_to_local.detach().cpu(),
-            "tile_center_distance_pixels": center_distance.detach().cpu(),
-            "q_global": q_global.detach().cpu(),
-            "q_local": q_local.detach().cpu(),
-            "uv_tile_continuous": uv_tile_continuous.detach().cpu(),
-            "uv_tile_quantized_per_source": uv_quantized.detach().cpu(),
-            "tile_camera": asdict(transform),
-        },
-        output_dir / "support_mapping_debug.pt",
-    )
-    print(
-        f"[tile-map] tile={transform.tile_id:02d} "
-        f"selected_global_C1024={selected_global_coords1024.shape[0]:,} "
-        f"kept_sources={coords1024_kept.shape[0]:,} "
-        f"unique_local_C64={local_coords_unique.shape[0]:,} "
-        f"outside={stats['hard_outside_fraction']:.6f}"
-    )
-    return TileSupportMapping(
-        local_coords64=local_coords_unique,
-        source_global_coords1024=coords1024_kept,
-        source_global_coords64=source_global_coords64,
-        source_to_local_index=source_to_local.to(torch.long),
-        tile_center_distance_pixels=center_distance,
-        stats=stats,
-    )
-
-def _select_closest_tile_candidate_per_global_token(
-    *,
-    global_coords: torch.Tensor,
-    shape_feats: torch.Tensor,
-    texture_feats: torch.Tensor,
-    distances: torch.Tensor,
-    tile_ids: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, Any]]:
-    """Keep exactly one candidate for each global C64 token.
-
-    Ranking is lexicographic: global coordinate, distance to tile center,
-    tile id, original candidate order. Therefore the closest tile center wins;
-    ties are deterministic and no feature averaging is performed.
-    """
-    tensors = (global_coords, shape_feats, texture_feats, distances, tile_ids)
-    rows = int(global_coords.shape[0])
-    if rows == 0:
-        raise RuntimeError("no tile SLAT candidates were produced")
-    if any(int(t.shape[0]) != rows for t in tensors):
-        raise ValueError("candidate tensors must have the same first dimension")
-    if global_coords.ndim != 2 or global_coords.shape[1] != 4:
-        raise ValueError("candidate global coordinates must be [N,4]")
-    if not torch.isfinite(distances).all():
-        raise RuntimeError("candidate center distances contain non-finite values")
-
-    coords_cpu = global_coords.to(device="cpu", dtype=torch.int64).contiguous()
-    distances_cpu = distances.to(device="cpu", dtype=torch.float64).contiguous()
-    tile_ids_cpu = tile_ids.to(device="cpu", dtype=torch.int64).contiguous()
-    xyz = coords_cpu[:, 1:4]
-    keys = (
-        xyz[:, 0] * (GRID_SHAPE_1024 * GRID_SHAPE_1024)
-        + xyz[:, 1] * GRID_SHAPE_1024
-        + xyz[:, 2]
-    ).numpy()
-    distance_np = distances_cpu.numpy()
-    tile_np = tile_ids_cpu.numpy()
-    original_order = np.arange(rows, dtype=np.int64)
-    order = np.lexsort((original_order, tile_np, distance_np, keys))
-    sorted_keys = keys[order]
-    first = np.ones(rows, dtype=bool)
-    first[1:] = sorted_keys[1:] != sorted_keys[:-1]
-    selected_np = order[first]
-    selected = torch.from_numpy(selected_np).to(torch.long)
-
-    counts = np.unique(keys, return_counts=True)[1]
-    selected_coords = coords_cpu.index_select(0, selected).to(torch.int32)
-    selected_shape = shape_feats.to("cpu").index_select(0, selected).contiguous()
-    selected_texture = texture_feats.to("cpu").index_select(0, selected).contiguous()
-    selected_distances = distances_cpu.index_select(0, selected).to(torch.float32)
-    selected_tile_ids = tile_ids_cpu.index_select(0, selected).to(torch.int32)
-    stats = {
-        "candidate_rows": rows,
-        "unique_global_c64_tokens_kept": int(selected.shape[0]),
-        "duplicate_candidates_discarded": int(rows - selected.shape[0]),
-        "global_tokens_with_multiple_candidates": int((counts > 1).sum()),
-        "maximum_candidates_for_one_global_token": int(counts.max()),
-        "selection_rule": (
-            "keep one candidate per global C64 token; minimum projected "
-            "distance to tile center wins; deterministic tile-id tie break"
-        ),
-        "feature_averaging_used": False,
-        "selected_distance_pixels_min": float(selected_distances.min().item()),
-        "selected_distance_pixels_mean": float(selected_distances.mean().item()),
-        "selected_distance_pixels_max": float(selected_distances.max().item()),
-    }
-    return (
-        selected_coords,
-        selected_shape,
-        selected_texture,
-        selected_distances,
-        selected_tile_ids,
-        stats,
-    )
-
-def _filter_unique_grid_coords(
-    coords: torch.Tensor,
-    *,
-    resolution: int,
-    source_name: str,
-) -> Tuple[torch.Tensor, Dict[str, Any]]:
-    """Keep only batch-0 integer coordinates inside a sparse cubic grid."""
-    if int(resolution) <= 1:
-        raise ValueError("resolution must exceed one")
-    if coords.ndim != 2 or coords.shape[1] != 4:
-        raise ValueError(
-            f"{source_name}: expected sparse coordinates [N,4], got "
-            f"{tuple(coords.shape)}"
-        )
-
-    coords_i32 = coords.to(dtype=torch.int32)
-    batch_valid = coords_i32[:, 0] == 0
-    xyz_valid = (
-        (coords_i32[:, 1:] >= 0)
-        & (coords_i32[:, 1:] < int(resolution))
-    ).all(dim=1)
-    valid = batch_valid & xyz_valid
-    filtered = coords_i32[valid]
-    unique = torch.unique(filtered, dim=0)
-    stats = {
-        "source": str(source_name),
-        "resolution": int(resolution),
-        "input_rows": int(coords_i32.shape[0]),
-        "invalid_batch_rows_dropped": int((~batch_valid).sum().item()),
-        "out_of_grid_rows_dropped": int((batch_valid & ~xyz_valid).sum().item()),
-        "valid_rows_before_unique": int(filtered.shape[0]),
-        "unique_rows": int(unique.shape[0]),
-        "duplicate_rows_removed": int(filtered.shape[0] - unique.shape[0]),
-    }
-    return unique, stats
-
-
-def _resize_panel(path: Optional[Path], size: int = 512) -> Image.Image:
-    if path is None or not path.is_file():
-        return Image.new("RGB", (size, size), (30, 30, 30))
-    image = Image.open(path).convert("RGB")
-    if image.size != (size, size):
-        image = image.resize((size, size), Image.Resampling.LANCZOS)
-    return image
-
-
-def _label_panel(image: Image.Image, text: str) -> Image.Image:
-    canvas = image.convert("RGBA")
-    overlay = Image.new("RGBA", (canvas.width, 76), (0, 0, 0, 185))
-    canvas.alpha_composite(overlay, dest=(0, 0))
-    draw = ImageDraw.Draw(canvas)
-    y = 8
-    for line in text.splitlines():
-        draw.text((9, y), line, fill=(255, 255, 255, 255))
-        y += 16
-    return canvas.convert("RGB")
-
-
-
-
-
-def _to_3vector(value: Any, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-    tensor = torch.as_tensor(value, device=device, dtype=dtype).reshape(-1)
-    if tensor.numel() == 1:
-        tensor = tensor.repeat(3)
-    elif tensor.numel() != 3:
-        raise ValueError(f"expected scalar or 3-vector, got shape {tuple(tensor.shape)}")
-    return tensor
-
-
-def _coord4_linear_keys(coords: torch.Tensor, resolution: int = GRID_SHAPE_1024) -> torch.Tensor:
-    if coords.ndim != 2 or coords.shape[1] != 4:
-        raise ValueError("coords must be [N,4]")
-    xyz = coords.to(torch.int64)[:, 1:4]
-    return (
-        xyz[:, 0] * (resolution * resolution)
-        + xyz[:, 1] * resolution
-        + xyz[:, 2]
-    )
-
-
-def _coord3_linear_keys(coords: torch.Tensor, shape3: torch.Tensor) -> torch.Tensor:
-    if coords.ndim != 2 or coords.shape[1] != 3:
-        raise ValueError("coords must be [N,3]")
-    shape3 = torch.as_tensor(shape3, dtype=torch.int64).reshape(-1)
-    if shape3.numel() == 1:
-        shape3 = shape3.repeat(3)
-    elif shape3.numel() != 3:
-        raise ValueError("shape3 must be scalar or length 3")
-    xyz = coords.to(torch.int64)
-    return xyz[:, 0] * (int(shape3[1]) * int(shape3[2])) + xyz[:, 1] * int(shape3[2]) + xyz[:, 2]
-
-
-def _transform_local_object_to_global_object(
-    local_object: torch.Tensor,
-    *,
-    global_camera: Mapping[str, float],
-    transform: TileCameraTransform,
-) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, Any]]:
-    """Convert decoder local object coordinates to global object coordinates.
-
-    Pixal3D's decoder emits mesh vertices and O-Voxel centers in object space,
-    normally about ``[-0.5, 0.5]``. Camera recanonicalization functions operate
-    on q coordinates in about ``[-1, 1]``. The correct conversion is:
-
-        q_local = local_object * (2 * tile_mesh_scale)
-        q_global = inverse_camera_mapping(q_local)
-        global_object = q_global / (2 * global_mesh_scale)
-
-    Treating decoder object coordinates directly as q introduces an exact
-    factor-of-two placement error when mesh_scale=1.
-    """
-    if local_object.ndim != 2 or local_object.shape[1] != 3:
-        raise ValueError("local_object must be [N,3]")
-    if not torch.isfinite(local_object).all():
-        raise RuntimeError("local decoder object coordinates contain non-finite values")
-
-    tile_scale = float(transform.mesh_scale)
-    global_scale = float(global_camera["mesh_scale"])
-    if tile_scale <= 0.0 or global_scale <= 0.0:
-        raise ValueError("mesh scales must be positive")
-
-    local_q = local_object * (2.0 * tile_scale)
-    global_q, _, _, stats = _centered_tile_q_to_global_q(
-        local_q,
-        global_camera=global_camera,
-        transform=transform,
-        validate_roundtrip=False,
-    )
-    global_object = global_q / (2.0 * global_scale)
-    if not torch.isfinite(global_object).all():
-        raise RuntimeError("transformed global object coordinates contain non-finite values")
-
-    stats = {
-        **stats,
-        "local_object_min": [
-            float(v) for v in local_object.amin(dim=0).detach().cpu().tolist()
-        ],
-        "local_object_max": [
-            float(v) for v in local_object.amax(dim=0).detach().cpu().tolist()
-        ],
-        "local_q_min": [
-            float(v) for v in local_q.amin(dim=0).detach().cpu().tolist()
-        ],
-        "local_q_max": [
-            float(v) for v in local_q.amax(dim=0).detach().cpu().tolist()
-        ],
-        "global_object_min": [
-            float(v) for v in global_object.amin(dim=0).detach().cpu().tolist()
-        ],
-        "global_object_max": [
-            float(v) for v in global_object.amax(dim=0).detach().cpu().tolist()
-        ],
-        "tile_mesh_scale": tile_scale,
-        "global_mesh_scale": global_scale,
-        "object_q_conversion": (
-            "local_q=local_object*(2*tile_mesh_scale); "
-            "global_object=global_q/(2*global_mesh_scale)"
-        ),
-    }
-    return global_object, global_q, stats
-
-
-def _to_voxel_shape3(
-    value: Any,
-    *,
-    device: torch.device,
-) -> Tuple[torch.Tensor, List[int]]:
-    """Normalize decoder voxel-shape metadata to spatial ``[X, Y, Z]``.
-
-    Pixal3D decoder metadata may expose the lattice shape as:
-      - a scalar;
-      - ``[X, Y, Z]``;
-      - ``[1, X, Y, Z]`` with a leading batch dimension;
-      - another tensor shape whose final three entries are the spatial axes.
-
-    Sparse O-Voxel coordinates contain only XYZ, so the final three entries
-    are the relevant spatial lattice dimensions.
-    """
-    raw = torch.as_tensor(value, device=device, dtype=torch.int64).reshape(-1)
-    raw_values = [int(v) for v in raw.detach().cpu().tolist()]
-
-    if raw.numel() == 0:
-        raise ValueError("voxel_shape is empty")
-    if raw.numel() == 1:
-        shape3 = raw.repeat(3)
-    elif raw.numel() >= 3:
-        shape3 = raw[-3:]
-    else:
-        raise ValueError(
-            f"voxel_shape must contain 1 or at least 3 entries, got {raw_values}"
-        )
-
-    if bool((shape3 <= 0).any().item()):
-        raise ValueError(
-            f"voxel_shape spatial dimensions must be positive, got {raw_values}"
-        )
-    return shape3, raw_values
-
-
-def _quantize_points_to_sparse_voxel_coords(
-    points: torch.Tensor,
-    *,
-    origin: Any,
-    voxel_size: Any,
-    voxel_shape: Any,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    if points.ndim != 2 or points.shape[1] != 3:
-        raise ValueError("points must be [N,3]")
-    device = points.device
-    origin3 = _to_3vector(origin, device=device, dtype=points.dtype)
-    voxel_size3 = _to_3vector(voxel_size, device=device, dtype=points.dtype)
-    shape3, raw_voxel_shape = _to_voxel_shape3(
-        voxel_shape,
-        device=device,
-    )
-    if len(raw_voxel_shape) != 3:
-        print(
-            "[ovoxel-grid] normalized voxel_shape "
-            f"{raw_voxel_shape} -> {[int(v) for v in shape3.detach().cpu().tolist()]}"
-        )
-    coords = torch.round(
-        (points - origin3[None]) / voxel_size3[None] - 0.5
-    ).to(torch.int64)
-    valid = ((coords >= 0) & (coords < shape3[None])).all(dim=1)
-    return coords[valid].to(torch.int32), valid, origin3.to(torch.float32), voxel_size3.to(torch.float32), shape3.to(torch.int32)
-
-
-def _inside_tile_mask(
-    uv_4096: torch.Tensor,
-    finite: torch.Tensor,
-    box: Sequence[int],
-) -> torch.Tensor:
-    x0, y0, x1, y1 = (float(v) for v in box)
-    return (
-        finite
-        & (uv_4096[:, 0] >= x0)
-        & (uv_4096[:, 0] < x1)
-        & (uv_4096[:, 1] >= y0)
-        & (uv_4096[:, 1] < y1)
-    )
-
-
-def _filter_faces_by_tile_projection(
-    *,
-    global_vertices_object: torch.Tensor,
-    global_vertices_q: torch.Tensor,
-    faces: torch.Tensor,
-    global_camera: Mapping[str, float],
-    box: Sequence[int],
-    chunk_size: int,
-) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, Any]]:
-    """Keep triangles whose projected centroid belongs to this tile.
-
-    The local decoder can generate surfaces outside the support-owned image
-    region. Centroid ownership makes non-overlapping tiles a deterministic
-    partition of image-space geometry and prevents unconditional concatenation
-    of every locally decoded surface.
-    """
-    if int(chunk_size) <= 0:
-        raise ValueError("face projection chunk_size must be positive")
-    faces = faces.to(device=global_vertices_q.device, dtype=torch.int64)
-    _, _, uv_4096, _, finite_vertices = _project_global_q_to_1024_and_4096(
-        global_vertices_q,
-        global_camera=global_camera,
-    )
-
-    kept_chunks: List[torch.Tensor] = []
-    for start in range(0, int(faces.shape[0]), int(chunk_size)):
-        face_chunk = faces[start : start + int(chunk_size)]
-        tri_uv = uv_4096.index_select(0, face_chunk.reshape(-1)).reshape(-1, 3, 2)
-        tri_finite = finite_vertices.index_select(
-            0, face_chunk.reshape(-1)
-        ).reshape(-1, 3).all(dim=1)
-        centroid_uv = tri_uv.mean(dim=1)
-        keep = _inside_tile_mask(centroid_uv, tri_finite, box)
-        if bool(keep.any().item()):
-            kept_chunks.append(face_chunk[keep])
-
-    if not kept_chunks:
-        return (
-            torch.empty((0, 3), device=faces.device, dtype=torch.int64),
-            torch.empty((0, 3), device=faces.device, dtype=global_vertices_object.dtype),
-            {
-                "input_vertices": int(global_vertices_object.shape[0]),
-                "input_faces": int(faces.shape[0]),
-                "owned_faces": 0,
-                "compact_owned_vertices": 0,
-                "face_ownership_rule": "projected triangle centroid inside tile box",
-            },
-        )
-
-    owned_faces_source = torch.cat(kept_chunks, dim=0)
-    used_vertices, inverse = torch.unique(
-        owned_faces_source.reshape(-1),
-        sorted=True,
-        return_inverse=True,
-    )
-    compact_faces = inverse.reshape(-1, 3).to(torch.int64)
-    compact_vertices = global_vertices_object.index_select(0, used_vertices)
-    stats = {
-        "input_vertices": int(global_vertices_object.shape[0]),
-        "input_faces": int(faces.shape[0]),
-        "owned_faces": int(compact_faces.shape[0]),
-        "faces_dropped_outside_tile_ownership": int(
-            faces.shape[0] - compact_faces.shape[0]
-        ),
-        "compact_owned_vertices": int(compact_vertices.shape[0]),
-        "unused_vertices_dropped": int(
-            global_vertices_object.shape[0] - compact_vertices.shape[0]
-        ),
-        "face_ownership_rule": "projected triangle centroid inside tile box",
-    }
-    return compact_faces, compact_vertices, stats
-
-
-def _canonical_ovoxel_metadata(
-    *,
-    template_voxel_shape: Any,
-    attr_channels: int,
-    resolution: int,
-    device: torch.device,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, Any]]:
-    if int(resolution) <= 1:
-        raise ValueError("canonical O-Voxel resolution must exceed one")
-    raw = torch.as_tensor(template_voxel_shape, dtype=torch.int64).reshape(-1)
-    raw_values = [int(v) for v in raw.tolist()]
-    if raw.numel() >= 5:
-        shape_values = raw_values[:-3] + [int(resolution)] * 3
-        if len(shape_values) >= 2:
-            shape_values[-4] = int(attr_channels)
-    elif raw.numel() == 4:
-        shape_values = [int(attr_channels)] + [int(resolution)] * 3
-    else:
-        # Renderer metadata from Pixal3D normally includes batch and channel
-        # dimensions. Build the official dense shape convention explicitly.
-        shape_values = [1, int(attr_channels)] + [int(resolution)] * 3
-
-    origin = torch.tensor(
-        [-0.5, -0.5, -0.5],
-        device=device,
-        dtype=torch.float32,
-    )
-    voxel_size = torch.tensor(
-        1.0 / float(resolution),
-        device=device,
-        dtype=torch.float32,
-    )
-    voxel_shape = torch.tensor(
-        shape_values,
-        device=device,
-        dtype=torch.int64,
-    )
-    stats = {
-        "template_voxel_shape": raw_values,
-        "canonical_voxel_shape": shape_values,
-        "canonical_spatial_resolution": int(resolution),
-        "canonical_origin": [-0.5, -0.5, -0.5],
-        "canonical_voxel_size": 1.0 / float(resolution),
-        "canonical_object_bounds": [-0.5, 0.5],
-    }
-    return origin, voxel_size, voxel_shape, stats
-
-
-def _select_closest_tile_ovoxel_candidates(
-    *,
-    coords: torch.Tensor,
-    attrs: torch.Tensor,
-    distances: torch.Tensor,
-    tile_ids: torch.Tensor,
-    resolution: int,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, Any]]:
-    rows = int(coords.shape[0])
-    if rows == 0:
-        raise RuntimeError("no O-Voxel candidates were produced")
-    if any(int(t.shape[0]) != rows for t in (attrs, distances, tile_ids)):
-        raise ValueError("O-Voxel candidate tensors must align")
-
-    coords_cpu = coords.to(device="cpu", dtype=torch.int64).contiguous()
-    distances_cpu = distances.to(device="cpu", dtype=torch.float64).contiguous()
-    tile_ids_cpu = tile_ids.to(device="cpu", dtype=torch.int64).contiguous()
-    keys = _coord3_linear_keys(
-        coords_cpu,
-        torch.tensor([resolution, resolution, resolution], dtype=torch.int64),
-    ).numpy()
-    distance_np = distances_cpu.numpy()
-    tile_np = tile_ids_cpu.numpy()
-    original_order = np.arange(rows, dtype=np.int64)
-    order = np.lexsort((original_order, tile_np, distance_np, keys))
-    sorted_keys = keys[order]
-    first = np.ones(rows, dtype=bool)
-    first[1:] = sorted_keys[1:] != sorted_keys[:-1]
-    selected_np = order[first]
-    selected = torch.from_numpy(selected_np).to(torch.long)
-
-    counts = np.unique(keys, return_counts=True)[1]
-    selected_coords = coords_cpu.index_select(0, selected).to(torch.int32)
-    selected_attrs = attrs.to("cpu").index_select(0, selected).contiguous()
-    selected_distances = distances_cpu.index_select(0, selected).to(torch.float32)
-    selected_tile_ids = tile_ids_cpu.index_select(0, selected).to(torch.int32)
-    stats = {
-        "candidate_rows": rows,
-        "unique_global_ovoxels_kept": int(selected.shape[0]),
-        "ovoxel_conflicts_discarded": int(rows - selected.shape[0]),
-        "ovoxels_with_multiple_candidates": int((counts > 1).sum()),
-        "maximum_candidates_for_one_ovoxel": int(counts.max()),
-        "selection_rule": (
-            "minimum projected distance to tile center; deterministic tile-id tie break"
-        ),
-        "feature_averaging_used": False,
-    }
-    return (
-        selected_coords,
-        selected_attrs,
-        selected_distances,
-        selected_tile_ids,
-        stats,
-    )
-
-
-def _weld_vertices_and_remap_faces(
-    *,
-    vertices: torch.Tensor,
-    faces: torch.Tensor,
-    tolerance: float,
-) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, Any]]:
-    """Spatially weld near-identical vertices and remove degenerate faces."""
-    if vertices.ndim != 2 or vertices.shape[1] != 3:
-        raise ValueError("vertices must be [N,3]")
-    if faces.ndim != 2 or faces.shape[1] != 3:
-        raise ValueError("faces must be [M,3]")
-    if float(tolerance) <= 0.0 or vertices.shape[0] == 0:
-        return vertices, faces, {
-            "enabled": False,
-            "tolerance": float(tolerance),
-            "input_vertices": int(vertices.shape[0]),
-            "output_vertices": int(vertices.shape[0]),
-            "input_faces": int(faces.shape[0]),
-            "output_faces": int(faces.shape[0]),
-            "degenerate_faces_removed": 0,
-        }
-
-    vertices_np = vertices.detach().cpu().numpy().astype(np.float64, copy=False)
-    faces_np = faces.detach().cpu().numpy().astype(np.int64, copy=False)
-    quantized = np.rint(vertices_np / float(tolerance)).astype(np.int64)
-    _, inverse = np.unique(quantized, axis=0, return_inverse=True)
-    cluster_count = int(inverse.max()) + 1
-    sums = np.zeros((cluster_count, 3), dtype=np.float64)
-    counts = np.bincount(inverse, minlength=cluster_count).astype(np.float64)
-    np.add.at(sums, inverse, vertices_np)
-    welded_np = sums / counts[:, None]
-    remapped_faces_np = inverse[faces_np]
-    nondegenerate = (
-        (remapped_faces_np[:, 0] != remapped_faces_np[:, 1])
-        & (remapped_faces_np[:, 1] != remapped_faces_np[:, 2])
-        & (remapped_faces_np[:, 0] != remapped_faces_np[:, 2])
-    )
-    remapped_faces_np = remapped_faces_np[nondegenerate]
-    welded = torch.from_numpy(welded_np.astype(np.float32, copy=False))
-    remapped_faces = torch.from_numpy(remapped_faces_np.astype(np.int64, copy=False))
-    stats = {
-        "enabled": True,
-        "tolerance": float(tolerance),
-        "input_vertices": int(vertices.shape[0]),
-        "output_vertices": int(welded.shape[0]),
-        "vertices_welded": int(vertices.shape[0] - welded.shape[0]),
-        "input_faces": int(faces.shape[0]),
-        "output_faces": int(remapped_faces.shape[0]),
-        "degenerate_faces_removed": int(faces.shape[0] - remapped_faces.shape[0]),
-    }
-    return welded, remapped_faces, stats
-
-
-def _assign_mesh_field(mesh: Any, name: str, value: Any) -> None:
-    """Assign a field on an actual Pixal3D MeshWithVoxel instance."""
-    try:
-        setattr(mesh, name, value)
-    except Exception:
-        # Supports frozen dataclasses or slots-backed representation classes.
-        object.__setattr__(mesh, name, value)
-
-
-def _clear_mesh_template_storage(mesh: Any) -> Any:
-    """Keep the official runtime type without retaining one tile's large tensors."""
-    template = copy.copy(mesh)
-    device = torch.device("cpu")
-    vertex_dtype = mesh.vertices.dtype
-    face_dtype = mesh.faces.dtype
-    coord_dtype = mesh.coords.dtype
-    attr_dtype = mesh.attrs.dtype
-    attr_channels = int(mesh.attrs.shape[1])
-
-    _assign_mesh_field(
-        template,
-        "vertices",
-        torch.empty((0, 3), device=device, dtype=vertex_dtype),
-    )
-    _assign_mesh_field(
-        template,
-        "faces",
-        torch.empty((0, 3), device=device, dtype=face_dtype),
-    )
-    _assign_mesh_field(
-        template,
-        "coords",
-        torch.empty((0, 3), device=device, dtype=coord_dtype),
-    )
-    _assign_mesh_field(
-        template,
-        "attrs",
-        torch.empty((0, attr_channels), device=device, dtype=attr_dtype),
-    )
-    return template
-
-
-def _tile_center_ownership_box(
-    transform: TileCameraTransform,
-    *,
-    tile_stride: int,
-    canonical_size: int = IMAGE_CANONICAL,
-    halo_pixels: float = 0.0,
-) -> Tuple[float, float, float, float]:
-    """Voronoi ownership box induced by the regular tile-center grid.
-
-    Interior tiles own one stride-sized center region. Boundary tiles extend to
-    the canonical image edge. A positive halo is intended for O-Voxel lookup
-    support, not for triangle ownership.
-    """
-    if int(tile_stride) <= 0:
-        raise ValueError("tile_stride must be positive")
-    if float(halo_pixels) < 0.0:
-        raise ValueError("halo_pixels must be non-negative")
-    x0, y0, x1, y1 = transform.box
-    cx = float(transform.tile_center_full_x)
-    cy = float(transform.tile_center_full_y)
-    half = float(tile_stride) / 2.0
-    left = 0.0 if x0 == 0 else cx - half
-    right = float(canonical_size) if x1 == canonical_size else cx + half
-    top = 0.0 if y0 == 0 else cy - half
-    bottom = float(canonical_size) if y1 == canonical_size else cy + half
-    halo = float(halo_pixels)
-    return (
-        max(0.0, left - halo),
-        max(0.0, top - halo),
-        min(float(canonical_size), right + halo),
-        min(float(canonical_size), bottom + halo),
-    )
-
-def _decode_full_tile_payloads_and_merge_to_global(
-    *,
-    pipeline: Any,
-    payloads: Sequence[TileLocalDecodePayload],
-    global_camera: Mapping[str, float],
-    template_voxel_shape: Any,
-    canonical_voxel_resolution: int,
-    vertex_weld_tolerance: float,
-    face_projection_chunk_size: int,
-    tile_stride: int,
-    ovoxel_ownership_halo_pixels: int,
-) -> Tuple[Any, List[Dict[str, Any]], Dict[str, Any]]:
-    """Decode every complete local SLAT, then return decoder outputs globally.
-
-    No local C64 token is deleted according to the Route-A global candidate
-    selection. The local decoder therefore receives exactly the complete sparse
-    latent produced by that tile's shape1024 and texture1024 flows.
-    """
-    if not payloads:
-        raise RuntimeError("no successful tile payloads are available")
-
-    vertex_chunks: List[torch.Tensor] = []
-    face_chunks: List[torch.Tensor] = []
-    ovoxel_coord_chunks: List[torch.Tensor] = []
-    ovoxel_attr_chunks: List[torch.Tensor] = []
-    ovoxel_distance_chunks: List[torch.Tensor] = []
-    ovoxel_tile_id_chunks: List[torch.Tensor] = []
-    tile_decoder_rows: List[Dict[str, Any]] = []
-    official_mesh_template: Optional[Any] = None
-    official_vertex_dtype: Optional[torch.dtype] = None
-    official_face_dtype: Optional[torch.dtype] = None
-    official_coord_dtype: Optional[torch.dtype] = None
-    official_attr_dtype: Optional[torch.dtype] = None
-    canonical_origin: Optional[torch.Tensor] = None
-    canonical_voxel_size: Optional[torch.Tensor] = None
-    canonical_voxel_shape: Optional[torch.Tensor] = None
-    canonical_metadata_stats: Optional[Dict[str, Any]] = None
-    vertex_offset = 0
-
-    for payload in sorted(payloads, key=lambda x: int(x.tile_id)):
-        local_coords = payload.local_coords64.to(
-            device=pipeline.device,
-            dtype=torch.int32,
-        )
-        local_shape_feats = payload.local_shape_denorm_feats.to(pipeline.device)
-        local_texture_feats = payload.local_texture_denorm_feats.to(pipeline.device)
-        shape_sparse = SparseTensor(feats=local_shape_feats, coords=local_coords)
-        texture_sparse = SparseTensor(feats=local_texture_feats, coords=local_coords)
-        decoded, mesh = _decode_normal_mesh_with_ovoxel(
-            pipeline=pipeline,
-            shape_latent=shape_sparse,
-            texture_latent=texture_sparse,
-            label=f"Tile {int(payload.tile_id):02d} complete local decode",
-        )
-        del decoded, shape_sparse, texture_sparse, local_shape_feats, local_texture_feats
-
-        if official_mesh_template is None:
-            official_mesh_template = _clear_mesh_template_storage(mesh)
-            official_vertex_dtype = mesh.vertices.dtype
-            official_face_dtype = mesh.faces.dtype
-            official_coord_dtype = mesh.coords.dtype
-            official_attr_dtype = mesh.attrs.dtype
-            (
-                canonical_origin,
-                canonical_voxel_size,
-                canonical_voxel_shape,
-                canonical_metadata_stats,
-            ) = _canonical_ovoxel_metadata(
-                template_voxel_shape=template_voxel_shape,
-                attr_channels=int(mesh.attrs.shape[1]),
-                resolution=int(canonical_voxel_resolution),
-                device=pipeline.device,
-            )
-            print(
-                "[local-decode-merge] captured official mesh template: "
-                f"{type(mesh).__module__}.{type(mesh).__name__}"
-            )
-
-        if canonical_origin is None or canonical_voxel_size is None or canonical_voxel_shape is None:
-            raise RuntimeError("canonical O-Voxel metadata was not initialized")
-
-        ownership_box = _tile_center_ownership_box(
-            payload.transform,
-            tile_stride=int(tile_stride),
-            halo_pixels=0.0,
-        )
-        ovoxel_box = _tile_center_ownership_box(
-            payload.transform,
-            tile_stride=int(tile_stride),
-            halo_pixels=float(ovoxel_ownership_halo_pixels),
-        )
-
-        local_vertices_object = mesh.vertices.to(
-            device=pipeline.device,
-            dtype=torch.float32,
-        )
-        (
-            global_vertices_object,
-            global_vertices_q,
-            vertex_transform_stats,
-        ) = _transform_local_object_to_global_object(
-            local_vertices_object,
-            global_camera=global_camera,
-            transform=payload.transform,
-        )
-        compact_faces, compact_vertices, face_stats = _filter_faces_by_tile_projection(
-            global_vertices_object=global_vertices_object,
-            global_vertices_q=global_vertices_q,
-            faces=mesh.faces,
-            global_camera=global_camera,
-            box=ownership_box,
-            chunk_size=int(face_projection_chunk_size),
-        )
-
-        coords_local = mesh.coords.to(pipeline.device, dtype=torch.float32)
-        attrs_local = mesh.attrs.to(pipeline.device)
-        local_origin3 = _to_3vector(
-            mesh.origin,
-            device=pipeline.device,
-            dtype=torch.float32,
-        )
-        local_voxel_size3 = _to_3vector(
-            mesh.voxel_size,
-            device=pipeline.device,
-            dtype=torch.float32,
-        )
-        local_voxel_object = (
-            local_origin3[None]
-            + (coords_local + 0.5) * local_voxel_size3[None]
-        )
-        (
-            global_voxel_object,
-            global_voxel_q,
-            voxel_transform_stats,
-        ) = _transform_local_object_to_global_object(
-            local_voxel_object,
-            global_camera=global_camera,
-            transform=payload.transform,
-        )
-        _, _, voxel_uv_4096, _, voxel_finite = _project_global_q_to_1024_and_4096(
-            global_voxel_q,
-            global_camera=global_camera,
-        )
-        voxel_owned = _inside_tile_mask(
-            voxel_uv_4096,
-            voxel_finite,
-            ovoxel_box,
-        )
-        global_voxel_object_owned = global_voxel_object[voxel_owned]
-        attrs_owned = attrs_local[voxel_owned]
-        uv_owned = voxel_uv_4096[voxel_owned]
-
-        quantized_coords3, valid_canonical, _, _, _ = (
-            _quantize_points_to_sparse_voxel_coords(
-                global_voxel_object_owned,
-                origin=canonical_origin,
-                voxel_size=canonical_voxel_size,
-                voxel_shape=canonical_voxel_shape,
-            )
-        )
-        quantized_attrs = attrs_owned[valid_canonical]
-        uv_quantized_candidates = uv_owned[valid_canonical]
-
-        if quantized_coords3.shape[0] == 0 or compact_faces.shape[0] == 0:
-            tile_decoder_rows.append({
-                "tile_id": int(payload.tile_id),
-                "status": "skipped_after_decode",
-                "reason": "no owned triangles or no canonical O-Voxels",
-                "complete_local_c64_tokens": int(payload.local_coords64.shape[0]),
-                "decoder_vertices": int(mesh.vertices.shape[0]),
-                "decoder_faces": int(mesh.faces.shape[0]),
-                "decoder_active_voxels": int(mesh.coords.shape[0]),
-                "owned_faces": int(compact_faces.shape[0]),
-                "owned_canonical_ovoxels": int(quantized_coords3.shape[0]),
-                "triangle_ownership_box": list(ownership_box),
-                "ovoxel_ownership_box": list(ovoxel_box),
-            })
-            del mesh
-            _empty_cuda_cache()
-            continue
-
-        tile_center = torch.tensor(
-            [
-                payload.transform.tile_center_full_x,
-                payload.transform.tile_center_full_y,
-            ],
-            device=uv_quantized_candidates.device,
-            dtype=uv_quantized_candidates.dtype,
-        )
-        quantized_distances = torch.linalg.vector_norm(
-            uv_quantized_candidates - tile_center[None],
-            dim=1,
-        )
-
-        compact_faces = compact_faces + int(vertex_offset)
-        vertex_chunks.append(compact_vertices.detach().cpu())
-        face_chunks.append(compact_faces.detach().cpu())
-        vertex_offset += int(compact_vertices.shape[0])
-        ovoxel_coord_chunks.append(quantized_coords3.detach().cpu())
-        ovoxel_attr_chunks.append(quantized_attrs.detach().cpu())
-        ovoxel_distance_chunks.append(quantized_distances.detach().cpu())
-        ovoxel_tile_id_chunks.append(
-            torch.full(
-                (int(quantized_coords3.shape[0]),),
-                int(payload.tile_id),
-                dtype=torch.int32,
-            )
-        )
-
-        tile_decoder_rows.append({
-            "tile_id": int(payload.tile_id),
-            "status": "success",
-            "complete_local_c64_tokens": int(payload.local_coords64.shape[0]),
-            "decoder_vertices": int(mesh.vertices.shape[0]),
-            "decoder_faces": int(mesh.faces.shape[0]),
-            "decoder_active_voxels": int(mesh.coords.shape[0]),
-            **face_stats,
-            "triangle_ownership_box": list(ownership_box),
-            "ovoxel_ownership_box": list(ovoxel_box),
-            "ovoxel_ownership_halo_pixels": int(ovoxel_ownership_halo_pixels),
-            "owned_ovoxel_centers_with_halo": int(voxel_owned.sum().item()),
-            "owned_ovoxels_outside_canonical_cube": int(
-                voxel_owned.sum().item() - valid_canonical.sum().item()
-            ),
-            "reprojected_global_active_voxels": int(quantized_coords3.shape[0]),
-            "vertex_object_q_conversion": vertex_transform_stats.get(
-                "object_q_conversion"
-            ),
-            "vertex_global_object_min": vertex_transform_stats.get(
-                "global_object_min"
-            ),
-            "vertex_global_object_max": vertex_transform_stats.get(
-                "global_object_max"
-            ),
-            "ovoxel_global_object_min": voxel_transform_stats.get(
-                "global_object_min"
-            ),
-            "ovoxel_global_object_max": voxel_transform_stats.get(
-                "global_object_max"
-            ),
-        })
-        del (
-            mesh,
-            local_vertices_object,
-            global_vertices_object,
-            global_vertices_q,
-            compact_faces,
-            compact_vertices,
-            coords_local,
-            attrs_local,
-            local_voxel_object,
-            global_voxel_object,
-            global_voxel_q,
-            quantized_coords3,
-            quantized_attrs,
-            quantized_distances,
-        )
-        _empty_cuda_cache()
-
-    success_rows = [row for row in tile_decoder_rows if row.get("status") == "success"]
-    if not success_rows:
-        raise RuntimeError("no complete tile local decode produced mergeable metadata")
-    if not vertex_chunks or not face_chunks or not ovoxel_coord_chunks:
-        raise RuntimeError("complete tile local decode produced no mergeable geometry")
-
-    concatenated_vertices = torch.cat(vertex_chunks, dim=0).to(torch.float32)
-    concatenated_faces = torch.cat(face_chunks, dim=0).to(torch.int64)
-    merged_vertices, merged_faces, weld_stats = _weld_vertices_and_remap_faces(
-        vertices=concatenated_vertices,
-        faces=concatenated_faces,
-        tolerance=float(vertex_weld_tolerance),
-    )
-
-    all_ovoxel_coords = torch.cat(ovoxel_coord_chunks, dim=0).to(torch.int32)
-    all_ovoxel_attrs = torch.cat(ovoxel_attr_chunks, dim=0)
-    all_ovoxel_distances = torch.cat(ovoxel_distance_chunks, dim=0).to(torch.float32)
-    all_ovoxel_tile_ids = torch.cat(ovoxel_tile_id_chunks, dim=0).to(torch.int32)
-    (
-        merged_ovoxel_coords,
-        merged_ovoxel_attrs,
-        merged_ovoxel_distances,
-        merged_ovoxel_tile_ids,
-        ovoxel_selection_stats,
-    ) = _select_closest_tile_ovoxel_candidates(
-        coords=all_ovoxel_coords,
-        attrs=all_ovoxel_attrs,
-        distances=all_ovoxel_distances,
-        tile_ids=all_ovoxel_tile_ids,
-        resolution=int(canonical_voxel_resolution),
-    )
-
-    if official_mesh_template is None:
-        raise RuntimeError("no official MeshWithVoxel template was captured")
-    if (
-        official_vertex_dtype is None
-        or official_face_dtype is None
-        or official_coord_dtype is None
-        or official_attr_dtype is None
-        or canonical_origin is None
-        or canonical_voxel_size is None
-        or canonical_voxel_shape is None
-        or canonical_metadata_stats is None
-    ):
-        raise RuntimeError("official MeshWithVoxel metadata is incomplete")
-
-    render_device = pipeline.device
-    merged_mesh = official_mesh_template
-    _assign_mesh_field(
-        merged_mesh,
-        "vertices",
-        merged_vertices.to(
-            device=render_device,
-            dtype=official_vertex_dtype,
-            non_blocking=True,
-        ),
-    )
-    _assign_mesh_field(
-        merged_mesh,
-        "faces",
-        merged_faces.to(
-            device=render_device,
-            dtype=official_face_dtype,
-            non_blocking=True,
-        ),
-    )
-    _assign_mesh_field(
-        merged_mesh,
-        "coords",
-        merged_ovoxel_coords.to(
-            device=render_device,
-            dtype=official_coord_dtype,
-            non_blocking=True,
-        ),
-    )
-    _assign_mesh_field(
-        merged_mesh,
-        "attrs",
-        merged_ovoxel_attrs.to(
-            device=render_device,
-            dtype=official_attr_dtype,
-            non_blocking=True,
-        ),
-    )
-    _assign_mesh_field(merged_mesh, "origin", canonical_origin)
-    _assign_mesh_field(merged_mesh, "voxel_size", canonical_voxel_size)
-    _assign_mesh_field(merged_mesh, "voxel_shape", canonical_voxel_shape)
-
-    summary = {
-        "attempted_complete_tile_local_decodes": len(payloads),
-        "successful_complete_tile_local_decodes": len(success_rows),
-        "concatenated_owned_vertices_before_weld": int(
-            concatenated_vertices.shape[0]
-        ),
-        "concatenated_owned_faces_before_weld": int(
-            concatenated_faces.shape[0]
-        ),
-        "merged_vertices": int(merged_vertices.shape[0]),
-        "merged_faces": int(merged_faces.shape[0]),
-        "vertex_welding": weld_stats,
-        "merged_ovoxel_rows_before_conflict_selection": int(
-            all_ovoxel_coords.shape[0]
-        ),
-        "merged_ovoxel_rows_after_conflict_selection": int(
-            merged_ovoxel_coords.shape[0]
-        ),
-        "ovoxel_candidate_selection": ovoxel_selection_stats,
-        "selected_ovoxel_tile_ids_min": int(merged_ovoxel_tile_ids.min().item()),
-        "selected_ovoxel_tile_ids_max": int(merged_ovoxel_tile_ids.max().item()),
-        "selected_ovoxel_center_distance_mean": float(
-            merged_ovoxel_distances.mean().item()
-        ),
-        "canonical_ovoxel_metadata": canonical_metadata_stats,
-        "tile_stride": int(tile_stride),
-        "ovoxel_ownership_halo_pixels": int(ovoxel_ownership_halo_pixels),
-        "merged_mesh_runtime_type": (
-            f"{type(merged_mesh).__module__}.{type(merged_mesh).__name__}"
-        ),
-        "merged_mesh_device": str(merged_mesh.vertices.device),
-        "merge_route": (
-            "complete local SLAT decode -> local object to local q -> inverse tile "
-            "camera mapping -> global object; nearest-center triangle ownership; "
-            "O-Voxel halo and global requantization; weld and conflict selection"
-        ),
-    }
-    return merged_mesh, tile_decoder_rows, summary
-
-def _save_local_decode_merge_comparison_sheet(
-    *,
-    reference_path: Path,
-    baseline_render_path: Path,
-    merged_render_path: Path,
-    covered_support_overlay_path: Path,
-    baseline_diff_path: Path,
-    merged_diff_path: Path,
-    baseline_metrics: Mapping[str, Any],
-    merged_metrics: Mapping[str, Any],
-    coverage_fraction: float,
-    output_path: Path,
-) -> str:
-    panels = [
-        _label_panel(
-            _resize_panel(reference_path),
-            "Reference canonical 1024",
-        ),
-        _label_panel(
-            _resize_panel(baseline_render_path),
-            (
-                "Ordinary global Pixal3D baseline\n"
-                f"PSNR={baseline_metrics.get('psnr_db')} "
-                f"SSIM={baseline_metrics.get('ssim')} "
-                f"LPIPS={baseline_metrics.get('lpips')}"
-            ),
-        ),
-        _label_panel(
-            _resize_panel(merged_render_path),
-            (
-                "Tile-local decode, decoder-metadata merged globally\n"
-                f"coverage={coverage_fraction:.4%}\n"
-                f"PSNR={merged_metrics.get('psnr_db')} "
-                f"SSIM={merged_metrics.get('ssim')} "
-                f"LPIPS={merged_metrics.get('lpips')}"
-            ),
-        ),
-        _label_panel(
-            _resize_panel(covered_support_overlay_path),
-            "Final selected global C64 support",
-        ),
-        _label_panel(
-            _resize_panel(baseline_diff_path),
-            "Baseline absolute RGB error",
-        ),
-        _label_panel(
-            _resize_panel(merged_diff_path),
-            "Merged tile-local-decode absolute RGB error",
-        ),
-    ]
-    size = panels[0].width
-    canvas = Image.new("RGB", (size * 3, size * 2), (18, 18, 18))
-    for index, panel in enumerate(panels):
-        canvas.paste(panel, ((index % 3) * size, (index // 3) * size))
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    canvas.save(output_path)
-    return str(output_path)
-
-
-def _save_tile_comparison_sheet(
-    *,
-    reference_path: Path,
-    support_overlay_path: Path,
-    route_summary: Optional[Mapping[str, Any]],
-    baseline_summary: Optional[Mapping[str, Any]],
-    projected_c64_token_count: int,
-    outside_fraction: float,
-    output_path: Path,
-) -> str:
-    reference = _label_panel(
-        _resize_panel(reference_path),
-        "Reference 4096 crop -> 1024",
-    )
-    support = _label_panel(
-        _resize_panel(support_overlay_path),
-        (
-            "Global C1024 -> centered tile -> quantized C64 only\n"
-            f"projected C64={projected_c64_token_count:,} "
-            f"outside={outside_fraction:.4%}"
-        ),
-    )
-
-    if baseline_summary is None:
-        baseline_render = _label_panel(
-            _resize_panel(None),
-            "Global ordinary 1024 baseline crop\nunavailable",
-        )
-        baseline_diff = _label_panel(
-            _resize_panel(None),
-            "Baseline absolute error\nunavailable",
-        )
-    else:
-        baseline_render_path = (
-            Path(str(baseline_summary["baseline_render_png"]))
-            if baseline_summary.get("baseline_render_png")
-            else None
-        )
-        baseline_diff_path = (
-            Path(str(baseline_summary["baseline_diff_heatmap_png"]))
-            if baseline_summary.get("baseline_diff_heatmap_png")
-            else None
-        )
-        baseline_render = _label_panel(
-            _resize_panel(baseline_render_path),
-            (
-                "Global 1024 model, ray-equivalent tile-view crop\n"
-                f"PSNR={baseline_summary.get('baseline_psnr_db')} "
-                f"SSIM={baseline_summary.get('baseline_ssim')} "
-                f"LPIPS={baseline_summary.get('baseline_lpips')}"
-            ),
-        )
-        baseline_diff = _label_panel(
-            _resize_panel(baseline_diff_path),
-            "Global baseline absolute RGB error",
-        )
-
-    if route_summary is None:
-        tile_render = _label_panel(
-            _resize_panel(None),
-            "Projected-C64-only tile flow\nfailed",
-        )
-        tile_diff = _label_panel(
-            _resize_panel(None),
-            "Tile absolute error\nunavailable",
-        )
-    else:
-        render_path = (
-            Path(str(route_summary["render_png"]))
-            if route_summary.get("render_png")
-            else None
-        )
-        diff_path = (
-            Path(str(route_summary["diff_heatmap_png"]))
-            if route_summary.get("diff_heatmap_png")
-            else None
-        )
-        tile_render = _label_panel(
-            _resize_panel(render_path),
-            (
-                "Projected-global C64 only -> shape1024 -> texture1024\n"
-                f"C64={route_summary.get('tile_c64_tokens')}\n"
-                f"PSNR={route_summary.get('psnr_db')} "
-                f"SSIM={route_summary.get('ssim')} "
-                f"LPIPS={route_summary.get('lpips')}\n"
-                f"gain: dPSNR={route_summary.get('psnr_gain_db')} "
-                f"dSSIM={route_summary.get('ssim_gain')} "
-                f"LPIPS-reduction={route_summary.get('lpips_reduction')}"
-            ),
-        )
-        tile_diff = _label_panel(
-            _resize_panel(diff_path),
-            "Projected-C64-only tile absolute RGB error",
-        )
-
-    panels = [
-        reference,
-        baseline_render,
-        tile_render,
-        support,
-        baseline_diff,
-        tile_diff,
-    ]
-    size = panels[0].width
-    canvas = Image.new("RGB", (size * 3, size * 2), (18, 18, 18))
-    for index, panel in enumerate(panels):
-        canvas.paste(panel, ((index % 3) * size, (index // 3) * size))
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    canvas.save(output_path)
-    return str(output_path)
-
-def _evaluate_baseline_tile_records(
-    *,
-    records: List[Dict[str, Any]],
-    args: argparse.Namespace,
-    lpips_evaluator: Optional[_LPIPSEvaluator] = None,
-) -> None:
-    comparable = [
-        row
-        for row in records
-        if row.get("reference_png")
-        and row.get("support_overlay_png")
-        and row.get("comparison_png")
-    ]
-    if not comparable:
-        return
-
-    metric_candidates = [
-        row for row in comparable if row.get("baseline_render_png")
-    ]
-    owned_lpips_evaluator: Optional[_LPIPSEvaluator] = None
-    if (
-        metric_candidates
-        and not bool(args.skip_lpips)
-        and lpips_evaluator is None
-    ):
-        device_name = str(args.metric_device)
-        if device_name.startswith("cuda") and not torch.cuda.is_available():
-            device_name = "cpu"
-        owned_lpips_evaluator = _LPIPSEvaluator(
-            str(args.lpips_net),
-            torch.device(device_name),
-        )
-        lpips_evaluator = owned_lpips_evaluator
-
-    try:
-        for row in metric_candidates:
-            reference = _image_to_metric_tensor(
-                Path(str(row["reference_png"])),
-                resolution=int(args.metric_resolution),
-            )
-            baseline = _image_to_metric_tensor(
-                Path(str(row["baseline_render_png"])),
-                resolution=int(args.metric_resolution),
-            )
-            row["baseline_psnr_db"] = _psnr_metric(reference, baseline)
-            row["baseline_ssim"] = _ssim_metric(reference, baseline)
-            row["baseline_lpips"] = (
-                None
-                if lpips_evaluator is None
-                else lpips_evaluator.evaluate(reference, baseline)
-            )
-
-            row["psnr_gain_db"] = (
-                None
-                if row.get("psnr_db") is None
-                else float(row["psnr_db"]) - float(row["baseline_psnr_db"])
-            )
-            row["ssim_gain"] = (
-                None
-                if row.get("ssim") is None
-                else float(row["ssim"]) - float(row["baseline_ssim"])
-            )
-            row["lpips_reduction"] = (
-                None
-                if row.get("lpips") is None or row.get("baseline_lpips") is None
-                else float(row["baseline_lpips"]) - float(row["lpips"])
-            )
-            print(
-                f"[baseline-tile] tile={int(row['tile_id']):02d} "
-                f"baseline_PSNR={row['baseline_psnr_db']:.4f} "
-                f"tile_PSNR={row.get('psnr_db')} "
-                f"gain={row.get('psnr_gain_db')}"
-            )
-
-        for row in comparable:
-            route_summary = row if row.get("render_png") else None
-            baseline_summary = row if row.get("baseline_render_png") else None
-            row["comparison_png"] = _save_tile_comparison_sheet(
-                reference_path=Path(str(row["reference_png"])),
-                support_overlay_path=Path(str(row["support_overlay_png"])),
-                route_summary=route_summary,
-                baseline_summary=baseline_summary,
-                projected_c64_token_count=int(row.get("tile_projective_c64_tokens") or 0),
-                outside_fraction=float(row.get("hard_outside_fraction") or 0.0),
-                output_path=Path(str(row["comparison_png"])),
-            )
-            _atomic_json(Path(str(row["tile_dir"])) / "summary.json", row)
-    finally:
-        if owned_lpips_evaluator is not None:
-            owned_lpips_evaluator.model.cpu()
-            del owned_lpips_evaluator
-            _empty_cuda_cache()
-
-
-def _write_contact_sheets(
-    records: Sequence[Mapping[str, Any]],
-    output_dir: Path,
-) -> List[str]:
-    rows = [
-        row
-        for row in records
-        if row.get("status") == "success" and row.get("comparison_png")
-    ]
-    outputs: List[str] = []
-    per_page = 6
-    for start in range(0, len(rows), per_page):
-        page = rows[start : start + per_page]
-        cell_w = 760
-        cell_h = 760
-        cols = 2
-        row_count = math.ceil(len(page) / cols)
-        canvas = Image.new(
-            "RGB",
-            (cell_w * cols, cell_h * row_count),
-            (20, 20, 20),
-        )
-        for index, row in enumerate(page):
-            image = Image.open(str(row["comparison_png"])).convert("RGB")
-            image.thumbnail((cell_w, cell_h), Image.Resampling.LANCZOS)
-            x0 = (index % cols) * cell_w + (cell_w - image.width) // 2
-            y0 = (index // cols) * cell_h + (cell_h - image.height) // 2
-            canvas.paste(image, (x0, y0))
-        path = output_dir / f"all_tiles_baseline_vs_tile_{start // per_page:02d}.png"
-        canvas.save(path)
-        outputs.append(str(path))
-    return outputs
-
-
-
-def _save_global_merge_comparison_sheet(
-    *,
-    reference_path: Path,
-    baseline_render_path: Path,
-    merged_render_path: Path,
-    covered_support_overlay_path: Path,
-    baseline_diff_path: Path,
-    merged_diff_path: Path,
-    baseline_metrics: Mapping[str, Any],
-    merged_metrics: Mapping[str, Any],
-    coverage_fraction: float,
-    output_path: Path,
-) -> str:
-    panels = [
-        _label_panel(
-            _resize_panel(reference_path),
-            "Reference canonical 1024",
-        ),
-        _label_panel(
-            _resize_panel(baseline_render_path),
-            (
-                "Ordinary global Pixal3D baseline\n"
-                f"PSNR={baseline_metrics.get('psnr_db')} "
-                f"SSIM={baseline_metrics.get('ssim')} "
-                f"LPIPS={baseline_metrics.get('lpips')}"
-            ),
-        ),
-        _label_panel(
-            _resize_panel(merged_render_path),
-            (
-                "Tile SLAT returned to global; one global decode\n"
-                f"coverage={coverage_fraction:.4%}\n"
-                f"PSNR={merged_metrics.get('psnr_db')} "
-                f"SSIM={merged_metrics.get('ssim')} "
-                f"LPIPS={merged_metrics.get('lpips')}"
-            ),
-        ),
-        _label_panel(
-            _resize_panel(covered_support_overlay_path),
-            "Final covered global C64 support",
-        ),
-        _label_panel(
-            _resize_panel(baseline_diff_path),
-            "Baseline absolute RGB error",
-        ),
-        _label_panel(
-            _resize_panel(merged_diff_path),
-            "Merged tile-SLAT absolute RGB error",
-        ),
-    ]
-    size = panels[0].width
-    canvas = Image.new("RGB", (size * 3, size * 2), (18, 18, 18))
-    for index, panel in enumerate(panels):
-        canvas.paste(panel, ((index % 3) * size, (index // 3) * size))
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    canvas.save(output_path)
-    return str(output_path)
+    return result
 
 
 def run(args: argparse.Namespace) -> None:
-    if int(args.tile_size) != DEFAULT_TILE_SIZE:
-        raise ValueError(f"this test requires --tile-size={DEFAULT_TILE_SIZE}")
-    if int(args.tile_stride) != DEFAULT_TILE_STRIDE:
-        raise ValueError(f"this test requires --tile-stride={DEFAULT_TILE_STRIDE}")
-    if args.cuda_device is not None:
-        torch.cuda.set_device(int(args.cuda_device))
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required")
+    torch.cuda.set_device(int(args.cuda_device))
+    device = torch.device("cuda")
+    print(
+        f"[cuda] requested physical/current index={int(args.cuda_device)} "
+        f"name={torch.cuda.get_device_name(torch.cuda.current_device())}"
+    )
 
     output_dir = Path(args.output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
-
     pipeline = init_pipeline(
         args.model_path,
         device="cuda",
         low_vram=bool(args.low_vram),
     )
-    envmap = load_envmap(str(args.envmap), device="cuda")
+
     canonical = pipeline.preprocess_canonical_images(Image.open(args.image))
     image_4096: Image.Image = canonical["image_4096"]
     image_1024: Image.Image = canonical["image_1024"]
     image_512: Image.Image = canonical["image_512"]
-    foreground_mask_4096: Image.Image = canonical[
-        "foreground_mask_4096"
-    ].convert("L")
     image_4096.save(output_dir / "canonical_4096.png")
     image_1024.save(output_dir / "canonical_1024.png")
     image_512.save(output_dir / "canonical_512.png")
-    foreground_mask_4096.save(output_dir / "canonical_foreground_mask_4096.png")
+    canonical["foreground_mask_4096"].save(
+        output_dir / "canonical_foreground_mask_4096.png"
+    )
     _atomic_json(output_dir / "canonical_metadata.json", canonical["metadata"])
 
     global_camera = _estimate_camera(
@@ -3518,865 +1783,499 @@ def run(args: argparse.Namespace) -> None:
         manual_fov=float(args.fov),
         mesh_scale=float(args.mesh_scale),
         extend_pixel=int(args.extend_pixel),
-        image_resolution=int(args.camera_image_resolution),
         moge_model_path=args.moge_model_path,
     )
     _atomic_json(output_dir / "global_camera.json", global_camera)
     print(
-        f"[global-camera] fov={global_camera['camera_angle_x']:.8f} "
+        "[global-camera] "
+        f"fov={global_camera['camera_angle_x']:.8f} "
         f"distance={global_camera['distance']:.8f} "
         f"mesh_scale={global_camera['mesh_scale']:.8f}"
     )
 
-    params = _sampler_params(args, pipeline)
-    print(
-        "[global-baseline] SS C32 -> shape512 -> learned C64 -> "
-        "shape1024 -> texture1024 -> decode"
+    ss_params, shape_params, texture_params = _sampler_overrides(args)
+    print("[global-baseline] running ordinary Pixal3D 1024_cascade")
+    _seed_everything(int(args.seed))
+    baseline_started = time.perf_counter()
+    baseline_output, baseline_latents = pipeline.run(
+        image_1024,
+        camera_params=global_camera,
+        seed=int(args.seed),
+        sparse_structure_sampler_params=ss_params,
+        shape_slat_sampler_params=shape_params,
+        tex_slat_sampler_params=texture_params,
+        preprocess_image=False,
+        return_latent=True,
+        pipeline_type="1024_cascade",
+        max_num_tokens=int(args.max_num_tokens),
     )
-    coords32, official_coords64, global_shape = (
-        _run_global_official_geometry_to_shape1024(
-            pipeline=pipeline,
-            image_512=image_512,
-            image_1024=image_1024,
-            camera=global_camera,
-            params=params,
-            seed=int(args.seed),
-            max_tokens=int(args.max_num_tokens),
+    baseline_seconds = time.perf_counter() - baseline_started
+    if len(baseline_output) != 1:
+        raise RuntimeError(
+            f"global baseline returned {len(baseline_output)} meshes, expected one"
         )
+    baseline_live = _validate_mesh(
+        baseline_output[0], "global ordinary Pixal3D-1024 baseline"
     )
-    global_texture_norm, global_texture_denorm, global_texture_seconds = (
-        _run_texture1024(
-            pipeline=pipeline,
-            image_1024=image_1024,
-            coords64=official_coords64,
-            camera=global_camera,
-            shape_norm=global_shape.shape_norm,
-            params=params,
-            seed=int(args.seed) + 301,
-            description="Global ordinary texture 1024",
+    shape_latent, texture_latent, decoded_resolution = baseline_latents
+    if int(decoded_resolution) != OVOXEL_RESOLUTION:
+        raise RuntimeError(
+            f"baseline decoder resolution is {decoded_resolution}, expected 1024"
         )
-    )
-
     baseline_dir = output_dir / "global_baseline_1024"
     baseline_dir.mkdir(parents=True, exist_ok=True)
-    baseline_meshes, baseline_mesh = _decode_normal_mesh_with_ovoxel(
-        pipeline=pipeline,
-        shape_latent=global_shape.shape_denorm,
-        texture_latent=global_texture_denorm,
-        label="Global ordinary 1024 baseline",
+    envmap = (
+        load_envmap(str(args.envmap), device="cuda") if args.render else None
     )
-    baseline_decoder_metadata = {
-        "decoder_vertices": int(baseline_mesh.vertices.shape[0]),
-        "decoder_faces": int(baseline_mesh.faces.shape[0]),
-        "active_voxels": int(baseline_mesh.coords.shape[0]),
-        "sample_type": type(baseline_mesh).__name__,
-        "renderer": "pixal3d.utils.render_utils.render_frames",
-    }
-    baseline_decoder_grid = {
-        "origin": torch.as_tensor(baseline_mesh.origin).detach().cpu(),
-        "voxel_size": torch.as_tensor(baseline_mesh.voxel_size).detach().cpu(),
-        "voxel_shape": torch.as_tensor(baseline_mesh.voxel_shape).detach().cpu(),
-    }
-
-    print("[global-support] shape1024 latent -> dense global C1024 support")
-    coords1024, upsample_stats = _learned_upsample_shape1024_to_c1024(
-        pipeline,
-        global_shape.shape_denorm,
-    )
-    if coords1024.shape[0] > int(args.max_num_tokens):
-        raise RuntimeError(
-            f"global C1024 support has {coords1024.shape[0]:,} tokens; "
-            f"exceeds --max-num-tokens={int(args.max_num_tokens):,}"
+    baseline_render: Optional[Dict[str, Any]] = None
+    if args.render:
+        baseline_render = _render(
+            baseline_live,
+            output_dir=baseline_dir / "aligned_eval",
+            camera=global_camera,
+            reference_image=output_dir / "canonical_1024.png",
+            args=args,
+            envmap=envmap,
         )
-    global_coords64, c1024_to_c64_inverse, global_c64_stats = (
-        _quantize_global_c1024_support_to_c64(coords1024)
-    )
-    print(
-        f"[global-support] dense C1024={coords1024.shape[0]:,}; "
-        f"return/decode global C64 domain={global_coords64.shape[0]:,}"
-    )
 
-    prior_dir = output_dir / "global_geometry_prior"
-    prior_dir.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "coords32_official": coords32.detach().cpu(),
-            "coords64_official": official_coords64.detach().cpu(),
-            "coords1024_dense": coords1024.detach().cpu(),
-            "coords64_return_domain": global_coords64.detach().cpu(),
-            "c1024_to_global_c64_inverse": c1024_to_c64_inverse.detach().cpu(),
-            "global_shape1024_norm_feats": global_shape.shape_norm.feats.detach().cpu(),
-            "global_shape1024_denorm_feats": global_shape.shape_denorm.feats.detach().cpu(),
-        },
-        prior_dir / "global_geometry_prior.pt",
-    )
-
-    baseline_metric = render_and_evaluate_mesh(
-        baseline_mesh,
-        camera_angle_x=float(global_camera["camera_angle_x"]),
-        distance=float(global_camera["distance"]),
-        output_dir=baseline_dir / "aligned_eval",
-        reference_image=output_dir / "canonical_1024.png",
-        resolution=int(args.baseline_render_resolution),
-        metric_resolution=int(args.metric_resolution),
-        envmap=envmap,
-        envmap_name=str(args.envmap),
-        ssaa=int(args.render_ssaa),
-        peel_layers=int(args.render_peel_layers),
-        use_envmap_bg=bool(args.use_envmap_bg),
-        lpips_net=str(args.lpips_net),
-        metric_device=str(args.metric_device),
-        skip_lpips=bool(args.skip_lpips),
-    )
-    baseline_extras = _save_extra_comparisons(
-        Path(str(baseline_metric["original_png"])),
-        Path(str(baseline_metric["render_png"])),
-        baseline_dir / "comparisons",
-    )
-    baseline_summary = {
-        **baseline_decoder_metadata,
-        **baseline_metric,
-        **baseline_extras,
-        "route": (
-            "ordinary global SS C32 -> shape512 -> learned C64 -> "
-            "shape1024 -> texture1024 -> global decode"
-        ),
-        "global_c32_tokens": int(coords32.shape[0]),
-        "official_global_c64_tokens": int(official_coords64.shape[0]),
-        "dense_global_c1024_tokens": int(coords1024.shape[0]),
-        "return_domain_global_c64_tokens": int(global_coords64.shape[0]),
-        "shape512_seconds": float(global_shape.shape512_seconds),
-        "shape1024_seconds": float(global_shape.shape1024_seconds),
-        "texture1024_seconds": float(global_texture_seconds),
+    baseline_mesh = baseline_live.to("cpu")
+    baseline_summary: Dict[str, Any] = {
+        "route": "ordinary pipeline.run(..., pipeline_type='1024_cascade')",
+        "generation_seconds": float(baseline_seconds),
+        "decoder_resolution": int(decoded_resolution),
+        "vertices": int(baseline_mesh.vertices.shape[0]),
+        "faces": int(baseline_mesh.faces.shape[0]),
+        "active_ovoxels": int(baseline_mesh.coords.shape[0]),
+        "shape_latent_tokens": int(shape_latent.feats.shape[0]),
+        "texture_latent_tokens": int(texture_latent.feats.shape[0]),
+        "render": baseline_render,
     }
     _atomic_json(baseline_dir / "summary.json", baseline_summary)
-    baseline_render_path = Path(str(baseline_metric["render_png"]))
-
-    del baseline_meshes, baseline_mesh
-    del global_texture_norm, global_texture_denorm
-    del global_shape
+    if args.save_mesh_checkpoints:
+        torch.save(baseline_mesh, baseline_dir / "mesh_with_ovoxel.pt")
+    del baseline_output, baseline_live, baseline_latents
+    del shape_latent, texture_latent
     _empty_cuda_cache()
 
-    q_global1024 = _endpoint_indices_to_q(
-        coords1024[:, 1:4],
-        GRID_GLOBAL_UPSAMPLED,
-    ).to(coords1024.device)
-    _, _, uv_global1024_4096, _, finite_global1024 = (
-        _project_global_q_to_1024_and_4096(
-            q_global1024,
-            global_camera=global_camera,
+    print("[global-analysis] projecting decoded O-Voxel cell centers and faces")
+    global_ovoxel_object = _ovoxel_indices_to_object(
+        baseline_mesh.coords,
+        origin=baseline_mesh.origin,
+        voxel_size=baseline_mesh.voxel_size,
+    )
+    global_ovoxel_q = global_ovoxel_object * (
+        2.0 * float(global_camera["mesh_scale"])
+    )
+    global_ovoxel_uv, _, global_ovoxel_finite = (
+        _project_global_q_to_4096(
+            global_ovoxel_q, global_camera=global_camera
         )
     )
-    if not bool(finite_global1024.any().item()):
-        raise RuntimeError("dense global C1024 support has no finite projection")
-
-    q_global64 = _endpoint_indices_to_q(
-        global_coords64[:, 1:4],
-        GRID_SHAPE_1024,
-    ).to(global_coords64.device)
-    _, _, uv_global64_4096, _, finite_global64 = (
-        _project_global_q_to_1024_and_4096(
-            q_global64,
-            global_camera=global_camera,
-        )
-    )
-    dense_support_overlay_path = prior_dir / "all_dense_global_c1024_support.png"
-    return_domain_overlay_path = prior_dir / "all_return_domain_global_c64_support.png"
-    _draw_uv_points(
+    _save_projection_overlay(
         image_4096,
-        uv_global1024_4096[finite_global1024],
-        q_global1024[:, 2][finite_global1024],
-        dense_support_overlay_path,
-        "dense global C1024 support used to construct every tile",
+        global_ovoxel_uv[global_ovoxel_finite],
+        output_dir / "global_baseline_1024" / "ovoxel_projection_4096.png",
+        "ordinary global-1024 decoder O-Voxel cell centers",
     )
-    _draw_uv_points(
-        image_4096,
-        uv_global64_4096[finite_global64],
-        q_global64[:, 2][finite_global64],
-        return_domain_overlay_path,
-        "global C64 domain used only after local SLAT return",
-    )
-    _atomic_json(
-        prior_dir / "summary.json",
-        {
-            "one_step_upsample": upsample_stats,
-            "c1024_to_global_c64_return_domain": global_c64_stats,
-            "dense_global_c1024_support_overlay": str(dense_support_overlay_path),
-            "return_domain_global_c64_support_overlay": str(return_domain_overlay_path),
-            "finite_projected_global_c1024_rows": int(finite_global1024.sum().item()),
-            "finite_projected_return_domain_global_c64_rows": int(finite_global64.sum().item()),
-        },
+    global_face_uv, global_face_finite = _project_face_centers(
+        baseline_mesh.vertices,
+        baseline_mesh.faces,
+        mesh_scale=float(global_camera["mesh_scale"]),
+        global_camera=global_camera,
+        chunk_size=int(args.face_projection_chunk_size),
     )
 
-    boxes = _tile_layout(
-        IMAGE_CANONICAL,
-        int(args.tile_size),
-        int(args.tile_stride),
-    )
-    selected_ids = _parse_tile_ids(args.tile_ids)
-    if selected_ids is not None:
-        invalid_ids = sorted(
-            tile_id
-            for tile_id in selected_ids
-            if tile_id >= len(boxes) or tile_id < 0
-        )
-        if invalid_ids:
-            raise ValueError(
-                f"invalid tile ids: {invalid_ids}; valid range is 0-{len(boxes)-1}"
-            )
+    print(f"[encoder] loading shape encoder: {args.shape_encoder}")
+    shape_encoder = pixal3d_models.from_pretrained(
+        str(Path(args.shape_encoder).expanduser())
+    ).eval()
+    print(f"[encoder] loading PBR encoder: {args.pbr_encoder}")
+    pbr_encoder = pixal3d_models.from_pretrained(
+        str(Path(args.pbr_encoder).expanduser())
+    ).eval()
+    if not args.low_vram:
+        shape_encoder.to(device)
+        pbr_encoder.to(device)
 
-    candidate_global_coords: List[torch.Tensor] = []
-    candidate_shape_feats: List[torch.Tensor] = []
-    candidate_texture_feats: List[torch.Tensor] = []
-    candidate_distances: List[torch.Tensor] = []
-    candidate_tile_ids: List[torch.Tensor] = []
-    records: List[Dict[str, Any]] = []
-    tile_local_decode_payloads: List[TileLocalDecodePayload] = []
-    attempted = 0
+    boxes = _tile_layout()
+    requested_ids = _parse_tile_ids(args.tile_ids)
+    if requested_ids is not None:
+        invalid = sorted(tile_id for tile_id in requested_ids if tile_id not in range(49))
+        if invalid:
+            raise ValueError(f"invalid tile ids {invalid}; valid ids are 0..48")
 
+    tile_records: List[Dict[str, Any]] = []
+    reconstructed_tiles = 0
     for tile_id, box in enumerate(boxes):
-        if selected_ids is not None and tile_id not in selected_ids:
+        if requested_ids is not None and tile_id not in requested_ids:
             continue
-        if args.max_tiles is not None and attempted >= int(args.max_tiles):
-            break
-        attempted += 1
-
-        tile_dir = output_dir / "tiles" / f"tile_{tile_id:02d}"
-        reference_tile = _prepare_tile_reference(image_4096, box, tile_dir)
-        rows = _rows_inside_tile(uv_global1024_4096, finite_global1024, box)
         transform = _derive_tile_camera(
             tile_id=tile_id,
             box=box,
             global_camera=global_camera,
             extend_pixel=int(args.extend_pixel),
-            offaxis_shift_y_sign=int(args.offaxis_shift_y_sign),
         )
-        tile_camera = {
-            "camera_angle_x": float(transform.camera_angle_x),
-            "distance": float(transform.distance),
-            "mesh_scale": float(transform.mesh_scale),
-        }
+        projected_count = int(
+            _inside_tile(
+                global_ovoxel_uv, global_ovoxel_finite, box
+            ).sum().item()
+        )
+        tile_dir = output_dir / "tiles" / f"tile_{tile_id:02d}"
+        tile_dir.mkdir(parents=True, exist_ok=True)
+        image_4096.crop(box).save(tile_dir / "tile_reference.png")
         _atomic_json(tile_dir / "tile_camera.json", asdict(transform))
         print(
-            f"[tile {tile_id:02d}] selected global C1024={rows.numel():,} "
-            f"box={box} centered_fov={math.degrees(transform.camera_angle_x):.6f}deg"
+            f"[tile {tile_id:02d}] projected_global_ovoxels={projected_count:,} "
+            f"box={box}"
         )
-
-        if rows.numel() == 0:
+        if projected_count < int(args.min_tile_ovoxels):
             record = {
                 "status": "skipped",
-                "tile_id": int(tile_id),
+                "tile_id": tile_id,
                 "box": list(box),
-                "reason": "no dense global C1024 projection inside tile",
-                "selected_global_c1024_rows": 0,
-                "kept_source_global_c1024_rows": 0,
-                "unique_local_c64_tokens": 0,
-                "returned_candidate_rows": 0,
+                "projected_global_ovoxels": projected_count,
+                "reason": (
+                    f"requires at least {int(args.min_tile_ovoxels)} projected "
+                    "global O-Voxels"
+                ),
             }
-            records.append(record)
+            tile_records.append(record)
             _atomic_json(tile_dir / "summary.json", record)
             continue
+        if args.max_tiles is not None and reconstructed_tiles >= int(args.max_tiles):
+            break
+        reconstructed_tiles += 1
 
-        selected_global_coords1024 = coords1024.index_select(0, rows)
-        selected_global_uv_4096 = uv_global1024_4096.index_select(0, rows)
-        support_dir = tile_dir / "global_c1024_direct_to_local_c64_support"
+        tile_started = time.perf_counter()
         try:
-            mapping = _prepare_global_c1024_tile_mapping(
-                reference=reference_tile,
-                selected_global_coords1024=selected_global_coords1024,
-                selected_global_uv_4096=selected_global_uv_4096,
+            mapping = _map_global_ovoxels_to_local(
+                global_mesh=baseline_mesh,
+                global_q=global_ovoxel_q,
+                global_uv_4096=global_ovoxel_uv,
+                finite_projection=global_ovoxel_finite,
                 global_camera=global_camera,
                 transform=transform,
-                output_dir=support_dir,
-                boundary_epsilon=float(args.boundary_epsilon),
             )
-        except Exception as exc:
-            record = {
-                "status": "failed",
-                "tile_id": int(tile_id),
-                "box": list(box),
-                "reason": f"support mapping failed: {type(exc).__name__}: {exc}",
-                "selected_global_c1024_rows": int(rows.numel()),
-                "kept_source_global_c1024_rows": 0,
-                "unique_local_c64_tokens": 0,
-                "returned_candidate_rows": 0,
-            }
-            records.append(record)
-            _atomic_json(tile_dir / "summary.json", record)
-            print(f"[tile-map-error] tile={tile_id:02d}: {record['reason']}")
-            _empty_cuda_cache()
-            continue
-
-        local_tokens = int(mapping.local_coords64.shape[0])
-        outside_fraction = float(mapping.stats["hard_outside_fraction"])
-        if local_tokens < int(args.min_tile_tokens):
-            record = {
-                "status": "skipped",
-                "tile_id": int(tile_id),
-                "box": list(box),
-                "reason": "unique local C64 below min_tile_tokens",
-                "selected_global_c1024_rows": int(rows.numel()),
-                "kept_source_global_c1024_rows": int(
-                    mapping.source_global_coords1024.shape[0]
-                ),
-                "unique_local_c64_tokens": local_tokens,
-                "returned_candidate_rows": 0,
-                "hard_outside_fraction": outside_fraction,
-            }
-            records.append(record)
-            _atomic_json(tile_dir / "summary.json", record)
-            del mapping
-            _empty_cuda_cache()
-            continue
-        if outside_fraction > float(args.max_outside_fraction):
-            record = {
-                "status": "failed",
-                "tile_id": int(tile_id),
-                "box": list(box),
-                "reason": (
-                    f"hard outside fraction {outside_fraction:.6f} exceeds "
-                    f"{float(args.max_outside_fraction):.6f}"
-                ),
-                "selected_global_c1024_rows": int(rows.numel()),
-                "kept_source_global_c1024_rows": int(
-                    mapping.source_global_coords1024.shape[0]
-                ),
-                "unique_local_c64_tokens": local_tokens,
-                "returned_candidate_rows": 0,
-                "hard_outside_fraction": outside_fraction,
-            }
-            records.append(record)
-            _atomic_json(tile_dir / "summary.json", record)
-            del mapping
-            _empty_cuda_cache()
-            continue
-        if local_tokens > int(args.max_num_tokens):
-            raise RuntimeError(
-                f"tile {tile_id:02d} local C64 has {local_tokens:,} tokens; "
-                f"exceeds --max-num-tokens={int(args.max_num_tokens):,}"
-            )
-
-        seed_tile = int(args.seed) + tile_id * 1000 + 1
-        try:
-            result = _run_tile_projected_c64_only(
-                pipeline=pipeline,
-                tile_image=reference_tile,
-                projected_coords64=mapping.local_coords64,
-                tile_camera=tile_camera,
-                params=params,
-                seed=seed_tile,
-                label=f"Tile {tile_id:02d} global-C1024-direct-local-C64",
-                max_tokens=int(args.max_num_tokens),
-            )
-            expected_local_coords = mapping.local_coords64.to(
-                device=result.shape_denorm.coords.device,
-                dtype=torch.int32,
-            )
-            if not torch.equal(result.shape_denorm.coords, expected_local_coords):
-                raise RuntimeError("tile shape SLAT coordinate order changed")
-            if not torch.equal(result.texture_denorm.coords, expected_local_coords):
-                raise RuntimeError("tile texture SLAT coordinates changed")
-
-            source_to_local = mapping.source_to_local_index.to(
-                device=result.shape_denorm.feats.device,
-                dtype=torch.long,
-            )
-            returned_shape = result.shape_denorm.feats.index_select(
-                0,
-                source_to_local,
-            )
-            returned_texture = result.texture_denorm.feats.index_select(
-                0,
-                source_to_local,
-            )
-            returned_rows = int(mapping.source_global_coords1024.shape[0])
-            if returned_shape.shape[0] != returned_rows:
-                raise RuntimeError("returned shape candidate rows do not align")
-            if returned_texture.shape[0] != returned_rows:
-                raise RuntimeError("returned texture candidate rows do not align")
-
-            candidate_global_coords.append(
-                mapping.source_global_coords64.detach().cpu().to(torch.int32)
-            )
-            candidate_shape_feats.append(returned_shape.detach().cpu())
-            candidate_texture_feats.append(returned_texture.detach().cpu())
-            candidate_distances.append(
-                mapping.tile_center_distance_pixels.detach().cpu().to(torch.float32)
-            )
-            candidate_tile_ids.append(
-                torch.full(
-                    (returned_rows,),
-                    int(tile_id),
-                    dtype=torch.int32,
+            if mapping.local_coords.shape[0] == 0:
+                raise RuntimeError("global-to-local mapping produced no O-Voxel")
+            if (
+                mapping.stats["global_local_global_q_max_abs_error"]
+                > float(args.roundtrip_tolerance)
+            ):
+                raise RuntimeError(
+                    "global/local camera round-trip exceeded tolerance: "
+                    f"{mapping.stats['global_local_global_q_max_abs_error']:.3e}"
                 )
+            selected_uv = global_ovoxel_uv.index_select(
+                0, mapping.source_global_rows
+            )
+            selected_tile_uv = torch.stack(
+                (
+                    selected_uv[:, 0] - float(box[0]),
+                    selected_uv[:, 1] - float(box[1]),
+                ),
+                dim=1,
+            )
+            selected_global_q = global_ovoxel_q.index_select(
+                0, mapping.source_global_rows
+            )
+            selected_global_depth = float(global_camera["distance"]) - (
+                selected_global_q[:, 2]
+                / (2.0 * float(global_camera["mesh_scale"]))
             )
 
-            local_slat_path = tile_dir / "local_shape_texture_slat.pt"
-            torch.save(
-                {
-                    "tile_id": int(tile_id),
-                    "tile_camera": asdict(transform),
-                    "local_coords64": result.shape_denorm.coords.detach().cpu(),
-                    "local_shape_denorm_feats": result.shape_denorm.feats.detach().cpu(),
-                    "local_texture_denorm_feats": result.texture_denorm.feats.detach().cpu(),
-                    "source_global_coords1024": mapping.source_global_coords1024.detach().cpu(),
-                    "source_global_coords64_return": mapping.source_global_coords64.detach().cpu(),
-                    "source_to_local_index": mapping.source_to_local_index.detach().cpu(),
-                    "tile_center_distance_pixels": mapping.tile_center_distance_pixels.detach().cpu(),
-                },
-                local_slat_path,
+            (
+                local_geometry_vertices,
+                local_geometry_faces,
+                reference_vertices,
+                reference_faces,
+                geometry_stats,
+            ) = _prepare_tile_geometry(
+                global_vertices=baseline_mesh.vertices,
+                global_faces=baseline_mesh.faces,
+                global_face_uv=global_face_uv,
+                global_face_finite=global_face_finite,
+                global_camera=global_camera,
+                transform=transform,
             )
-            tile_local_decode_payloads.append(
-                TileLocalDecodePayload(
-                    tile_id=int(tile_id),
-                    transform=transform,
-                    local_coords64=result.shape_denorm.coords.detach().cpu().to(torch.int32),
-                    local_shape_denorm_feats=result.shape_denorm.feats.detach().cpu(),
-                    local_texture_denorm_feats=result.texture_denorm.feats.detach().cpu(),
+            reference_mesh = _make_reference_tile_mesh(
+                vertices=reference_vertices,
+                faces=reference_faces,
+                mapping=mapping,
+                global_mesh=baseline_mesh,
+            )
+
+            shape_z, shape_encoder_stats = _encode_local_shape(
+                encoder=shape_encoder,
+                vertices=local_geometry_vertices,
+                faces=local_geometry_faces,
+                device=device,
+                low_vram=bool(args.low_vram),
+            )
+            pbr_z, pbr_encoder_stats = _encode_local_pbr(
+                encoder=pbr_encoder,
+                coords=mapping.local_coords,
+                attrs=mapping.local_attrs,
+                device=device,
+                low_vram=bool(args.low_vram),
+            )
+            shape_z, pbr_z, alignment_stats = _align_latent_supports(
+                shape_z, pbr_z
+            )
+            visualization_stats = _save_selected_ovoxel_visualizations(
+                tile_image=image_4096.crop(box),
+                ovoxel_uv=selected_tile_uv,
+                ovoxel_depth=selected_global_depth,
+                output_dir=tile_dir,
+                tile_id=tile_id,
+                latent_coords=shape_z.coords,
+                transform=transform,
+            )
+            if shape_z.feats.shape[0] > int(args.max_num_tokens):
+                raise RuntimeError(
+                    f"common local latent has {shape_z.feats.shape[0]:,} tokens, "
+                    f"exceeding --max-num-tokens={int(args.max_num_tokens):,}"
                 )
+
+            decode_started = time.perf_counter()
+            with torch.no_grad():
+                decoded = pipeline.decode_latent(
+                    shape_z,
+                    pbr_z,
+                    OVOXEL_RESOLUTION,
+                )
+            _sync_cuda()
+            decode_seconds = time.perf_counter() - decode_started
+            if len(decoded) != 1:
+                raise RuntimeError(
+                    f"local latent decoder returned {len(decoded)} meshes"
+                )
+            local_decoded = _validate_mesh(
+                decoded[0], f"tile {tile_id:02d} local encoded reconstruction"
             )
+            returned_mesh, return_stats = _return_decoded_mesh_to_global(
+                local_mesh=local_decoded,
+                global_template=baseline_mesh,
+                global_camera=global_camera,
+                transform=transform,
+                face_chunk_size=int(args.face_projection_chunk_size),
+            )
+
+            surface_metrics = _mesh_surface_similarity(
+                reference_mesh,
+                returned_mesh,
+                samples=int(args.surface_samples),
+                chunk_size=int(args.nearest_chunk_size),
+                seed=int(args.seed) + tile_id * 100,
+                device=device,
+            )
+            ov_stats = _ovoxel_support_similarity(
+                reference_mesh.coords, returned_mesh.coords
+            )
+
+            render_stats: Optional[Dict[str, Any]] = None
+            if args.render:
+                reference_render = _render(
+                    reference_mesh,
+                    output_dir=tile_dir / "reference_global_part_render",
+                    camera=global_camera,
+                    reference_image=None,
+                    args=args,
+                    envmap=envmap,
+                )
+                reconstruction_render = _render(
+                    returned_mesh,
+                    output_dir=tile_dir / "reconstructed_returned_global_render",
+                    camera=global_camera,
+                    reference_image=None,
+                    args=args,
+                    envmap=envmap,
+                )
+                crop_metrics = _tile_crop_render_metrics(
+                    reference_render=Path(reference_render["render_png"]),
+                    prediction_render=Path(reconstruction_render["render_png"]),
+                    box=box,
+                    output_dir=tile_dir / "tile_render_comparison",
+                    metric_resolution=int(args.metric_resolution),
+                )
+                render_stats = {
+                    "reference": reference_render,
+                    "reconstruction": reconstruction_render,
+                    **crop_metrics,
+                }
+
+            if args.save_mesh_checkpoints:
+                torch.save(
+                    {
+                        "local_coords": mapping.local_coords,
+                        "local_attrs": mapping.local_attrs,
+                        "source_global_rows": mapping.source_global_rows,
+                        "shape_latent": shape_z.to("cpu"),
+                        "pbr_latent": pbr_z.to("cpu"),
+                    },
+                    tile_dir / "local_ovoxel_and_latents.pt",
+                )
+                torch.save(reference_mesh, tile_dir / "reference_global_part_mesh.pt")
+                torch.save(returned_mesh, tile_dir / "returned_global_mesh.pt")
 
             record = {
                 "status": "success",
-                "tile_id": int(tile_id),
+                "tile_id": tile_id,
                 "box": list(box),
-                "selected_global_c1024_rows": int(rows.numel()),
-                "kept_source_global_c1024_rows": returned_rows,
-                "unique_return_global_c64_tokens": int(
-                    torch.unique(mapping.source_global_coords64, dim=0).shape[0]
-                ),
-                "unique_local_c64_tokens": local_tokens,
-                "source_rows_merged_by_local_quantization": int(
-                    mapping.stats["source_rows_merged_by_local_quantization"]
-                ),
-                "returned_candidate_rows": returned_rows,
-                "hard_outside_fraction": outside_fraction,
-                "tile_center_distance_pixels_mean": mapping.stats[
-                    "tile_center_distance_pixels_mean"
-                ],
-                "quantization_pixel_error_mean": mapping.stats[
-                    "quantization_pixel_error_mean"
-                ],
-                "shape1024_seconds": float(result.shape1024_seconds),
-                "texture1024_seconds": float(result.texture1024_seconds),
-                "complete_local_decode_deferred": True,
-                "slat_returned_to_global": True,
-                "local_slat_pt": str(local_slat_path),
-                "support_overlay_png": str(
-                    support_dir / "local_c64_support_overlay.png"
-                ),
+                "tile_seconds": float(time.perf_counter() - tile_started),
+                "decode_seconds": float(decode_seconds),
+                "mapping": mapping.stats,
+                "geometry_input": geometry_stats,
+                "shape_encoder": shape_encoder_stats,
+                "pbr_encoder": pbr_encoder_stats,
+                "latent_alignment": alignment_stats,
+                "visualizations": visualization_stats,
+                "returned_mesh": return_stats,
+                "surface_similarity": surface_metrics,
+                "ovoxel_support_similarity": ov_stats,
+                "render_similarity": render_stats,
             }
-            records.append(record)
+            tile_records.append(record)
             _atomic_json(tile_dir / "summary.json", record)
             print(
-                f"[tile-return] tile={tile_id:02d} local_C64={local_tokens:,} "
-                f"C1024_source_candidates={returned_rows:,}"
+                f"[tile {tile_id:02d}] success "
+                f"common_C64={alignment_stats['common_latent_tokens']:,} "
+                f"chamfer={surface_metrics['chamfer_l1_in_global_voxels']:.4f}vox "
+                f"F@2={surface_metrics['fscore_at_2_global_voxels']:.4f} "
+                f"O-IoU={ov_stats['global_ovoxel_iou']:.4f}"
             )
-            result.shape_norm = None  # type: ignore[assignment]
-            result.shape_denorm = None  # type: ignore[assignment]
-            result.texture_norm = None  # type: ignore[assignment]
-            result.texture_denorm = None  # type: ignore[assignment]
-            del returned_shape, returned_texture, source_to_local, result, mapping
+            del (
+                mapping,
+                reference_mesh,
+                returned_mesh,
+                local_decoded,
+                decoded,
+                shape_z,
+                pbr_z,
+            )
             _empty_cuda_cache()
         except Exception as exc:
             record = {
                 "status": "failed",
-                "tile_id": int(tile_id),
+                "tile_id": tile_id,
                 "box": list(box),
-                "reason": f"tile flow/return failed: {type(exc).__name__}: {exc}",
-                "selected_global_c1024_rows": int(rows.numel()),
-                "kept_source_global_c1024_rows": int(
-                    mapping.source_global_coords1024.shape[0]
-                ),
-                "unique_local_c64_tokens": local_tokens,
-                "returned_candidate_rows": 0,
-                "hard_outside_fraction": outside_fraction,
+                "projected_global_ovoxels": projected_count,
+                "tile_seconds": float(time.perf_counter() - tile_started),
+                "reason": f"{type(exc).__name__}: {exc}",
             }
-            records.append(record)
+            tile_records.append(record)
             _atomic_json(tile_dir / "summary.json", record)
-            print(f"[tile-flow-error] tile={tile_id:02d}: {record['reason']}")
-            del mapping
+            print(f"[tile {tile_id:02d}] FAILED: {record['reason']}")
             _empty_cuda_cache()
 
-    successful_records = [row for row in records if row.get("status") == "success"]
-    if not candidate_global_coords:
-        raise RuntimeError("no successful tile returned SLAT candidates")
-
-    all_candidate_coords = torch.cat(candidate_global_coords, dim=0)
-    all_candidate_shape = torch.cat(candidate_shape_feats, dim=0)
-    all_candidate_texture = torch.cat(candidate_texture_feats, dim=0)
-    all_candidate_distance = torch.cat(candidate_distances, dim=0)
-    all_candidate_tile_ids = torch.cat(candidate_tile_ids, dim=0)
-
-    (
-        merged_coords64_cpu,
-        merged_shape_feats_cpu,
-        merged_texture_feats_cpu,
-        selected_distances_cpu,
-        selected_tile_ids_cpu,
-        selection_stats,
-    ) = _select_closest_tile_candidate_per_global_token(
-        global_coords=all_candidate_coords,
-        shape_feats=all_candidate_shape,
-        texture_feats=all_candidate_texture,
-        distances=all_candidate_distance,
-        tile_ids=all_candidate_tile_ids,
-    )
-    total_global_c64 = int(global_coords64.shape[0])
-    covered_global_c64 = int(merged_coords64_cpu.shape[0])
-    uncovered_global_c64 = int(total_global_c64 - covered_global_c64)
-    coverage_fraction = float(covered_global_c64 / max(total_global_c64, 1))
-    print(
-        f"[global-slat-merge] source_candidates={all_candidate_coords.shape[0]:,} "
-        f"kept_global_C64={covered_global_c64:,} coverage={coverage_fraction:.6f}"
-    )
-
-    merge_dir = output_dir / "merged_global_tile_slat"
-    merge_dir.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "coords64_global": merged_coords64_cpu,
-            "shape_denorm_feats": merged_shape_feats_cpu,
-            "texture_denorm_feats": merged_texture_feats_cpu,
-            "selected_tile_ids": selected_tile_ids_cpu,
-            "selected_tile_center_distance_pixels": selected_distances_cpu,
-            "selection_stats": selection_stats,
-            "coverage": {
-                "all_return_domain_global_c64_tokens": total_global_c64,
-                "covered_global_c64_tokens": covered_global_c64,
-                "uncovered_global_c64_tokens_discarded": uncovered_global_c64,
-                "coverage_fraction": coverage_fraction,
-            },
-        },
-        merge_dir / "merged_global_slat.pt",
-    )
-
-    merged_coords64 = merged_coords64_cpu.to(
-        device=pipeline.device,
-        dtype=torch.int32,
-    )
-    merged_shape = SparseTensor(
-        feats=merged_shape_feats_cpu.to(pipeline.device),
-        coords=merged_coords64,
-    )
-    merged_texture = SparseTensor(
-        feats=merged_texture_feats_cpu.to(pipeline.device),
-        coords=merged_coords64,
-    )
-    merged_meshes, merged_mesh = _decode_normal_mesh_with_ovoxel(
-        pipeline=pipeline,
-        shape_latent=merged_shape,
-        texture_latent=merged_texture,
-        label="Merged tile SLAT returned to global C64",
-    )
-    merged_decoder_metadata = {
-        "decoder_vertices": int(merged_mesh.vertices.shape[0]),
-        "decoder_faces": int(merged_mesh.faces.shape[0]),
-        "active_voxels": int(merged_mesh.coords.shape[0]),
-        "sample_type": type(merged_mesh).__name__,
-        "renderer": "pixal3d.utils.render_utils.render_frames",
-    }
-    del merged_shape, merged_texture
+    del shape_encoder, pbr_encoder
     _empty_cuda_cache()
+    success_rows = [row for row in tile_records if row["status"] == "success"]
+    failed_rows = [row for row in tile_records if row["status"] == "failed"]
+    skipped_rows = [row for row in tile_records if row["status"] == "skipped"]
+    aggregate: Dict[str, Any] = {}
+    if success_rows:
+        aggregate = {
+            "mean_chamfer_l1_in_global_voxels": float(
+                np.mean(
+                    [
+                        row["surface_similarity"][
+                            "chamfer_l1_in_global_voxels"
+                        ]
+                        for row in success_rows
+                    ]
+                )
+            ),
+            "mean_fscore_at_2_global_voxels": float(
+                np.mean(
+                    [
+                        row["surface_similarity"][
+                            "fscore_at_2_global_voxels"
+                        ]
+                        for row in success_rows
+                    ]
+                )
+            ),
+            "mean_global_ovoxel_iou": float(
+                np.mean(
+                    [
+                        row["ovoxel_support_similarity"]["global_ovoxel_iou"]
+                        for row in success_rows
+                    ]
+                )
+            ),
+            "mean_tile_render_psnr_db": (
+                None
+                if not args.render
+                else float(
+                    np.mean(
+                        [
+                            row["render_similarity"]["tile_render_psnr_db"]
+                            for row in success_rows
+                        ]
+                    )
+                )
+            ),
+            "mean_tile_render_ssim": (
+                None
+                if not args.render
+                else float(
+                    np.mean(
+                        [
+                            row["render_similarity"]["tile_render_ssim"]
+                            for row in success_rows
+                        ]
+                    )
+                )
+            ),
+        }
 
-    merged_metric = render_and_evaluate_mesh(
-        merged_mesh,
-        camera_angle_x=float(global_camera["camera_angle_x"]),
-        distance=float(global_camera["distance"]),
-        output_dir=merge_dir / "aligned_eval",
-        reference_image=output_dir / "canonical_1024.png",
-        resolution=int(args.render_resolution),
-        metric_resolution=int(args.metric_resolution),
-        envmap=envmap,
-        envmap_name=str(args.envmap),
-        ssaa=int(args.render_ssaa),
-        peel_layers=int(args.render_peel_layers),
-        use_envmap_bg=bool(args.use_envmap_bg),
-        lpips_net=str(args.lpips_net),
-        metric_device=str(args.metric_device),
-        skip_lpips=bool(args.skip_lpips),
-    )
-    merged_extras = _save_extra_comparisons(
-        Path(str(merged_metric["original_png"])),
-        Path(str(merged_metric["render_png"])),
-        merge_dir / "comparisons",
-    )
-    del merged_meshes, merged_mesh
-    _empty_cuda_cache()
-
-    merged_q_global = _endpoint_indices_to_q(
-        merged_coords64_cpu[:, 1:4],
-        GRID_SHAPE_1024,
-    ).to(pipeline.device)
-    _, _, merged_uv_4096, _, merged_finite = _project_global_q_to_1024_and_4096(
-        merged_q_global,
-        global_camera=global_camera,
-    )
-    covered_support_overlay_path = merge_dir / "covered_global_c64_support.png"
-    _draw_uv_points(
-        image_4096,
-        merged_uv_4096[merged_finite],
-        merged_q_global[:, 2][merged_finite],
-        covered_support_overlay_path,
-        "global C64 tokens carrying returned local shape/texture SLAT",
-    )
-
-    baseline_psnr = baseline_metric.get("psnr_db")
-    baseline_ssim = baseline_metric.get("ssim")
-    baseline_lpips = baseline_metric.get("lpips")
-    merged_psnr = merged_metric.get("psnr_db")
-    merged_ssim = merged_metric.get("ssim")
-    merged_lpips = merged_metric.get("lpips")
-    metric_gains = {
-        "psnr_gain_db": (
-            None
-            if baseline_psnr is None or merged_psnr is None
-            else float(merged_psnr) - float(baseline_psnr)
-        ),
-        "ssim_gain": (
-            None
-            if baseline_ssim is None or merged_ssim is None
-            else float(merged_ssim) - float(baseline_ssim)
-        ),
-        "lpips_reduction": (
-            None
-            if baseline_lpips is None or merged_lpips is None
-            else float(baseline_lpips) - float(merged_lpips)
-        ),
-    }
-
-    comparison_path = output_dir / "comparison_global_baseline_vs_merged_tile_slat.png"
-    _save_global_merge_comparison_sheet(
-        reference_path=output_dir / "canonical_1024.png",
-        baseline_render_path=baseline_render_path,
-        merged_render_path=Path(str(merged_metric["render_png"])),
-        covered_support_overlay_path=covered_support_overlay_path,
-        baseline_diff_path=Path(str(baseline_extras["diff_heatmap_png"])),
-        merged_diff_path=Path(str(merged_extras["diff_heatmap_png"])),
-        baseline_metrics=baseline_metric,
-        merged_metrics=merged_metric,
-        coverage_fraction=coverage_fraction,
-        output_path=comparison_path,
-    )
-
-    merged_summary = {
-        **merged_decoder_metadata,
-        **merged_metric,
-        **merged_extras,
-        **metric_gains,
-        "route": (
-            "global C1024 direct transform to each local C64 -> local shape/texture "
-            "flow -> gather features to source C1024 -> return-time global C64 "
-            "quantization -> closest-center candidate -> one global decode"
-        ),
-        "candidate_selection": selection_stats,
-        "all_return_domain_global_c64_tokens": total_global_c64,
-        "covered_global_c64_tokens": covered_global_c64,
-        "uncovered_global_c64_tokens_discarded": uncovered_global_c64,
-        "coverage_fraction": coverage_fraction,
-        "covered_support_overlay_png": str(covered_support_overlay_path),
-        "merged_global_slat_pt": str(merge_dir / "merged_global_slat.pt"),
-        "comparison_png": str(comparison_path),
-    }
-    _atomic_json(merge_dir / "summary.json", merged_summary)
-
-    local_decode_merge_dir = output_dir / "merged_complete_local_tile_decodes"
-    local_decode_merge_dir.mkdir(parents=True, exist_ok=True)
-    (
-        local_decoded_merged_mesh,
-        local_decode_tile_rows,
-        local_decode_merge_stats,
-    ) = _decode_full_tile_payloads_and_merge_to_global(
-        pipeline=pipeline,
-        payloads=tile_local_decode_payloads,
-        global_camera=global_camera,
-        template_voxel_shape=baseline_decoder_grid["voxel_shape"],
-        canonical_voxel_resolution=int(
-            args.local_decode_canonical_voxel_resolution
-        ),
-        vertex_weld_tolerance=float(args.vertex_weld_tolerance),
-        face_projection_chunk_size=int(args.face_projection_chunk_size),
-        tile_stride=int(args.tile_stride),
-        ovoxel_ownership_halo_pixels=int(args.ovoxel_ownership_halo_pixels),
-    )
-    local_decode_pre_render = {
-        **local_decode_merge_stats,
-        "render_face_chunk_size": int(
-            args.local_decode_render_face_chunk_size
-        ),
-        "tile_decodes": local_decode_tile_rows,
-    }
-    _atomic_json(
-        local_decode_merge_dir / "merge_stats_pre_render.json",
-        local_decode_pre_render,
-    )
-    local_decode_face_count = int(local_decoded_merged_mesh.faces.shape[0])
-    local_decode_face_chunk_size = int(
-        args.local_decode_render_face_chunk_size
-    )
-    local_decode_render_chunks = (
-        1
-        if local_decode_face_chunk_size <= 0
-        else (
-            local_decode_face_count + local_decode_face_chunk_size - 1
-        )
-        // local_decode_face_chunk_size
-    )
-    print(
-        "[local-decode-render] "
-        f"vertices={int(local_decoded_merged_mesh.vertices.shape[0]):,} "
-        f"faces={local_decode_face_count:,} "
-        f"face_chunk_size={local_decode_face_chunk_size:,} "
-        f"chunks={local_decode_render_chunks:,}"
-    )
-    local_decode_metric = render_and_evaluate_mesh(
-        local_decoded_merged_mesh,
-        camera_angle_x=float(global_camera["camera_angle_x"]),
-        distance=float(global_camera["distance"]),
-        output_dir=local_decode_merge_dir / "aligned_eval",
-        reference_image=output_dir / "canonical_1024.png",
-        resolution=int(args.render_resolution),
-        metric_resolution=int(args.metric_resolution),
-        envmap=envmap,
-        envmap_name=str(args.envmap),
-        ssaa=int(args.render_ssaa),
-        peel_layers=int(args.render_peel_layers),
-        face_chunk_size=local_decode_face_chunk_size,
-        use_envmap_bg=bool(args.use_envmap_bg),
-        lpips_net=str(args.lpips_net),
-        metric_device=str(args.metric_device),
-        skip_lpips=bool(args.skip_lpips),
-    )
-    local_decode_extras = _save_extra_comparisons(
-        Path(str(local_decode_metric["original_png"])),
-        Path(str(local_decode_metric["render_png"])),
-        local_decode_merge_dir / "comparisons",
-    )
-    del local_decoded_merged_mesh
-    _empty_cuda_cache()
-
-    local_decode_metric_gains = {
-        "psnr_gain_db": (
-            None
-            if baseline_psnr is None or local_decode_metric.get("psnr_db") is None
-            else float(local_decode_metric["psnr_db"]) - float(baseline_psnr)
-        ),
-        "ssim_gain": (
-            None
-            if baseline_ssim is None or local_decode_metric.get("ssim") is None
-            else float(local_decode_metric["ssim"]) - float(baseline_ssim)
-        ),
-        "lpips_reduction": (
-            None
-            if baseline_lpips is None or local_decode_metric.get("lpips") is None
-            else float(baseline_lpips) - float(local_decode_metric["lpips"])
-        ),
-    }
-    local_decode_compare_png = (
-        output_dir / "comparison_global_baseline_vs_complete_local_decode_merge.png"
-    )
-    _save_local_decode_merge_comparison_sheet(
-        reference_path=output_dir / "canonical_1024.png",
-        baseline_render_path=baseline_render_path,
-        merged_render_path=Path(str(local_decode_metric["render_png"])),
-        covered_support_overlay_path=covered_support_overlay_path,
-        baseline_diff_path=Path(str(baseline_extras["diff_heatmap_png"])),
-        merged_diff_path=Path(str(local_decode_extras["diff_heatmap_png"])),
-        baseline_metrics=baseline_metric,
-        merged_metrics=local_decode_metric,
-        coverage_fraction=coverage_fraction,
-        output_path=local_decode_compare_png,
-    )
-    local_decode_summary = {
-        **local_decode_metric,
-        **local_decode_extras,
-        **local_decode_metric_gains,
-        **local_decode_merge_stats,
-        "route": (
-            "complete local shape/texture SLAT -> complete local decode -> "
-            "object/q inverse camera mapping -> nearest-center spatial ownership -> "
-            "global O-Voxel requantization and global-camera render"
-        ),
-        "comparison_png": str(local_decode_compare_png),
-        "covered_support_overlay_png": str(covered_support_overlay_path),
-        "tile_local_decode_rows_csv": str(
-            local_decode_merge_dir / "tile_local_decode_records.csv"
-        ),
-        "tile_local_decode_records": local_decode_tile_rows,
-    }
-    _write_csv(
-        local_decode_merge_dir / "tile_local_decode_records.csv",
-        local_decode_tile_rows,
-    )
-    _atomic_json(local_decode_merge_dir / "summary.json", local_decode_summary)
-
-    aggregate_csv = output_dir / "tile_flow_records.csv"
-    _write_csv(aggregate_csv, records)
     summary = {
-        "format": "pixal3d_c1024_direct_local_slat_and_complete_local_decode_return_global_v1",
+        "format": "pixal3d_global_1024_ovoxel_tile_encode_decode_v1",
         "image": str(Path(args.image).expanduser().resolve()),
+        "cuda_device": int(args.cuda_device),
         "global_camera": global_camera,
-        "tile_layout": {
-            "canonical_size": IMAGE_CANONICAL,
-            "tile_size": int(args.tile_size),
-            "tile_stride": int(args.tile_stride),
-            "tiles_total": len(boxes),
-            "overlap_pixels": max(0, int(args.tile_size) - int(args.tile_stride)),
-        },
-        "global_support_route": {
-            "official_global_c64_tokens": int(official_coords64.shape[0]),
-            "dense_global_c1024_tokens": int(coords1024.shape[0]),
-            "return_domain_global_c64_tokens": total_global_c64,
-            "c1024_to_global_c64_return_domain": global_c64_stats,
-            "one_step_upsample": upsample_stats,
-        },
-        "tile_route": [
-            "select dense global C1024 support by projection inside tile",
-            "recanonicalize global C1024 q to centered local camera q",
-            "quantize only after the transform to unique local C64",
-            "run complete tile shape1024 and texture1024 flows",
-            "save one complete local shape/texture SLAT per tile",
-            "gather local features back to source C1024 rows",
-            "quantize source rows to global C64 only for return/global decode",
-            "retain closest-center candidate per global C64 and decode once globally",
-            "independently decode each complete local SLAT and merge decoder outputs globally",
-        ],
-        "duplicate_policy": {
-            "feature_averaging": False,
-            "kept_candidates_per_global_token": 1,
-            "ranking": "minimum projected source-C1024 distance to tile center",
-            "tie_break": "smaller tile id, then original candidate order",
-        },
-        "local_decode_policy": {
-            "decode_complete_local_latent": True,
-            "predecode_global_winner_filtering": False,
-            "triangle_ownership": "nearest regular tile center",
-            "ovoxel_ownership_halo_pixels": int(args.ovoxel_ownership_halo_pixels),
-        },
-        "attempted_tiles": attempted,
-        "successful_tiles": len(successful_records),
-        "skipped_tiles": sum(row.get("status") == "skipped" for row in records),
-        "failed_tiles": sum(row.get("status") == "failed" for row in records),
-        "candidate_selection": selection_stats,
-        "coverage": {
-            "all_return_domain_global_c64_tokens": total_global_c64,
-            "covered_global_c64_tokens": covered_global_c64,
-            "uncovered_global_c64_tokens_discarded": uncovered_global_c64,
-            "coverage_fraction": coverage_fraction,
-        },
         "global_baseline_1024": baseline_summary,
-        "merged_global_tile_slat": merged_summary,
-        "merged_complete_local_tile_decodes": local_decode_summary,
-        "metric_gains_over_baseline": {
-            "merged_global_tile_slat": metric_gains,
-            "merged_complete_local_tile_decodes": local_decode_metric_gains,
+        "tile_policy": {
+            "canonical_image_size": CANONICAL_IMAGE_SIZE,
+            "tile_size": TILE_SIZE,
+            "tile_stride": TILE_STRIDE,
+            "minimum_projected_global_ovoxels": int(args.min_tile_ovoxels),
+            "strictly_more_than_1000_by_default": int(args.min_tile_ovoxels)
+            == 1001,
+            "global_index_to_absolute": (
+                "global_object = origin + (global_index + 0.5) * voxel_size"
+            ),
+            "global_to_local": (
+                "global_object -> global_q -> global camera projection -> "
+                "tile pixels -> local camera backprojection -> local_q"
+            ),
+            "local_quantization": (
+                "nearest local O-Voxel cell center; out-of-cube rows dropped; "
+                "no clamp"
+            ),
+            "encoder_inputs": (
+                "shape encoder: same tile-owned global mesh transformed local; "
+                "PBR encoder: transformed local O-Voxels"
+            ),
+            "decoder_input": "exact intersection of encoded shape/PBR C64 supports",
+            "return_to_global": (
+                "decoder local object -> local_q -> exact inverse camera mapping "
+                "-> global_q -> global object"
+            ),
         },
-        "comparison_png": str(comparison_path),
-        "tile_flow_records_csv": str(aggregate_csv),
-        "tiles": records,
+        "successful_tiles": len(success_rows),
+        "failed_tiles": len(failed_rows),
+        "skipped_tiles": len(skipped_rows),
+        "aggregate_similarity": aggregate,
+        "tiles": tile_records,
     }
     _atomic_json(output_dir / "summary.json", summary)
-    print(f"[summary] {output_dir / 'summary.json'}")
+    print(
+        f"[done] success={len(success_rows)} failed={len(failed_rows)} "
+        f"skipped={len(skipped_rows)} summary={output_dir / 'summary.json'}"
+    )
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -4388,92 +2287,46 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--cuda-device",
         type=int,
-        default=None,
-        help="visible CUDA device index; omitted respects the current CUDA environment",
+        default=4,
+        help="physical CUDA index; defaults to GPU 4 as requested",
+    )
+    parser.add_argument(
+        "--low-vram",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="move the large flow/encoder/decoder models on demand",
+    )
+    parser.add_argument(
+        "--shape-encoder",
+        default=str(DEFAULT_ENCODER_ROOT / "shape_enc_next_dc_f16c32_fp16"),
+    )
+    parser.add_argument(
+        "--pbr-encoder",
+        default=str(DEFAULT_ENCODER_ROOT / "tex_enc_next_dc_f16c32_fp16"),
     )
 
-    parser.add_argument("--tile-size", type=int, default=DEFAULT_TILE_SIZE)
-    parser.add_argument("--tile-stride", type=int, default=DEFAULT_TILE_STRIDE)
-    parser.add_argument(
-        "--tile-ids",
-        default=None,
-        help="comma-separated tile ids; omitted means all 49 overlapping tiles",
-    )
+    parser.add_argument("--tile-ids", default=None)
     parser.add_argument("--max-tiles", type=int, default=None)
     parser.add_argument(
-        "--min-tile-tokens",
+        "--min-tile-ovoxels",
         type=int,
-        default=1000,
-        help=(
-            "minimum unique local C64 tokens obtained after transforming "
-            "dense global C1024 support into a tile and quantizing local C64"
-        ),
+        default=1001,
+        help="minimum projected global O-Voxels; 1001 means strictly >1000",
     )
-    parser.add_argument("--max-num-tokens", type=int, default=100000000)
+    parser.add_argument("--max-num-tokens", type=int, default=1_000_000)
+    parser.add_argument("--roundtrip-tolerance", type=float, default=2e-5)
+    parser.add_argument("--face-projection-chunk-size", type=int, default=250_000)
+    parser.add_argument("--surface-samples", type=int, default=10_000)
+    parser.add_argument("--nearest-chunk-size", type=int, default=1_024)
     parser.add_argument(
-        "--local-decode-canonical-voxel-resolution",
-        type=int,
-        default=1024,
-        help=(
-            "Full canonical O-Voxel lattice resolution for merged tile-local "
-            "decoder metadata. Uses origin=-0.5 and voxel_size=1/resolution."
-        ),
-    )
-    parser.add_argument(
-        "--face-projection-chunk-size",
-        type=int,
-        default=500000,
-        help="Triangle chunk size for projected tile-ownership filtering.",
-    )
-    parser.add_argument(
-        "--ovoxel-ownership-halo-pixels",
-        type=int,
-        default=32,
-        help=(
-            "Canonical-4096 image-space halo retained around each nearest-center "
-            "triangle ownership region for O-Voxel material lookup support."
-        ),
-    )
-    parser.add_argument(
-        "--vertex-weld-tolerance",
-        type=float,
-        default=1e-6,
-        help=(
-            "Global object-space tolerance for welding near-identical vertices "
-            "after tile-owned triangle cropping; <=0 disables welding."
-        ),
-    )
-    parser.add_argument(
-        "--boundary-epsilon",
-        type=float,
-        default=1e-5,
-        help=(
-            "Separates tiny numerical overflow from hard overflow in diagnostics. "
-            "Both are dropped; neither is clipped to [-1,1]."
-        ),
-    )
-    parser.add_argument(
-        "--max-outside-fraction",
-        type=float,
-        default=0.10,
-        help=(
-            "Fail a tile if too many transformed points leave the local cube. "
-            "A small nonzero fraction is expected at perspective far-plane edges."
-        ),
-    )
-    parser.add_argument(
-        "--offaxis-shift-y-sign",
-        type=int,
-        choices=(-1, 1),
-        default=1,
-        help="Vertical sign convention for saved off-axis crop diagnostics.",
+        "--save-mesh-checkpoints",
+        action=argparse.BooleanOptionalAction,
+        default=False,
     )
 
     parser.add_argument("--fov", type=float, default=-1.0)
     parser.add_argument("--mesh-scale", type=float, default=1.0)
     parser.add_argument("--extend-pixel", type=int, default=0)
-    parser.add_argument("--camera-image-resolution", type=int, default=1024)
-
     parser.add_argument("--ss-steps", type=int, default=12)
     parser.add_argument("--ss-guidance-strength", type=float, default=7.5)
     parser.add_argument("--ss-guidance-rescale", type=float, default=0.7)
@@ -4488,88 +2341,68 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--texture-rescale-t", type=float, default=3.0)
 
     parser.add_argument(
-        "--low-vram",
+        "--render",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=True,
     )
-    parser.add_argument(
-        "--envmap",
-        default="studio",
-        help="bundled Pixal3D HDRI name (for example studio) or an EXR path",
-    )
+    parser.add_argument("--envmap", default="studio")
     parser.add_argument("--render-resolution", type=int, default=1024)
-    parser.add_argument(
-        "--baseline-render-resolution",
-        type=int,
-        default=IMAGE_CANONICAL,
-        help=(
-            "Full-frame render resolution for the ordinary global 1024 baseline. "
-            "The default 4096 makes each 1024 canonical tile crop retain 1024 "
-            "rendered pixels instead of upsampling a 256-pixel crop."
-        ),
-    )
-    parser.add_argument("--metric-resolution", type=int, default=1024)
+    parser.add_argument("--metric-resolution", type=int, default=512)
     parser.add_argument("--render-ssaa", type=int, default=2)
     parser.add_argument("--render-peel-layers", type=int, default=8)
-    parser.add_argument(
-        "--local-decode-render-face-chunk-size",
-        type=int,
-        default=4_000_000,
-        help=(
-            "Maximum faces per nvdiffrast call when rendering the merged "
-            "complete local decodes. The default stays below nvdiffrast's "
-            "fixed 2^24-subtriangle limit; zero disables chunking."
-        ),
-    )
+    parser.add_argument("--render-face-chunk-size", type=int, default=4_000_000)
     parser.add_argument(
         "--use-envmap-bg",
         action=argparse.BooleanOptionalAction,
         default=False,
-        help="Use the HDRI as the background; default keeps a black background.",
+    )
+    parser.add_argument(
+        "--skip-lpips",
+        action=argparse.BooleanOptionalAction,
+        default=True,
     )
     parser.add_argument(
         "--lpips-net",
         choices=("alex", "vgg", "squeeze"),
         default="vgg",
     )
-    parser.add_argument("--metric-device", default="cuda")
-    parser.add_argument(
-        "--skip-lpips",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-    )
     return parser
 
 
 def main() -> None:
     args = build_parser().parse_args()
-    if int(args.min_tile_tokens) < 1:
-        raise ValueError("--min-tile-tokens must be positive")
-    if int(args.max_num_tokens) < int(args.min_tile_tokens):
-        raise ValueError("--max-num-tokens must be >= --min-tile-tokens")
+    if int(args.cuda_device) < 0:
+        raise ValueError("--cuda-device must be non-negative")
+    if int(args.min_tile_ovoxels) < 1001:
+        raise ValueError("--min-tile-ovoxels must be >=1001 for this experiment")
     if args.max_tiles is not None and int(args.max_tiles) < 1:
         raise ValueError("--max-tiles must be positive")
-    if args.cuda_device is not None and int(args.cuda_device) < 0:
-        raise ValueError("--cuda-device must be non-negative")
+    if int(args.max_num_tokens) < 1:
+        raise ValueError("--max-num-tokens must be positive")
+    if float(args.roundtrip_tolerance) <= 0.0:
+        raise ValueError("--roundtrip-tolerance must be positive")
+    if (
+        int(args.face_projection_chunk_size) < 1
+        or int(args.surface_samples) < 1
+        or int(args.nearest_chunk_size) < 1
+    ):
+        raise ValueError("projection/sample/chunk sizes must be positive")
     if (
         int(args.render_resolution) < 1
-        or int(args.baseline_render_resolution) < 1
         or int(args.metric_resolution) < 1
         or int(args.render_ssaa) < 1
         or int(args.render_peel_layers) < 1
-        or int(args.local_decode_render_face_chunk_size) < 0
+        or int(args.render_face_chunk_size) < 0
     ):
-        raise ValueError(
-            "render resolutions, metric resolution, SSAA, and peel layers "
-            "must be positive; local decode render face chunk size must be "
-            "non-negative"
-        )
-    if float(args.boundary_epsilon) < 0:
-        raise ValueError("--boundary-epsilon must be non-negative")
-    if int(args.ovoxel_ownership_halo_pixels) < 0:
-        raise ValueError("--ovoxel-ownership-halo-pixels must be non-negative")
-    if not (0.0 <= float(args.max_outside_fraction) <= 1.0):
-        raise ValueError("--max-outside-fraction must be in [0,1]")
+        raise ValueError("invalid render configuration")
+    for encoder_path in (args.shape_encoder, args.pbr_encoder):
+        base = Path(encoder_path).expanduser()
+        if not Path(f"{base}.json").is_file() or not Path(
+            f"{base}.safetensors"
+        ).is_file():
+            raise FileNotFoundError(
+                f"encoder checkpoint pair not found for base path {base}"
+            )
     run(args)
 
 

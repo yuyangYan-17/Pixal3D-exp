@@ -225,11 +225,55 @@ class SLatFlowModel(nn.Module):
             
         # Handle different conditioning modes
         if self.image_attn_mode == 'proj':
+            is_visibility_routed = isinstance(cond, dict) and (
+                cond.get("mode") == "visibility_routed"
+            )
             is_multi_tile = isinstance(cond, dict) and (
                 cond.get("mode") == "multi_tile_paired"
                 or "global_bank" in cond
             )
-            if is_multi_tile:
+            if is_visibility_routed:
+                required = {
+                    "global_front",
+                    "proj_front",
+                    "global_back",
+                    "proj_back",
+                    "token_visibility",
+                    "mask_coords",
+                }
+                missing = required.difference(cond)
+                if missing:
+                    raise KeyError(
+                        "visibility-routed condition is missing: "
+                        + ", ".join(sorted(missing))
+                    )
+                global_front = cond["global_front"]
+                global_back = cond["global_back"]
+                if isinstance(global_front, list):
+                    global_front = sp.VarLenTensor.from_tensor_list(
+                        global_front
+                    )
+                if isinstance(global_back, list):
+                    global_back = sp.VarLenTensor.from_tensor_list(global_back)
+                cond = {
+                    **cond,
+                    "mode": "visibility_routed",
+                    "global_front": manual_cast(
+                        global_front, self.dtype
+                    ),
+                    "proj_front": manual_cast(
+                        cond["proj_front"], self.dtype
+                    ),
+                    "global_back": manual_cast(global_back, self.dtype),
+                    "proj_back": manual_cast(
+                        cond["proj_back"], self.dtype
+                    ),
+                    # The mask is deliberately not passed through
+                    # ``manual_cast`` so hard bool/int masks remain exact.
+                    "token_visibility": cond["token_visibility"],
+                    "mask_coords": cond["mask_coords"],
+                }
+            elif is_multi_tile:
                 global_bank = manual_cast(cond["global_bank"], self.dtype)
                 proj_cond = manual_cast(cond["proj"], self.dtype)
                 # IDs must remain integers; weights follow the model dtype.
@@ -249,7 +293,7 @@ class SLatFlowModel(nn.Module):
                 proj_cond = cond['proj']
             else:
                 global_cond, proj_cond = cond
-            if not is_multi_tile:
+            if not is_multi_tile and not is_visibility_routed:
                 if isinstance(global_cond, list):
                     global_cond = sp.VarLenTensor.from_tensor_list(global_cond)
                 global_cond = manual_cast(global_cond, self.dtype)

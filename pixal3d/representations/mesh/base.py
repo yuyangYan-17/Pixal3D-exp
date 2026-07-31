@@ -187,6 +187,37 @@ class MeshWithPbrMaterial(Mesh):
         )
 
 
+class MeshWithVertexPbr(Mesh):
+    """Triangle mesh with PBR channels baked on decoder dual vertices."""
+
+    def __init__(
+        self,
+        vertices: torch.Tensor,
+        faces: torch.Tensor,
+        vertex_attrs: torch.Tensor,
+        layout: Dict = {},
+    ):
+        self.vertices = vertices.float()
+        self.faces = faces.int()
+        self.vertex_attrs = vertex_attrs
+        self.layout = layout
+        if (
+            self.vertex_attrs.ndim != 2
+            or self.vertex_attrs.shape[0] != self.vertices.shape[0]
+        ):
+            raise ValueError(
+                "vertex_attrs must be [N,C] and aligned with vertices"
+            )
+
+    def to(self, device, non_blocking=False):
+        return MeshWithVertexPbr(
+            self.vertices.to(device, non_blocking=non_blocking),
+            self.faces.to(device, non_blocking=non_blocking),
+            self.vertex_attrs.to(device, non_blocking=non_blocking),
+            self.layout,
+        )
+
+
 class MeshWithVoxel(Mesh, Voxel):
     def __init__(self,
         vertices: torch.Tensor,

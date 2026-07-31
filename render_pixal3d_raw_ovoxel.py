@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render a Pixal3D ``MeshWithVoxel`` with the official nvdiffrast renderer.
+"""Render Pixal3D sparse-voxel or locally baked vertex-PBR meshes.
 
 This module keeps the decoder output in its native representation:
 
@@ -35,7 +35,7 @@ import torch.nn.functional as F
 from PIL import Image
 
 from pixal3d.renderers import EnvMap
-from pixal3d.representations import MeshWithVoxel
+from pixal3d.representations import MeshWithVertexPbr, MeshWithVoxel
 from pixal3d.utils import render_utils
 
 
@@ -268,33 +268,47 @@ def load_envmap(
     return result
 
 
-def _validate_mesh(mesh: Any) -> MeshWithVoxel:
-    if not isinstance(mesh, MeshWithVoxel):
+def _validate_mesh(mesh: Any) -> Union[MeshWithVoxel, MeshWithVertexPbr]:
+    if not isinstance(mesh, (MeshWithVoxel, MeshWithVertexPbr)):
         raise TypeError(
-            "official O-Voxel rendering requires pixal3d.representations."
-            f"MeshWithVoxel, got {type(mesh)!r}"
+            "official PBR rendering requires MeshWithVoxel or "
+            f"MeshWithVertexPbr, got {type(mesh)!r}"
         )
-    required = (
-        "vertices",
-        "faces",
-        "coords",
-        "attrs",
-        "origin",
-        "voxel_size",
-        "voxel_shape",
-        "layout",
-    )
+    if isinstance(mesh, MeshWithVertexPbr):
+        required = ("vertices", "faces", "vertex_attrs", "layout")
+    else:
+        required = (
+            "vertices",
+            "faces",
+            "coords",
+            "attrs",
+            "origin",
+            "voxel_size",
+            "voxel_shape",
+            "layout",
+        )
     missing = [name for name in required if not hasattr(mesh, name)]
     if missing:
-        raise ValueError(f"MeshWithVoxel is missing: {', '.join(missing)}")
+        raise ValueError(f"PBR mesh is missing: {', '.join(missing)}")
     if mesh.vertices.ndim != 2 or mesh.vertices.shape[1] != 3:
         raise ValueError("mesh.vertices must have shape [N, 3]")
     if mesh.faces.ndim != 2 or mesh.faces.shape[1] != 3:
         raise ValueError("mesh.faces must have shape [M, 3]")
-    if mesh.coords.ndim != 2 or mesh.coords.shape[1] != 3:
-        raise ValueError("mesh.coords must have shape [L, 3]")
-    if mesh.attrs.ndim != 2 or mesh.attrs.shape[0] != mesh.coords.shape[0]:
-        raise ValueError("mesh.attrs must have shape [L, C] aligned with coords")
+    if isinstance(mesh, MeshWithVertexPbr):
+        if (
+            mesh.vertex_attrs.ndim != 2
+            or mesh.vertex_attrs.shape[0] != mesh.vertices.shape[0]
+        ):
+            raise ValueError(
+                "mesh.vertex_attrs must be [N,C] aligned with vertices"
+            )
+    else:
+        if mesh.coords.ndim != 2 or mesh.coords.shape[1] != 3:
+            raise ValueError("mesh.coords must have shape [L, 3]")
+        if mesh.attrs.ndim != 2 or mesh.attrs.shape[0] != mesh.coords.shape[0]:
+            raise ValueError(
+                "mesh.attrs must have shape [L, C] aligned with coords"
+            )
     return mesh
 
 
@@ -456,9 +470,17 @@ def render_and_evaluate_mesh(
     row: Dict[str, Any] = {
         "status": "success",
         "renderer": "pixal3d.utils.render_utils.render_frames",
-        "sample_type": "MeshWithVoxel",
-        "material_source": "official sparse O-Voxel surface-position lookup",
-        "sampling_mode": "grid_sample_3d trilinear",
+        "sample_type": type(mesh).__name__,
+        "material_source": (
+            "local O-Voxel PBR baked to decoder dual vertices"
+            if isinstance(mesh, MeshWithVertexPbr)
+            else "official sparse O-Voxel surface-position lookup"
+        ),
+        "sampling_mode": (
+            "barycentric vertex-PBR interpolation"
+            if isinstance(mesh, MeshWithVertexPbr)
+            else "grid_sample_3d trilinear"
+        ),
         "envmap": (
             envmap_name
             if envmap_name is not None
@@ -476,7 +498,11 @@ def render_and_evaluate_mesh(
         "use_envmap_bg": bool(use_envmap_bg),
         "decoder_vertices": int(mesh.vertices.shape[0]),
         "decoder_faces": int(mesh.faces.shape[0]),
-        "active_voxels": int(mesh.coords.shape[0]),
+        "active_voxels": (
+            None
+            if isinstance(mesh, MeshWithVertexPbr)
+            else int(mesh.coords.shape[0])
+        ),
         "render_seconds": render_seconds,
         "render_png": output_paths["render"],
         "render_outputs": output_paths,
@@ -552,24 +578,35 @@ def load_mesh_checkpoint(
     path: Path,
     *,
     device: Union[str, torch.device] = "cuda",
-) -> MeshWithVoxel:
-    """Load a ``MeshWithVoxel`` object or a mapping of its native tensors."""
+) -> Union[MeshWithVoxel, MeshWithVertexPbr]:
+    """Load a supported PBR mesh or a mapping of its native tensors."""
     path = Path(path).expanduser().resolve()
     try:
         payload = torch.load(path, map_location="cpu", weights_only=False)
     except TypeError:
         payload = torch.load(path, map_location="cpu")
-    if isinstance(payload, Mapping) and isinstance(
-        payload.get("mesh"),
-        MeshWithVoxel,
-    ):
-        payload = payload["mesh"]
-    if isinstance(payload, MeshWithVoxel):
+    if isinstance(payload, Mapping):
+        for key in ("mesh", "mesh_with_local_vertex_pbr"):
+            if isinstance(
+                payload.get(key),
+                (MeshWithVoxel, MeshWithVertexPbr),
+            ):
+                payload = payload[key]
+                break
+    if isinstance(payload, (MeshWithVoxel, MeshWithVertexPbr)):
         return payload.to(device)
     if not isinstance(payload, Mapping):
         raise TypeError(
-            "checkpoint must contain MeshWithVoxel or a mapping of native fields"
+            "checkpoint must contain a supported PBR mesh or native mapping"
         )
+    if {"vertices", "faces", "vertex_attrs"}.issubset(payload):
+        mesh = MeshWithVertexPbr(
+            vertices=torch.as_tensor(payload["vertices"]),
+            faces=torch.as_tensor(payload["faces"]),
+            vertex_attrs=torch.as_tensor(payload["vertex_attrs"]),
+            layout=_normalize_layout(payload.get("layout")),
+        )
+        return mesh.to(device)
     required = (
         "vertices",
         "faces",

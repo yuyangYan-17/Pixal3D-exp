@@ -3,7 +3,7 @@ import torch
 from easydict import EasyDict as edict
 import numpy as np
 import utils3d
-from ..representations.mesh import Mesh, MeshWithVoxel, MeshWithPbrMaterial, TextureFilterMode, AlphaMode, TextureWrapMode
+from ..representations.mesh import Mesh, MeshWithVoxel, MeshWithVertexPbr, MeshWithPbrMaterial, TextureFilterMode, AlphaMode, TextureWrapMode
 import torch.nn.functional as F
 
 
@@ -258,7 +258,7 @@ class PbrMeshRenderer:
 
     def _render_mesh_with_voxel_face_chunks(
         self,
-        mesh: MeshWithVoxel,
+        mesh: Union[MeshWithVoxel, MeshWithVertexPbr],
         extrinsics: torch.Tensor,
         intrinsics: torch.Tensor,
         envmap: Dict[str, EnvMap],
@@ -316,10 +316,14 @@ class PbrMeshRenderer:
             full_proj.transpose(-1, -2),
         )
 
+        vertex_pbr = isinstance(mesh, MeshWithVertexPbr)
+        material_channels = (
+            int(mesh.vertex_attrs.shape[-1]) if vertex_pbr else 3
+        )
         # Packed per-layer geometry:
-        # camera depth (1), transformed position (3), world normal (3),
-        # original position for O-Voxel lookup (3).
-        packed_channels = 10
+        # camera depth (1), transformed position (3), world normal (3), then
+        # either local-baked vertex PBR or original position for O-Voxel lookup.
+        packed_channels = 7 + material_channels
         global_depth = torch.full(
             (peel_layers, render_size, render_size),
             float("inf"),
@@ -380,11 +384,18 @@ class PbrMeshRenderer:
                         torch.full_like(rast[0, ..., 2], float("inf")),
                     )
                     pos = dr.interpolate(vertices, rast, faces)[0][0]
-                    pos_orig = dr.interpolate(
-                        vertices_orig,
-                        rast,
-                        faces,
-                    )[0][0]
+                    if vertex_pbr:
+                        material_payload = dr.interpolate(
+                            mesh.vertex_attrs.unsqueeze(0),
+                            rast,
+                            faces,
+                        )[0][0]
+                    else:
+                        material_payload = dr.interpolate(
+                            vertices_orig,
+                            rast,
+                            faces,
+                        )[0][0]
                     gb_depth = dr.interpolate(
                         vertices_camera[..., 2:3].contiguous(),
                         rast,
@@ -405,13 +416,21 @@ class PbrMeshRenderer:
                         gb_normal,
                     )
                     packed = torch.cat(
-                        [gb_depth, pos, gb_normal, pos_orig],
+                        [gb_depth, pos, gb_normal, material_payload],
                         dim=-1,
                     )
                     packed = packed * mask.to(packed.dtype)
                     chunk_depth_layers.append(raster_depth)
                     chunk_geometry_layers.append(packed)
-                    del rast, mask, pos, pos_orig, gb_depth, gb_normal, packed
+                    del (
+                        rast,
+                        mask,
+                        pos,
+                        material_payload,
+                        gb_depth,
+                        gb_normal,
+                        packed,
+                    )
 
             chunk_depth = torch.stack(chunk_depth_layers, dim=0)
             chunk_geometry = torch.stack(chunk_geometry_layers, dim=0)
@@ -484,10 +503,11 @@ class PbrMeshRenderer:
         )
         alpha = torch.zeros_like(max_w)
         rotation = extrinsics_batched[..., :3, :3].reshape(1, 1, 3, 3)
-        ov_coords = torch.cat(
-            [torch.zeros_like(mesh.coords[..., :1]), mesh.coords],
-            dim=-1,
-        )
+        if not vertex_pbr:
+            ov_coords = torch.cat(
+                [torch.zeros_like(mesh.coords[..., :1]), mesh.coords],
+                dim=-1,
+            )
 
         for layer_index in range(peel_layers):
             layer_valid = torch.isfinite(
@@ -497,31 +517,40 @@ class PbrMeshRenderer:
             gb_depth = packed[..., 0:1]
             pos = packed[..., 1:4]
             gb_normal = packed[..., 4:7]
-            pos_orig = packed[..., 7:10]
             gb_cam_normal = (
                 rotation @ gb_normal.unsqueeze(-1)
             ).squeeze(-1)
 
-            xyz = (
-                (pos_orig - mesh.origin) / mesh.voxel_size
-            ).reshape(1, -1, 3)
-            img = grid_sample_3d(
-                mesh.attrs,
-                ov_coords,
-                mesh.voxel_shape,
-                xyz,
-                mode='trilinear',
-            )
-            img = img.reshape(
-                1,
-                render_size,
-                render_size,
-                mesh.attrs.shape[-1],
-            ) * layer_valid.unsqueeze(0).to(img.dtype)
-            gb_basecolor = img[0, ..., mesh.layout['base_color']]
-            gb_metallic = img[0, ..., mesh.layout['metallic']]
-            gb_roughness = img[0, ..., mesh.layout['roughness']]
-            gb_alpha = img[0, ..., mesh.layout['alpha']]
+            pos_orig = None
+            xyz = None
+            if vertex_pbr:
+                img = packed[..., 7:] * layer_valid.to(packed.dtype)
+                gb_basecolor = img[..., mesh.layout['base_color']]
+                gb_metallic = img[..., mesh.layout['metallic']]
+                gb_roughness = img[..., mesh.layout['roughness']]
+                gb_alpha = img[..., mesh.layout['alpha']]
+            else:
+                pos_orig = packed[..., 7:10]
+                xyz = (
+                    (pos_orig - mesh.origin) / mesh.voxel_size
+                ).reshape(1, -1, 3)
+                img = grid_sample_3d(
+                    mesh.attrs,
+                    ov_coords,
+                    mesh.voxel_shape,
+                    xyz,
+                    mode='trilinear',
+                )
+                img = img.reshape(
+                    1,
+                    render_size,
+                    render_size,
+                    mesh.attrs.shape[-1],
+                ) * layer_valid.unsqueeze(0).to(img.dtype)
+                gb_basecolor = img[0, ..., mesh.layout['base_color']]
+                gb_metallic = img[0, ..., mesh.layout['metallic']]
+                gb_roughness = img[0, ..., mesh.layout['roughness']]
+                gb_alpha = img[0, ..., mesh.layout['alpha']]
 
             if layer_index == 0:
                 out_dict.normal = -gb_cam_normal * 0.5 + 0.5
@@ -699,7 +728,7 @@ class PbrMeshRenderer:
             face_chunk_size=face_chunk_size,
         )
         if (
-            isinstance(mesh, MeshWithVoxel)
+            isinstance(mesh, (MeshWithVoxel, MeshWithVertexPbr))
             and face_chunk_size > 0
             and mesh.faces.shape[0] > face_chunk_size
         ):
@@ -770,7 +799,18 @@ class PbrMeshRenderer:
                     out_dict.mask = mask
                 
                 # PBR attributes
-                if isinstance(mesh, MeshWithVoxel):
+                if isinstance(mesh, MeshWithVertexPbr):
+                    mask = rast[..., -1:] > 0
+                    img = dr.interpolate(
+                        mesh.vertex_attrs.unsqueeze(0),
+                        rast,
+                        faces,
+                    )[0] * mask
+                    gb_basecolor = img[0, ..., mesh.layout['base_color']]
+                    gb_metallic = img[0, ..., mesh.layout['metallic']]
+                    gb_roughness = img[0, ..., mesh.layout['roughness']]
+                    gb_alpha = img[0, ..., mesh.layout['alpha']]
+                elif isinstance(mesh, MeshWithVoxel):
                     if 'grid_sample_3d' not in globals():
                         from flex_gemm.ops.grid_sample import grid_sample_3d
                     mask = rast[..., -1:] > 0

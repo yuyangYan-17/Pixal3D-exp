@@ -6,7 +6,7 @@ import utils3d
 from PIL import Image
 
 from ..renderers import MeshRenderer, VoxelRenderer, PbrMeshRenderer
-from ..representations import Mesh, Voxel, MeshWithPbrMaterial, MeshWithVoxel
+from ..representations import Mesh, Voxel, MeshWithPbrMaterial, MeshWithVoxel, MeshWithVertexPbr
 from .random_utils import sphere_hammersley_sequence
 
 
@@ -41,7 +41,7 @@ def yaw_pitch_r_fov_to_extrinsics_intrinsics(yaws, pitchs, rs, fovs):
 
 
 def get_renderer(sample, **kwargs):
-    if isinstance(sample, (MeshWithPbrMaterial, MeshWithVoxel)):
+    if isinstance(sample, (MeshWithPbrMaterial, MeshWithVoxel, MeshWithVertexPbr)):
         renderer = PbrMeshRenderer()
         renderer.rendering_options.resolution = kwargs.get('resolution', 512)
         renderer.rendering_options.near = kwargs.get('near', 1)

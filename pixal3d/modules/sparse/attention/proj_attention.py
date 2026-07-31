@@ -22,6 +22,156 @@ class SparseProjectAttention(nn.Module):
         super().__init__()
         self.cross_attn_block = cross_attn_block
         self.proj_linear = nn.Linear(proj_in_channels, channels, bias=True)
+        self.last_routing_tensors: Optional[Dict[str, torch.Tensor]] = None
+
+    @staticmethod
+    def _rms(value: torch.Tensor) -> torch.Tensor:
+        return value.float().square().mean().sqrt()
+
+    @staticmethod
+    def _cosine(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
+        left = left.float().reshape(-1)
+        right = right.float().reshape(-1)
+        denominator = (
+            torch.linalg.vector_norm(left)
+            * torch.linalg.vector_norm(right)
+        ).clamp_min(1e-12)
+        return torch.dot(left, right) / denominator
+
+    @staticmethod
+    def _validate_routed_context(
+        x: SparseTensor,
+        context: Dict[str, Any],
+    ) -> Tuple[
+        Union[torch.Tensor, VarLenTensor],
+        SparseTensor,
+        Union[torch.Tensor, VarLenTensor],
+        SparseTensor,
+        torch.Tensor,
+    ]:
+        required = {
+            "global_front",
+            "proj_front",
+            "global_back",
+            "proj_back",
+            "token_visibility",
+            "mask_coords",
+        }
+        missing = required.difference(context)
+        if missing:
+            raise KeyError(
+                "visibility-routed context is missing: "
+                + ", ".join(sorted(missing))
+            )
+        global_front = context["global_front"]
+        proj_front = context["proj_front"]
+        global_back = context["global_back"]
+        proj_back = context["proj_back"]
+        visibility = context["token_visibility"]
+        mask_coords = context["mask_coords"]
+        if not isinstance(global_front, (torch.Tensor, VarLenTensor)):
+            raise TypeError("global_front must be a Tensor or VarLenTensor")
+        if not isinstance(global_back, (torch.Tensor, VarLenTensor)):
+            raise TypeError("global_back must be a Tensor or VarLenTensor")
+        if not isinstance(proj_front, SparseTensor):
+            raise TypeError("proj_front must be a SparseTensor")
+        if not isinstance(proj_back, SparseTensor):
+            raise TypeError("proj_back must be a SparseTensor")
+        if not isinstance(visibility, torch.Tensor):
+            raise TypeError("token_visibility must be a Tensor")
+        if not isinstance(mask_coords, torch.Tensor):
+            raise TypeError("mask_coords must be a Tensor")
+        token_count = int(x.feats.shape[0])
+        if (
+            proj_front.feats.shape[0] != token_count
+            or proj_back.feats.shape[0] != token_count
+            or visibility.shape != (token_count,)
+            or mask_coords.shape != x.coords.shape
+        ):
+            raise ValueError(
+                "visibility-routed projected conditions/mask are not aligned "
+                "with hidden rows"
+            )
+        if not torch.equal(x.coords, proj_front.coords):
+            raise ValueError("proj_front coordinates are misaligned")
+        if not torch.equal(x.coords, proj_back.coords):
+            raise ValueError("proj_back coordinates are misaligned")
+        if not torch.equal(x.coords, mask_coords):
+            raise ValueError("visibility mask coordinates are misaligned")
+        if (
+            visibility.device != x.device
+            or proj_front.device != x.device
+            or proj_back.device != x.device
+            or mask_coords.device != x.device
+        ):
+            raise ValueError(
+                "visibility-routed tensors must be on the hidden device"
+            )
+        visibility_float = visibility.float()
+        if (
+            not torch.isfinite(visibility_float).all()
+            or torch.any(visibility_float < 0)
+            or torch.any(visibility_float > 1)
+        ):
+            raise ValueError("token_visibility must be finite and in [0, 1]")
+        if context.get("routing_kind", "hard") == "hard" and torch.any(
+            (visibility_float != 0) & (visibility_float != 1)
+        ):
+            raise ValueError("hard token_visibility must contain only 0/1")
+        return (
+            global_front,
+            proj_front,
+            global_back,
+            proj_back,
+            visibility,
+        )
+
+    def forward_routed(
+        self,
+        x: SparseTensor,
+        context: Dict[str, Any],
+    ) -> SparseTensor:
+        """Route complete image-attention contributions per sparse-token row."""
+        (
+            global_front,
+            proj_front,
+            global_back,
+            proj_back,
+            visibility,
+        ) = self._validate_routed_context(x, context)
+
+        # Both branches intentionally traverse the checkpointed modules.  In
+        # particular, zero image features still retain all learned biases.
+        global_front_out = self.cross_attn_block(x, global_front)
+        global_back_out = self.cross_attn_block(x, global_back)
+        proj_front_out = self.proj_linear(proj_front.feats)
+        proj_back_out = self.proj_linear(proj_back.feats)
+        front_condition = global_front_out.feats + proj_front_out
+        back_condition = global_back_out.feats + proj_back_out
+        mask = visibility.to(
+            device=front_condition.device,
+            dtype=front_condition.dtype,
+        ).reshape(-1, 1)
+        routed_condition = (
+            mask * front_condition + (1.0 - mask) * back_condition
+        )
+
+        if bool(context.get("record_diagnostics", False)):
+            self.last_routing_tensors = {
+                "front_global_rms": self._rms(global_front_out.feats).detach(),
+                "back_global_rms": self._rms(global_back_out.feats).detach(),
+                "front_projected_rms": self._rms(proj_front_out).detach(),
+                "back_projected_rms": self._rms(proj_back_out).detach(),
+                "front_condition_rms": self._rms(front_condition).detach(),
+                "back_condition_rms": self._rms(back_condition).detach(),
+                "routed_condition_rms": self._rms(routed_condition).detach(),
+                "front_back_condition_cosine": self._cosine(
+                    front_condition, back_condition
+                ).detach(),
+            }
+        else:
+            self.last_routing_tensors = None
+        return global_front_out.replace(routed_condition)
 
     @staticmethod
     def _validate_multi_tile_context(
@@ -167,6 +317,11 @@ class SparseProjectAttention(nn.Module):
         context: Union[Dict[str, Union[torch.Tensor, VarLenTensor, SparseTensor]], 
                        Tuple[Union[torch.Tensor, VarLenTensor], SparseTensor]]
     ) -> SparseTensor:
+        if (
+            isinstance(context, dict)
+            and context.get("mode") == "visibility_routed"
+        ):
+            return self.forward_routed(x, context)
         multi_tile = isinstance(context, dict) and (
             context.get("mode") == "multi_tile_paired"
             or "global_bank" in context
