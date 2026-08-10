@@ -326,5 +326,5 @@ support 分析显示：global C1024 support 约 3.96M 行，tile local support �
 - [`research/SUPPORT_ANALYSIS_20260727.md`](SUPPORT_ANALYSIS_20260727.md)
 - [`research/FIXED_SUPPORT_MATERIAL_EXPERIMENT_20260727.md`](FIXED_SUPPORT_MATERIAL_EXPERIMENT_20260727.md)
 - [`research/CANONICAL_ENDPOINT_SR_EXPERIMENT_20260727.md`](CANONICAL_ENDPOINT_SR_EXPERIMENT_20260727.md)
-- [`outputs/global_c64_hr_tile_condition_ablation/seed_42/EXPERIMENT_REPORT.md`](../outputs/global_c64_hr_tile_condition_ablation/seed_42/EXPERIMENT_REPORT.md)
-- [`outputs/global1024_to_c256_hr_tile_velocity_average/seed_42/EXPERIMENT_REPORT.md`](../outputs/global1024_to_c256_hr_tile_velocity_average/seed_42/EXPERIMENT_REPORT.md)
+- [`outputs/global_c64_hr_tile_condition_ablation/seed_42/EXPERIMENT_REPORT.md`](../used/experiments_archive_20260802/outputs/global_c64_hr_tile_condition_ablation/seed_42/EXPERIMENT_REPORT.md)
+- [`outputs/global1024_to_c256_hr_tile_velocity_average/seed_42/EXPERIMENT_REPORT.md`](../used/experiments_archive_20260802/outputs/global1024_to_c256_hr_tile_velocity_average/seed_42/EXPERIMENT_REPORT.md)

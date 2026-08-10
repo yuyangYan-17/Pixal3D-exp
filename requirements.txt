@@ -5,6 +5,7 @@ imageio-ffmpeg==0.6.0
 tqdm==4.67.1
 easydict==1.13
 opencv-python-headless==4.12.0.88
+OpenEXR>=3.3,<4
 trimesh==4.10.1
 transformers==4.57.3
 zstandard==0.25.0

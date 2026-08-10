@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Render global Pixal3D versus a global-anchored tile-detail FDG mesh.
+"""Run the clean no-CCA global-anchor HR/LR tile route.
 
 The ordinary global route is unchanged.  The tile route uses the decoded
 global O-Voxels and the released VAE encoders only to discover active local
@@ -23,17 +23,13 @@ C64 query coordinates:
     -> weld near-identical global vertices
     -> keep PBR sampled onto local dual vertices and interpolate it on faces.
 
-This is deliberately a visual experiment.  It reports only full-frame image
-metrics for:
-
-1. the ordinary global Pixal3D render against the original image; and
-2. the directly merged tile FDG mesh render against the original image.
-
-Per-tile Chamfer, O-Voxel IoU, and per-tile render metrics are not computed.
-Each successful tile reports shape/texture latent feature differences between
-the projected-global encoder result and the anchored detail-flow result, plus
-per-step anchor and HR-minus-LR residual diagnostics.
-The merged tile mesh also receives a configurable multi-view render sheet.
+The route is intentionally single-path: no CCA, C256 latent route, velocity
+averaging, projective/UV texture route, GLB export, or Blender step.  Rendering
+and all final comparisons use the repository's nvdiffrast-backed
+``PbrMeshRenderer`` path.  The run writes the baseline 1024 O-Voxel projection
+onto the 4096 image and every 1024/stride-512 tile, a camera-view original vs
+global-baseline vs merged-tile comparison, PSNR/SSIM/LPIPS metrics, and
+baseline-vs-tile multi-view sheets.
 """
 
 from __future__ import annotations
@@ -71,7 +67,12 @@ from inference import MODEL_PATH, init_pipeline
 from pixal3d.modules.sparse import SparseTensor
 from pixal3d.representations import MeshWithVertexPbr, MeshWithVoxel
 from pixal3d.utils import render_utils
-from render_pixal3d_raw_ovoxel import load_envmap
+from render_pixal3d_raw_ovoxel import (
+    image_to_tensor,
+    load_envmap,
+    psnr_metric,
+    ssim_metric,
+)
 
 
 @dataclass
@@ -80,16 +81,6 @@ class TileFlowLatents:
     shape_denorm: SparseTensor
     texture_norm: SparseTensor
     texture_denorm: SparseTensor
-    stats: Dict[str, Any]
-
-
-@dataclass
-class ReturnedTileOVoxels:
-    tile_id: int
-    coords: torch.Tensor
-    attrs: torch.Tensor
-    center_distance_normalized: torch.Tensor
-    center_weight: torch.Tensor
     stats: Dict[str, Any]
 
 
@@ -110,6 +101,26 @@ def _empty_cuda_cache() -> None:
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+
+
+def _resolve_cuda_index(requested: int) -> int:
+    """Resolve a physical GPU request to the current CUDA-visible index."""
+    requested = int(requested)
+    visible_count = int(torch.cuda.device_count())
+    mask = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+    if mask:
+        visible_devices = [item.strip() for item in mask.split(",")]
+        if str(requested) in visible_devices:
+            return visible_devices.index(str(requested))
+        if visible_count == 1:
+            # A single masked device is already remapped to visible index 0.
+            return 0
+    if 0 <= requested < visible_count:
+        return requested
+    raise RuntimeError(
+        f"requested CUDA device {requested} is unavailable; "
+        f"visible_count={visible_count}, CUDA_VISIBLE_DEVICES={mask or '<unset>'}"
+    )
 
 
 def _sync_cuda() -> None:
@@ -1254,357 +1265,6 @@ def _merge_tile_meshes_by_nearest_center(
     )
 
 
-def _global_carrier_metadata(
-    global_template: MeshWithVoxel,
-    *,
-    resolution: int,
-) -> Tuple[torch.Tensor, float, torch.Size, Dict[str, Any]]:
-    if int(resolution) <= core.OVOXEL_RESOLUTION:
-        raise ValueError("global carrier resolution must exceed 1024")
-    origin = torch.as_tensor(
-        global_template.origin, dtype=torch.float32
-    ).reshape(-1)
-    if origin.numel() != 3:
-        raise ValueError("global O-Voxel origin must contain three values")
-    base_size = torch.as_tensor(
-        global_template.voxel_size, dtype=torch.float64
-    ).reshape(-1)
-    if base_size.numel() == 1:
-        base_size = base_size.repeat(3)
-    if base_size.numel() != 3 or not torch.allclose(
-        base_size, base_size[:1].expand_as(base_size), atol=1e-12, rtol=0.0
-    ):
-        raise ValueError("global O-Voxel voxel_size must be isotropic")
-    extent = float(base_size[0].item()) * float(core.OVOXEL_RESOLUTION)
-    carrier_size = extent / float(resolution)
-    attr_channels = int(global_template.attrs.shape[1])
-    voxel_shape = torch.Size(
-        [1, attr_channels, int(resolution), int(resolution), int(resolution)]
-    )
-    stats = {
-        "source_resolution": int(core.OVOXEL_RESOLUTION),
-        "carrier_resolution": int(resolution),
-        "origin": [float(value) for value in origin.tolist()],
-        "source_voxel_size": float(base_size[0].item()),
-        "carrier_voxel_size": float(carrier_size),
-        "spatial_extent": float(extent),
-        "voxel_shape": list(voxel_shape),
-        "quantization": (
-            "floor((global_absolute_object - origin) / carrier_voxel_size)"
-        ),
-    }
-    return origin, float(carrier_size), voxel_shape, stats
-
-
-def _floor_quantize_global_points(
-    points: torch.Tensor,
-    *,
-    origin: torch.Tensor,
-    voxel_size: float,
-    resolution: int,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    if points.ndim != 2 or points.shape[1] != 3:
-        raise ValueError("global absolute O-Voxel points must have shape [N,3]")
-    origin = origin.to(device=points.device, dtype=points.dtype)
-    continuous = (points - origin[None]) / float(voxel_size)
-    floored = torch.floor(continuous).to(torch.int64)
-    valid = torch.isfinite(points).all(dim=1) & (
-        (floored >= 0) & (floored < int(resolution))
-    ).all(dim=1)
-    centers = origin[None] + (
-        floored.to(points.dtype) + 0.5
-    ) * float(voxel_size)
-    error_in_cells = torch.linalg.vector_norm(
-        (points - centers) / float(voxel_size), dim=1
-    )
-    return floored.to(torch.int32), valid, error_in_cells
-
-
-def _same_tile_floor_dedup_rows(
-    coords: torch.Tensor,
-    error_in_cells: torch.Tensor,
-    *,
-    resolution: int,
-) -> Tuple[torch.Tensor, Dict[str, Any]]:
-    coords_cpu = coords.to(device="cpu", dtype=torch.int64).contiguous()
-    errors = error_in_cells.to(
-        device="cpu", dtype=torch.float64
-    ).contiguous().numpy()
-    keys = core._linear_keys(coords_cpu, int(resolution)).numpy()
-    original = np.arange(coords_cpu.shape[0], dtype=np.int64)
-    order = np.lexsort((original, errors, keys))
-    sorted_keys = keys[order]
-    first = np.ones(order.shape[0], dtype=bool)
-    first[1:] = sorted_keys[1:] != sorted_keys[:-1]
-    counts = np.unique(keys, return_counts=True)[1]
-    selected = torch.from_numpy(order[first]).to(torch.long)
-    return selected, {
-        "floor_candidates": int(coords.shape[0]),
-        "unique_floor_cells_kept": int(selected.shape[0]),
-        "same_tile_floor_collision_candidates_discarded": int(
-            coords.shape[0] - selected.shape[0]
-        ),
-        "same_tile_floor_collision_cells": int((counts > 1).sum()),
-        "same_tile_floor_max_candidates_in_one_cell": int(counts.max()),
-        "same_tile_floor_selection": (
-            "keep candidate closest to the selected carrier cell center; "
-            "original decoder row breaks exact ties"
-        ),
-    }
-
-
-def _return_local_ovoxels_to_global_carrier(
-    *,
-    tile_id: int,
-    local_mesh: MeshWithVoxel,
-    global_camera: Mapping[str, float],
-    transform: core.TileCameraTransform,
-    carrier_origin: torch.Tensor,
-    carrier_voxel_size: float,
-    carrier_resolution: int,
-) -> ReturnedTileOVoxels:
-    local_absolute = core._ovoxel_indices_to_object(
-        local_mesh.coords,
-        origin=local_mesh.origin,
-        voxel_size=local_mesh.voxel_size,
-    )
-    local_q = local_absolute * (2.0 * float(transform.mesh_scale))
-    local_points = core._camera_q_to_points(
-        local_q,
-        distance=float(transform.distance),
-        mesh_scale=float(transform.mesh_scale),
-    )
-    local_uv, _, local_finite = core._project_points(
-        local_points,
-        fx=float(transform.fx),
-        fy=float(transform.fy),
-        cx=float(transform.cx),
-        cy=float(transform.cy),
-    )
-    center = local_uv.new_tensor(
-        [float(transform.cx), float(transform.cy)]
-    )[None]
-    center_distance_pixels = torch.linalg.vector_norm(
-        local_uv - center, dim=1
-    )
-    tile_width = float(transform.box[2] - transform.box[0])
-    tile_height = float(transform.box[3] - transform.box[1])
-    half_diagonal = math.hypot(tile_width * 0.5, tile_height * 0.5)
-    center_distance_normalized = center_distance_pixels / max(
-        half_diagonal, 1e-12
-    )
-    center_weight = 1.0 / (
-        1.0 + center_distance_normalized.square()
-    )
-
-    global_q, _ = core._local_q_to_global_q(
-        local_q,
-        global_camera=global_camera,
-        transform=transform,
-    )
-    global_absolute = global_q / (
-        2.0 * float(global_camera["mesh_scale"])
-    )
-    global_coords, valid_grid, error_in_cells = (
-        _floor_quantize_global_points(
-            global_absolute,
-            origin=carrier_origin,
-            voxel_size=float(carrier_voxel_size),
-            resolution=int(carrier_resolution),
-        )
-    )
-    valid = (
-        valid_grid
-        & local_finite
-        & torch.isfinite(center_distance_normalized)
-        & torch.isfinite(center_weight)
-        & torch.isfinite(error_in_cells)
-    )
-    valid_rows = torch.where(valid)[0]
-    if valid_rows.numel() == 0:
-        raise RuntimeError("tile decode has no O-Voxel in global carrier")
-    valid_coords = global_coords.index_select(0, valid_rows)
-    valid_error = error_in_cells.index_select(0, valid_rows)
-    keep_relative, collision_stats = _same_tile_floor_dedup_rows(
-        valid_coords,
-        valid_error,
-        resolution=int(carrier_resolution),
-    )
-    keep_relative = keep_relative.to(valid_rows.device)
-    kept_rows = valid_rows.index_select(0, keep_relative)
-    coords_unique = global_coords.index_select(0, kept_rows)
-    attrs_unique = local_mesh.attrs.index_select(0, kept_rows)
-    distances_unique = center_distance_normalized.index_select(0, kept_rows)
-    weights_unique = center_weight.index_select(0, kept_rows)
-    kept_error = error_in_cells.index_select(0, kept_rows)
-    stats = {
-        "tile_id": int(tile_id),
-        "local_decoder_vertices_ignored": int(local_mesh.vertices.shape[0]),
-        "local_decoder_faces_ignored": int(local_mesh.faces.shape[0]),
-        "local_decoder_ovoxels": int(local_mesh.coords.shape[0]),
-        "local_absolute_coordinate_formula": (
-            "local_origin + (local_relative_index + 0.5) * local_voxel_size"
-        ),
-        "global_absolute_coordinate_formula": (
-            "local absolute -> local camera q -> global camera q -> "
-            "global absolute object coordinate"
-        ),
-        "global_carrier_resolution": int(carrier_resolution),
-        "global_floor_candidates_in_bounds": int(valid_rows.shape[0]),
-        "global_floor_candidates_out_of_bounds_or_nonfinite": int(
-            local_mesh.coords.shape[0] - valid_rows.shape[0]
-        ),
-        **collision_stats,
-        "returned_unique_global_carrier_ovoxels": int(
-            coords_unique.shape[0]
-        ),
-        "floor_cell_center_error_cells_mean": float(kept_error.mean().item()),
-        "floor_cell_center_error_cells_max": float(kept_error.max().item()),
-        "tile_center_distance_normalized_min": float(
-            distances_unique.min().item()
-        ),
-        "tile_center_distance_normalized_mean": float(
-            distances_unique.mean().item()
-        ),
-        "tile_center_distance_normalized_max": float(
-            distances_unique.max().item()
-        ),
-        "tile_center_weight_min": float(weights_unique.min().item()),
-        "tile_center_weight_mean": float(weights_unique.mean().item()),
-        "tile_center_weight_max": float(weights_unique.max().item()),
-        "tile_center_weight_formula": (
-            "w = 1 / (1 + (pixel_distance / tile_half_diagonal)^2)"
-        ),
-        "global_absolute_min": [
-            float(value)
-            for value in global_absolute.index_select(
-                0, kept_rows
-            ).amin(dim=0).tolist()
-        ],
-        "global_absolute_max": [
-            float(value)
-            for value in global_absolute.index_select(
-                0, kept_rows
-            ).amax(dim=0).tolist()
-        ],
-    }
-    print(
-        f"[tile {int(tile_id):02d} carrier C{int(carrier_resolution)}] "
-        f"local={local_mesh.coords.shape[0]:,} "
-        f"in_bounds={valid_rows.shape[0]:,} "
-        f"same_tile_floor_drop="
-        f"{collision_stats['same_tile_floor_collision_candidates_discarded']:,} "
-        f"kept={coords_unique.shape[0]:,}"
-    )
-    return ReturnedTileOVoxels(
-        tile_id=int(tile_id),
-        coords=coords_unique.detach().to(device="cpu", dtype=torch.int32),
-        attrs=attrs_unique.detach().to(device="cpu", dtype=torch.float32),
-        center_distance_normalized=distances_unique.detach().to(
-            device="cpu", dtype=torch.float32
-        ),
-        center_weight=weights_unique.detach().to(
-            device="cpu", dtype=torch.float32
-        ),
-        stats=stats,
-    )
-
-
-def _fuse_tile_ovoxels_by_center_weight(
-    *,
-    tiles: Sequence[ReturnedTileOVoxels],
-    resolution: int,
-) -> Tuple[
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    Dict[str, Any],
-]:
-    if not tiles:
-        raise RuntimeError("no successful returned tile O-Voxels to fuse")
-    coords = torch.cat([tile.coords for tile in tiles], dim=0)
-    attrs = torch.cat([tile.attrs for tile in tiles], dim=0)
-    distances = torch.cat(
-        [tile.center_distance_normalized for tile in tiles], dim=0
-    )
-    weights = torch.cat([tile.center_weight for tile in tiles], dim=0)
-    tile_ids = torch.cat(
-        [
-            torch.full(
-                (tile.coords.shape[0],),
-                int(tile.tile_id),
-                dtype=torch.int32,
-            )
-            for tile in tiles
-        ],
-        dim=0,
-    )
-    coords64 = coords.to(torch.int64)
-    keys = core._linear_keys(coords64, int(resolution)).numpy()
-    weight_np = weights.to(torch.float64).numpy()
-    tile_np = tile_ids.to(torch.int64).numpy()
-    original = np.arange(coords.shape[0], dtype=np.int64)
-    order = np.lexsort((original, tile_np, -weight_np, keys))
-    sorted_keys = keys[order]
-    first = np.ones(order.shape[0], dtype=bool)
-    first[1:] = sorted_keys[1:] != sorted_keys[:-1]
-    counts = np.unique(keys, return_counts=True)[1]
-    selected = torch.from_numpy(order[first]).to(torch.long)
-    selected_tile_ids = tile_ids.index_select(0, selected)
-    candidate_by_tile: Dict[str, int] = {}
-    winner_by_tile: Dict[str, int] = {}
-    for tile in tiles:
-        label = str(int(tile.tile_id))
-        candidate_by_tile[label] = int(tile.coords.shape[0])
-        winner_by_tile[label] = int(
-            (selected_tile_ids == int(tile.tile_id)).sum().item()
-        )
-    stats = {
-        "successful_tiles": len(tiles),
-        "tile_ids": [int(tile.tile_id) for tile in tiles],
-        "global_carrier_resolution": int(resolution),
-        "candidates_after_same_tile_floor_dedup": int(coords.shape[0]),
-        "unique_global_carrier_ovoxels": int(selected.shape[0]),
-        "cross_tile_conflict_candidates_discarded": int(
-            coords.shape[0] - selected.shape[0]
-        ),
-        "cross_tile_contested_global_cells": int((counts > 1).sum()),
-        "cross_tile_max_candidates_in_one_cell": int(counts.max()),
-        "cross_tile_selection": (
-            "highest source-tile center weight wins; smaller tile id then "
-            "original candidate row break exact ties"
-        ),
-        "tile_center_weight_formula": (
-            "w = 1 / (1 + (pixel_distance / tile_half_diagonal)^2)"
-        ),
-        "candidate_ovoxels_by_tile": candidate_by_tile,
-        "winning_ovoxels_by_tile": winner_by_tile,
-        "winning_fraction_by_tile": {
-            tile_id: (
-                float(winner_by_tile[tile_id])
-                / float(candidate_by_tile[tile_id])
-            )
-            for tile_id in candidate_by_tile
-        },
-    }
-    print(
-        f"[global carrier C{int(resolution)} fuse] "
-        f"candidates={coords.shape[0]:,} "
-        f"contested_cells={stats['cross_tile_contested_global_cells']:,} "
-        f"cross_tile_drop="
-        f"{stats['cross_tile_conflict_candidates_discarded']:,} "
-        f"kept={selected.shape[0]:,}"
-    )
-    return (
-        coords.index_select(0, selected).contiguous(),
-        attrs.index_select(0, selected).contiguous(),
-        distances.index_select(0, selected).contiguous(),
-        weights.index_select(0, selected).contiguous(),
-        selected_tile_ids.contiguous(),
-        stats,
-    )
 
 
 def _direct_mesh_with_local_vertex_pbr(
@@ -1631,149 +1291,6 @@ def _direct_mesh_with_local_vertex_pbr(
         layout=dict(layout),
     )
 
-
-def _global_ovoxels_to_surface_mesh(
-    *,
-    coords: torch.Tensor,
-    attrs: torch.Tensor,
-    origin: torch.Tensor,
-    voxel_size: float,
-    voxel_shape: torch.Size,
-    layout: Mapping[str, Any],
-    resolution: int,
-    chunk_size: int,
-) -> Tuple[MeshWithVoxel, Dict[str, Any]]:
-    if coords.ndim != 2 or coords.shape[1] != 3 or coords.shape[0] == 0:
-        raise ValueError("fused global O-Voxel coords must be non-empty [N,3]")
-    if attrs.ndim != 2 or attrs.shape[0] != coords.shape[0]:
-        raise ValueError("fused global O-Voxel attrs are not aligned")
-    if int(chunk_size) <= 0:
-        raise ValueError("voxel mesh chunk size must be positive")
-    coords_np = coords.to(torch.int64).contiguous().numpy()
-    keys = core._linear_keys(coords.to(torch.int64), int(resolution)).numpy()
-    sorted_keys = np.sort(keys)
-    if bool((sorted_keys[1:] == sorted_keys[:-1]).any()):
-        raise RuntimeError("fused global C4096 O-Voxel coords are not unique")
-    directions = np.asarray(
-        [
-            [-1, 0, 0],
-            [1, 0, 0],
-            [0, -1, 0],
-            [0, 1, 0],
-            [0, 0, -1],
-            [0, 0, 1],
-        ],
-        dtype=np.int64,
-    )
-    face_corners = torch.tensor(
-        [
-            [[0, 0, 0], [0, 0, 1], [0, 1, 1], [0, 1, 0]],
-            [[1, 0, 0], [1, 1, 0], [1, 1, 1], [1, 0, 1]],
-            [[0, 0, 0], [1, 0, 0], [1, 0, 1], [0, 0, 1]],
-            [[0, 1, 0], [0, 1, 1], [1, 1, 1], [1, 1, 0]],
-            [[0, 0, 0], [0, 1, 0], [1, 1, 0], [1, 0, 0]],
-            [[0, 0, 1], [1, 0, 1], [1, 1, 1], [0, 1, 1]],
-        ],
-        dtype=torch.float32,
-    )
-    triangle_pattern = torch.tensor(
-        [[0, 1, 2], [0, 2, 3]], dtype=torch.int64
-    )
-    origin_cpu = origin.to(device="cpu", dtype=torch.float32)
-    vertex_chunks: List[torch.Tensor] = []
-    face_chunks: List[torch.Tensor] = []
-    total_vertices = 0
-    exposed_quads = 0
-    direction_quads = [0] * 6
-    for start in range(0, int(coords_np.shape[0]), int(chunk_size)):
-        block = coords_np[start : start + int(chunk_size)]
-        for direction_index, direction in enumerate(directions):
-            neighbor = block + direction[None]
-            in_bounds = (
-                (neighbor >= 0) & (neighbor < int(resolution))
-            ).all(axis=1)
-            neighbor_keys = (
-                (
-                    neighbor[:, 0] * int(resolution)
-                    + neighbor[:, 1]
-                )
-                * int(resolution)
-                + neighbor[:, 2]
-            )
-            positions = np.searchsorted(sorted_keys, neighbor_keys)
-            occupied = np.zeros(block.shape[0], dtype=bool)
-            test = in_bounds & (positions < sorted_keys.shape[0])
-            occupied[test] = (
-                sorted_keys[positions[test]] == neighbor_keys[test]
-            )
-            exposed_block = block[~occupied]
-            if exposed_block.shape[0] == 0:
-                continue
-            base_coords = torch.from_numpy(exposed_block).to(torch.float32)
-            vertices = origin_cpu[None, None] + (
-                base_coords[:, None] + face_corners[direction_index][None]
-            ) * float(voxel_size)
-            vertices = vertices.reshape(-1, 3).contiguous()
-            quad_count = int(exposed_block.shape[0])
-            faces = (
-                torch.arange(
-                    quad_count, dtype=torch.int64
-                )[:, None, None]
-                * 4
-                + triangle_pattern[None]
-                + int(total_vertices)
-            ).reshape(-1, 3)
-            vertex_chunks.append(vertices)
-            face_chunks.append(faces)
-            total_vertices += int(vertices.shape[0])
-            exposed_quads += quad_count
-            direction_quads[direction_index] += quad_count
-    if not face_chunks:
-        raise RuntimeError("fused global O-Voxels produced no exposed faces")
-    if total_vertices >= 2**31:
-        raise RuntimeError(
-            "C4096 voxel surface exceeds int32 mesh vertex-index capacity"
-        )
-    vertices = torch.cat(vertex_chunks, dim=0)
-    faces = torch.cat(face_chunks, dim=0).to(torch.int32)
-    mesh = MeshWithVoxel(
-        vertices=vertices,
-        faces=faces,
-        origin=[float(value) for value in origin_cpu.tolist()],
-        voxel_size=float(voxel_size),
-        coords=coords.to(dtype=torch.int32).contiguous(),
-        attrs=attrs.to(dtype=torch.float32).contiguous(),
-        voxel_shape=voxel_shape,
-        layout=dict(layout),
-    )
-    candidate_quads = int(coords.shape[0]) * 6
-    stats = {
-        "mesh_source": "union surface of fused global C4096 O-Voxel cells",
-        "active_global_c4096_ovoxels": int(coords.shape[0]),
-        "candidate_voxel_quads": candidate_quads,
-        "internal_neighbor_quads_removed": int(
-            candidate_quads - exposed_quads
-        ),
-        "exposed_surface_quads": int(exposed_quads),
-        "exposed_quads_by_direction_xyz_negative_positive": direction_quads,
-        "surface_vertices_with_per_quad_duplication": int(vertices.shape[0]),
-        "vertex_sharing": (
-            "disabled across exposed quads so opposite faces cannot cancel "
-            "the renderer's generated vertex normals"
-        ),
-        "surface_triangles": int(faces.shape[0]),
-        "surface_extraction_chunk_size": int(chunk_size),
-        "surface_rule": (
-            "emit a quad only when the adjacent C4096 cell is unoccupied"
-        ),
-    }
-    print(
-        "[global C4096 mesh] "
-        f"ovoxels={coords.shape[0]:,} "
-        f"exposed_quads={exposed_quads:,} "
-        f"triangles={faces.shape[0]:,}"
-    )
-    return mesh, stats
 
 
 def _metric_subset(row: Mapping[str, Any]) -> Dict[str, Any]:
@@ -1845,6 +1362,40 @@ def _save_three_way_comparison(
     sheet.save(output_path)
 
 
+def _save_baseline_ovoxel_tile_grid(
+    *,
+    image_4096: Image.Image,
+    boxes: Sequence[Sequence[int]],
+    projected_counts: Sequence[int],
+    min_tile_ovoxels: int,
+    output_path: Path,
+) -> None:
+    """Visualize the 1024 baseline O-Voxel projection and 49 tile boxes."""
+    if len(boxes) != len(projected_counts):
+        raise ValueError("tile boxes and projected O-Voxel counts are misaligned")
+    canvas = image_4096.convert("RGB").copy()
+    draw = ImageDraw.Draw(canvas)
+    for tile_id, (box, count) in enumerate(zip(boxes, projected_counts)):
+        x0, y0, x1, y1 = [int(value) for value in box]
+        eligible = int(count) >= int(min_tile_ovoxels)
+        color = (40, 255, 80) if eligible else (255, 80, 80)
+        draw.rectangle((x0, y0, x1 - 1, y1 - 1), outline=color, width=5)
+        draw.rectangle((x0 + 2, y0 + 2, x0 + 190, y0 + 30), fill=(0, 0, 0))
+        draw.text(
+            (x0 + 8, y0 + 8),
+            f"tile {tile_id:02d}: {int(count):,} O-Voxels",
+            fill=color,
+        )
+    draw.rectangle((0, 0, canvas.width, 42), fill=(0, 0, 0))
+    draw.text(
+        (10, 12),
+        "Baseline 1024 O-Voxels projected to canonical 4096; green=eligible, red=skipped",
+        fill=(255, 255, 255),
+    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    canvas.save(output_path)
+
+
 def _parse_angle_csv(value: str, *, label: str) -> List[float]:
     try:
         angles = [
@@ -1892,14 +1443,61 @@ def _save_multiview_sheet(
     sheet.save(output_path)
 
 
-def _render_merged_mesh_multiview(
-    mesh: MeshWithVertexPbr,
+
+def _save_multiview_comparison_sheet(
+    *,
+    global_paths: Sequence[Path],
+    tile_paths: Sequence[Path],
+    labels: Sequence[str],
+    output_path: Path,
+) -> None:
+    if not (
+        len(global_paths) == len(tile_paths) == len(labels)
+        and global_paths
+    ):
+        raise ValueError("multi-view comparison inputs are not aligned")
+    panel_size = 512
+    header = 54
+    rows = len(labels)
+    sheet = Image.new(
+        "RGB",
+        (2 * panel_size, rows * (panel_size + header)),
+        (0, 0, 0),
+    )
+    draw = ImageDraw.Draw(sheet)
+    for index, (global_path, tile_path, label) in enumerate(
+        zip(global_paths, tile_paths, labels)
+    ):
+        y = index * (panel_size + header)
+        for column, path, title in (
+            (0, global_path, "global baseline"),
+            (1, tile_path, "tile flow"),
+        ):
+            x = column * panel_size
+            with Image.open(path) as image:
+                panel = image.convert("RGB").resize(
+                    (panel_size, panel_size), Image.Resampling.LANCZOS
+                )
+            sheet.paste(panel, (x, y + header))
+            draw.text(
+                (x + 10, y + 10),
+                f"{title} | {label}",
+                fill=(255, 255, 255),
+            )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    sheet.save(output_path)
+
+
+def _render_multiview_comparison(
+    global_mesh: MeshWithVoxel,
+    tile_mesh: MeshWithVertexPbr,
     *,
     output_dir: Path,
     camera: Mapping[str, float],
     args: argparse.Namespace,
     envmap: Any,
 ) -> Dict[str, Any]:
+    """Render baseline and tile meshes from identical cameras with nvdiffrast."""
     yaws = _parse_angle_csv(
         args.multiview_yaws_degrees,
         label="--multiview-yaws-degrees",
@@ -1916,16 +1514,16 @@ def _render_merged_mesh_multiview(
             "must have equal lengths, or provide one pitch"
         )
     output_dir.mkdir(parents=True, exist_ok=True)
-    live_mesh = mesh.to(torch.device("cuda"))
+    device = torch.device("cuda")
     radius = float(camera["distance"]) * float(args.multiview_radius_scale)
     fov = torch.tensor(
         float(camera["camera_angle_x"]),
-        device="cuda",
+        device=device,
         dtype=torch.float32,
     )
     intrinsics = utils3d.torch.intrinsics_from_fov_xy(fov, fov)
-    target = torch.zeros(3, device="cuda", dtype=torch.float32)
-    up = torch.tensor([0.0, 1.0, 0.0], device="cuda")
+    target = torch.zeros(3, device=device, dtype=torch.float32)
+    up = torch.tensor([0.0, 1.0, 0.0], device=device)
     extrinsics: List[torch.Tensor] = []
     intrinsics_list: List[torch.Tensor] = []
     labels: List[str] = []
@@ -1938,59 +1536,120 @@ def _render_merged_mesh_multiview(
                 math.sin(pitch),
                 math.cos(yaw) * math.cos(pitch),
             ],
-            device="cuda",
+            device=device,
             dtype=torch.float32,
         )
         camera_position = target + direction * radius
         extrinsics.append(
-            utils3d.torch.extrinsics_look_at(
-                camera_position,
-                target,
-                up,
-            )
+            utils3d.torch.extrinsics_look_at(camera_position, target, up)
         )
         intrinsics_list.append(intrinsics)
         labels.append(
             f"yaw={float(yaw_degrees):g}°, pitch={float(pitch_degrees):g}°"
         )
-    near = max(0.01, radius - 2.0)
-    far = radius + 10.0
+    render_options = {
+        "resolution": int(args.multiview_resolution),
+        "near": max(0.01, radius - 2.0),
+        "far": radius + 10.0,
+        "ssaa": int(args.multiview_ssaa),
+        "peel_layers": int(args.multiview_peel_layers),
+        "face_chunk_size": int(args.render_face_chunk_size),
+    }
     started = time.perf_counter()
-    renders = render_utils.render_frames(
-        live_mesh,
-        extrinsics=extrinsics,
-        intrinsics=intrinsics_list,
-        options={
-            "resolution": int(args.multiview_resolution),
-            "near": float(near),
-            "far": float(far),
-            "ssaa": int(args.multiview_ssaa),
-            "peel_layers": int(args.multiview_peel_layers),
-            "face_chunk_size": int(args.render_face_chunk_size),
-        },
-        verbose=True,
-        envmap=envmap,
-        use_envmap_bg=bool(args.use_envmap_bg),
-    )
-    shaded_frames = renders.get("shaded")
-    if not shaded_frames or len(shaded_frames) != len(labels):
-        raise RuntimeError("multi-view renderer did not return all shaded frames")
-    frame_paths: List[Path] = []
-    for index, (frame, label) in enumerate(zip(shaded_frames, labels)):
-        path = output_dir / f"view_{index:02d}.png"
-        Image.fromarray(np.asarray(frame)).convert("RGB").save(path)
-        frame_paths.append(path)
-        print(f"[multiview] {label} -> {path.name}")
-    sheet_path = output_dir / "multiview_sheet.png"
+
+    def render_mesh(mesh: Any) -> List[np.ndarray]:
+        live_mesh = mesh.to(device)
+        rendered = render_utils.render_frames(
+            live_mesh,
+            extrinsics=extrinsics,
+            intrinsics=intrinsics_list,
+            options=render_options,
+            verbose=True,
+            envmap=envmap,
+            use_envmap_bg=bool(args.use_envmap_bg),
+        )
+        frames = rendered.get("shaded")
+        if not frames or len(frames) != len(labels):
+            raise RuntimeError("nvdiffrast multi-view render returned incomplete frames")
+        del live_mesh, rendered
+        _empty_cuda_cache()
+        return [np.asarray(frame) for frame in frames]
+
+    global_frames = render_mesh(global_mesh)
+    tile_frames = render_mesh(tile_mesh)
+    global_paths: List[Path] = []
+    tile_paths: List[Path] = []
+    pair_paths: List[Path] = []
+    pair_metrics: List[Dict[str, Any]] = []
+    for index, (global_frame, tile_frame, label) in enumerate(
+        zip(global_frames, tile_frames, labels)
+    ):
+        global_path = output_dir / f"view_{index:02d}_global_baseline.png"
+        tile_path = output_dir / f"view_{index:02d}_tile_flow.png"
+        pair_path = output_dir / f"view_{index:02d}_global_vs_tile.png"
+        Image.fromarray(global_frame).convert("RGB").save(global_path)
+        Image.fromarray(tile_frame).convert("RGB").save(tile_path)
+        pair = Image.new(
+            "RGB",
+            (global_frame.shape[1] * 2, global_frame.shape[0]),
+            (0, 0, 0),
+        )
+        pair.paste(Image.fromarray(global_frame).convert("RGB"), (0, 0))
+        pair.paste(
+            Image.fromarray(tile_frame).convert("RGB"),
+            (global_frame.shape[1], 0),
+        )
+        pair.save(pair_path)
+        global_paths.append(global_path)
+        tile_paths.append(tile_path)
+        pair_paths.append(pair_path)
+        global_tensor = image_to_tensor(Image.fromarray(global_frame), (
+            int(global_frame.shape[1]),
+            int(global_frame.shape[0]),
+        ))
+        tile_tensor = image_to_tensor(Image.fromarray(tile_frame), (
+            int(tile_frame.shape[1]),
+            int(tile_frame.shape[0]),
+        ))
+        pair_metrics.append(
+            {
+                "view": index,
+                "label": label,
+                "baseline_vs_tile_psnr_db": psnr_metric(
+                    global_tensor, tile_tensor
+                ),
+                "baseline_vs_tile_ssim": ssim_metric(
+                    global_tensor, tile_tensor
+                ),
+            }
+        )
+        print(f"[multiview] {label} -> {pair_path.name}")
+    global_sheet = output_dir / "multiview_global_baseline_sheet.png"
+    tile_sheet = output_dir / "multiview_tile_flow_sheet.png"
+    comparison_sheet = output_dir / "multiview_baseline_vs_tile_sheet.png"
     _save_multiview_sheet(
-        frame_paths=frame_paths,
+        frame_paths=global_paths,
         labels=labels,
-        output_path=sheet_path,
+        output_path=global_sheet,
     )
-    del live_mesh, renders
-    _empty_cuda_cache()
+    _save_multiview_sheet(
+        frame_paths=tile_paths,
+        labels=labels,
+        output_path=tile_sheet,
+    )
+    _save_multiview_comparison_sheet(
+        global_paths=global_paths,
+        tile_paths=tile_paths,
+        labels=labels,
+        output_path=comparison_sheet,
+    )
+    _atomic_json(
+        output_dir / "multiview_metrics.json",
+        {"views": pair_metrics},
+    )
     return {
         "enabled": True,
+        "renderer": "pixal3d.utils.render_utils -> PbrMeshRenderer -> nvdiffrast",
         "resolution": int(args.multiview_resolution),
         "ssaa": int(args.multiview_ssaa),
         "peel_layers": int(args.multiview_peel_layers),
@@ -1998,12 +1657,17 @@ def _render_merged_mesh_multiview(
         "radius_scale": float(args.multiview_radius_scale),
         "yaw_degrees": yaws,
         "pitch_degrees": pitches,
-        "frame_pngs": [str(path) for path in frame_paths],
-        "sheet_png": str(sheet_path),
+        "global_frame_pngs": [str(path) for path in global_paths],
+        "tile_frame_pngs": [str(path) for path in tile_paths],
+        "pair_frame_pngs": [str(path) for path in pair_paths],
+        "global_sheet_png": str(global_sheet),
+        "tile_sheet_png": str(tile_sheet),
+        "comparison_sheet_png": str(comparison_sheet),
+        "sheet_png": str(comparison_sheet),
+        "pair_metrics_json": str(output_dir / "multiview_metrics.json"),
+        "pair_metrics": pair_metrics,
         "render_seconds": float(time.perf_counter() - started),
     }
-
-
 def _sampler_params(args: argparse.Namespace) -> Tuple[Dict[str, Any], ...]:
     return (
         {
@@ -2030,10 +1694,13 @@ def _sampler_params(args: argparse.Namespace) -> Tuple[Dict[str, Any], ...]:
 def run(args: argparse.Namespace) -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
-    torch.cuda.set_device(int(args.cuda_device))
+    requested_cuda_device = int(args.cuda_device)
+    visible_cuda_device = _resolve_cuda_index(requested_cuda_device)
+    torch.cuda.set_device(visible_cuda_device)
     device = torch.device("cuda")
     print(
-        f"[cuda] index={int(args.cuda_device)} "
+        f"[cuda] requested_physical={requested_cuda_device} "
+        f"visible_index={visible_cuda_device} "
         f"name={torch.cuda.get_device_name(torch.cuda.current_device())}"
     )
     output_dir = Path(args.output_dir).expanduser().resolve()
@@ -2123,6 +1790,15 @@ def run(args: argparse.Namespace) -> None:
             global_ovoxel_q, global_camera=global_camera
         )
     )
+    global_projection_path = (
+        baseline_dir / "baseline_1024_ovoxel_projection_4096.png"
+    )
+    core._save_projection_overlay(
+        image_4096,
+        global_ovoxel_uv[global_ovoxel_finite],
+        global_projection_path,
+        "Baseline 1024 O-Voxels projected onto canonical 4096",
+    )
     global_face_uv, global_face_finite = core._project_face_centers(
         baseline_mesh.vertices,
         baseline_mesh.faces,
@@ -2142,6 +1818,45 @@ def run(args: argparse.Namespace) -> None:
         pbr_encoder.to(device)
 
     boxes = core._tile_layout()
+    projected_counts = [
+        int(
+            core._inside_tile(
+                global_ovoxel_uv, global_ovoxel_finite, box
+            ).sum().item()
+        )
+        for box in boxes
+    ]
+    grid_projection_path = (
+        baseline_dir / "baseline_1024_ovoxel_projection_4096_tile_grid.png"
+    )
+    _save_baseline_ovoxel_tile_grid(
+        image_4096=image_4096,
+        boxes=boxes,
+        projected_counts=projected_counts,
+        min_tile_ovoxels=int(args.min_tile_ovoxels),
+        output_path=grid_projection_path,
+    )
+    baseline_summary["ovoxel_projection"] = {
+        "source": "ordinary global Pixal3D 1024_cascade decoder O-Voxels",
+        "source_resolution": int(baseline_resolution),
+        "canonical_image_size": [4096, 4096],
+        "projected_rows": int(global_ovoxel_uv.shape[0]),
+        "finite_projected_rows": int(global_ovoxel_finite.sum().item()),
+        "projection_png": str(global_projection_path),
+        "tile_grid_png": str(grid_projection_path),
+        "tile_size": int(core.TILE_SIZE),
+        "tile_stride": int(core.TILE_STRIDE),
+        "tile_count": len(boxes),
+        "projected_ovoxels_by_tile": {
+            str(tile_id): count
+            for tile_id, count in enumerate(projected_counts)
+        },
+        "visualization_note": (
+            "points are image-space projections for correspondence only; "
+            "they are not texture UVs and no UV unwrap is used"
+        ),
+    }
+    _atomic_json(baseline_dir / "summary.json", baseline_summary)
     requested_ids = core._parse_tile_ids(args.tile_ids)
     if requested_ids is not None:
         invalid = sorted(tile_id for tile_id in requested_ids if tile_id not in range(49))
@@ -2154,23 +1869,38 @@ def run(args: argparse.Namespace) -> None:
     for tile_id, box in enumerate(boxes):
         if requested_ids is not None and tile_id not in requested_ids:
             continue
-        projected_count = int(
-            core._inside_tile(
-                global_ovoxel_uv, global_ovoxel_finite, box
-            ).sum().item()
+        inside_rows = core._inside_tile(
+            global_ovoxel_uv, global_ovoxel_finite, box
         )
+        projected_count = int(inside_rows.sum().item())
         tile_dir = output_dir / "tiles" / f"tile_{tile_id:02d}"
         tile_dir.mkdir(parents=True, exist_ok=True)
         tile_image = image_4096.crop(box).convert("RGB")
         lr_tile_image = _make_lr_reference_tile(image_1024, box)
         tile_image.save(tile_dir / "tile_reference.png")
         lr_tile_image.save(tile_dir / "tile_reference_lr_from_global_1024.png")
+        tile_projection_uv = global_ovoxel_uv[inside_rows].clone()
+        tile_projection_uv[:, 0] -= float(box[0])
+        tile_projection_uv[:, 1] -= float(box[1])
+        tile_projection_path = (
+            tile_dir / "baseline_1024_ovoxel_projection_on_tile.png"
+        )
+        core._save_projection_overlay(
+            tile_image,
+            tile_projection_uv,
+            tile_projection_path,
+            (
+                f"tile {tile_id:02d}: baseline 1024 O-Voxels projected "
+                f"from canonical 4096 ({projected_count:,} points)"
+            ),
+        )
         if projected_count < int(args.min_tile_ovoxels):
             record = {
                 "status": "skipped",
                 "tile_id": tile_id,
                 "box": list(box),
                 "projected_global_ovoxels": projected_count,
+                "baseline_projection_overlay_png": str(tile_projection_path),
                 "reason": "projected global O-Voxels below threshold",
             }
             tile_records.append(record)
@@ -2321,6 +2051,7 @@ def run(args: argparse.Namespace) -> None:
                 "tile_id": tile_id,
                 "box": list(box),
                 "projected_global_ovoxels": projected_count,
+                "baseline_projection_overlay_png": str(tile_projection_path),
                 "mapping": mapping.stats,
                 "geometry_encoder_input": geometry_stats,
                 "shape_encoder": shape_encoder_stats,
@@ -2421,7 +2152,8 @@ def run(args: argparse.Namespace) -> None:
         output_path=comparison_path,
     )
     if bool(args.render_multiview):
-        multiview_summary = _render_merged_mesh_multiview(
+        multiview_summary = _render_multiview_comparison(
+            baseline_mesh,
             merged_mesh,
             output_dir=merged_dir / "multiview",
             camera=global_camera,
@@ -2452,6 +2184,10 @@ def run(args: argparse.Namespace) -> None:
         ),
     }
     merged_summary = {
+        "renderer": (
+            "pixal3d.utils.render_utils.render_frames -> "
+            "PbrMeshRenderer -> nvdiffrast"
+        ),
         "geometry_merge": geometry_merge_stats,
         "triangle_ownership_by_tile": triangle_ownership_rows,
         "material": {
@@ -2470,7 +2206,8 @@ def run(args: argparse.Namespace) -> None:
     summary = {
         "format": "pixal3d_global_anchor_hr_lr_detail_direct_mesh_merge_v4",
         "image": str(Path(args.image).expanduser().resolve()),
-        "cuda_device": int(args.cuda_device),
+        "cuda_device": requested_cuda_device,
+        "cuda_visible_index": visible_cuda_device,
         "global_camera": global_camera,
         "route": {
             "query_source": (
@@ -2502,12 +2239,34 @@ def run(args: argparse.Namespace) -> None:
                 "successful tile center; owned meshes compacted, concatenated, "
                 "and near-identical global vertices welded"
             ),
+            "projection_and_tiles": (
+                "baseline 1024 O-Voxels projected in canonical 4096 image "
+                "coordinates; 1024x1024 crops with stride 512; each tile "
+                "is remapped into its local camera 1024 O-Voxel index space"
+            ),
+            "excluded_routes": (
+                "CCA, C256 latent, velocity averaging, UV unwrap, GLB, "
+                "Blender, and alternate projective fusion routes"
+            ),
         },
         "comparison_scope": (
-            "full-frame original/global/direct-tile-mesh render metrics plus "
-            "per-tile same-coordinate latent feature diagnostics; no per-tile "
-            "render metrics; extra merged-mesh multi-view visualization"
+            "full-frame original/global/direct-tile-mesh PSNR/SSIM/LPIPS, "
+            "per-tile same-coordinate latent diagnostics, baseline O-Voxel "
+            "projection overlays, and identical-camera baseline-vs-tile "
+            "nvdiffrast multi-view comparisons"
         ),
+        "visualizations": {
+            "baseline_ovoxel_projection_4096": baseline_summary[
+                "ovoxel_projection"
+            ]["projection_png"],
+            "baseline_ovoxel_tile_grid": baseline_summary["ovoxel_projection"][
+                "tile_grid_png"
+            ],
+            "camera_view_three_way": str(comparison_path),
+            "multiview_baseline_vs_tile": multiview_summary.get(
+                "comparison_sheet_png"
+            ),
+        },
         "global_baseline": baseline_summary,
         "tile_owned_direct_global_mesh": merged_summary,
         "metric_delta": delta,

@@ -610,6 +610,7 @@ class Pixal3DImageTo3DPipeline(Pipeline):
         mesh_scale: float = 1.0,
         grid_resolution_override: int = None,
         projection_crop_box: Optional[Sequence[float]] = None,
+        transform_matrix: Optional[torch.Tensor] = None,
     ) -> dict:
         """
         Get proj conditioning for shape/texture stages (sparse-token aligned).
@@ -625,6 +626,10 @@ class Pixal3DImageTo3DPipeline(Pipeline):
             projection_crop_box: Optional normalized crop in the complete
                 camera image. The image model projects globally before mapping
                 points into crop-local feature coordinates.
+            transform_matrix: Optional camera-to-world matrix, shaped [4, 4]
+                or [1, 4, 4]. When omitted, the standard centered front-view
+                camera is used. Sparse tensor identity still comes from
+                ``coords``; this matrix only controls image-feature sampling.
 
         Returns:
             dict with 'cond' and 'neg_cond', each containing {'global': ..., 'proj': SparseTensor}
@@ -647,11 +652,25 @@ class Pixal3DImageTo3DPipeline(Pipeline):
         cam_angle = torch.tensor([camera_angle_x], device=device)
         dist_tensor = torch.tensor([distance], device=device)
         scale_tensor = torch.tensor([mesh_scale], device=device)
+        if transform_matrix is not None:
+            transform_matrix = torch.as_tensor(
+                transform_matrix,
+                dtype=torch.float32,
+                device=device,
+            )
+            if transform_matrix.shape == (4, 4):
+                transform_matrix = transform_matrix.unsqueeze(0)
+            if transform_matrix.shape != (B, 4, 4):
+                raise ValueError(
+                    "transform_matrix must have shape [4, 4] or [1, 4, 4], "
+                    f"got {tuple(transform_matrix.shape)}"
+                )
         z_global, z_proj = image_cond_model(
             image,
             camera_angle_x=cam_angle,
             distance=dist_tensor,
             mesh_scale=scale_tensor,
+            transform_matrix=transform_matrix,
             grid_indices=coords[:, 1:4],
             grid_resolution=grid_res,
             projection_crop_box=projection_crop_box,
