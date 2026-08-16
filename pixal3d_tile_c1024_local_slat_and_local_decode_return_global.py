@@ -79,7 +79,9 @@ from render_pixal3d_raw_ovoxel import (
 GLOBAL_IMAGE_SIZE = 1024
 CANONICAL_IMAGE_SIZE = 4096
 TILE_SIZE = 1024
-TILE_STRIDE = 512
+# The quick follow-up experiment uses a 4x4 partition of the canonical
+# 4096 image: four disjoint 1024 crops per axis, with no overlap/stride halo.
+TILE_STRIDE = TILE_SIZE
 OVOXEL_RESOLUTION = 1024
 LATENT_RESOLUTION = 64
 DEFAULT_ENCODER_ROOT = Path(
@@ -152,6 +154,8 @@ class TileFlowLatents:
     texture_norm: SparseTensor
     texture_denorm: SparseTensor
     stats: Dict[str, Any]
+    velocity_analysis_shape: Dict[str, Any]
+    velocity_analysis_texture: Dict[str, Any]
 
 
 @dataclass
@@ -225,6 +229,30 @@ def _tile_layout(
         for y0 in starts
         for x0 in starts
     ]
+
+
+def _make_lr_tile_image(
+    image_1024: Image.Image,
+    box_4096: Sequence[int],
+) -> Image.Image:
+    """Make the mandated 256 crop from canonical 1024 and resize it to 1024."""
+    if tuple(image_1024.size) != (GLOBAL_IMAGE_SIZE, GLOBAL_IMAGE_SIZE):
+        raise ValueError(
+            "LR velocity analysis expects canonical/global 1024 image, got "
+            f"{image_1024.size}"
+        )
+    if len(box_4096) != 4:
+        raise ValueError(f"tile box must have four coordinates, got {box_4096}")
+    x0, y0, x1, y1 = (int(value) for value in box_4096)
+    scale = float(GLOBAL_IMAGE_SIZE) / float(CANONICAL_IMAGE_SIZE)
+    box_1024 = tuple(int(round(value * scale)) for value in (x0, y0, x1, y1))
+    if box_1024[2] - box_1024[0] != TILE_SIZE // 4 or box_1024[3] - box_1024[1] != TILE_SIZE // 4:
+        raise ValueError(
+            "4096 tile does not map to an exact 256x256 canonical/global 1024 crop: "
+            f"box_4096={tuple(box_4096)} box_1024={box_1024}"
+        )
+    crop = image_1024.crop(box_1024).convert("RGB")
+    return crop.resize((TILE_SIZE, TILE_SIZE), resample=Image.Resampling.BICUBIC)
 
 
 def _parse_tile_ids(value: Optional[str]) -> Optional[set[int]]:
@@ -846,7 +874,9 @@ def _resample_local_attrs_from_global(
     transform: TileCameraTransform,
     query_chunk_size: int,
     face_chunk_size: int,
-) -> Tuple[torch.Tensor, Dict[str, Any]]:
+    global_face_normals: Optional[torch.Tensor] = None,
+    return_mapping: bool = False,
+) -> Any:
     """Sample the baseline PBR field at local surface correspondences.
 
     A local dual-grid cell is assigned every local triangle whose triangle AABB
@@ -874,6 +904,7 @@ def _resample_local_attrs_from_global(
     valid_triangles = torch.isfinite(twice_area) & (twice_area > 1e-12)
     if not bool(valid_triangles.any().item()):
         raise RuntimeError("local geometry contains no non-degenerate triangle")
+    valid_face_ids_cpu = torch.where(valid_triangles)[0].to(torch.long)
     triangles_cpu = triangles_cpu[valid_triangles]
 
     coords_cpu = geometry.coords.to(device="cpu", dtype=torch.int64)
@@ -1094,7 +1125,95 @@ def _resample_local_attrs_from_global(
             "global MeshWithVoxel.query_attrs trilinear query"
         ),
     }
-    return local_attrs.to(device="cpu", dtype=torch.float32), stats
+    if not return_mapping:
+        return local_attrs.to(device="cpu", dtype=torch.float32), stats
+
+    # Keep the numerical resampling above unchanged, but expose the exact
+    # contribution rows used by the weighted material merge.  The visibility
+    # experiment uses these rows to aggregate evidence with the same weights
+    # instead of silently replacing a multi-triangle cell by a new query.
+    local_face_ids = valid_face_ids_cpu.to(device=device).index_select(0, final_faces)
+    if geometry.selected_global_face_ids.numel() == 0:
+        raise RuntimeError("local geometry has no selected global face ids")
+    selected_global_face_ids = geometry.selected_global_face_ids.to(device=device, dtype=torch.long)
+    global_face_ids = selected_global_face_ids.index_select(0, local_face_ids)
+    if global_face_normals is not None:
+        normals = global_face_normals.to(device=device, dtype=torch.float32)
+        if normals.ndim != 2 or normals.shape[1] != 3:
+            raise ValueError(
+                "global_face_normals must have shape [num_global_faces, 3], "
+                f"got {tuple(normals.shape)}"
+            )
+        if bool((global_face_ids < 0).any().item()) or bool(
+            (global_face_ids >= normals.shape[0]).any().item()
+        ):
+            raise RuntimeError("material mapping refers to an invalid global face normal")
+        contribution_normals = normals.index_select(0, global_face_ids)
+        normal_sum = torch.zeros(
+            (centers.shape[0], 3), device=device, dtype=torch.float32
+        )
+        normal_sum.index_add_(0, final_rows, contribution_normals * weights[:, None])
+        aggregate_normals = F.normalize(normal_sum, dim=1, eps=1e-12)
+    else:
+        contribution_normals = torch.zeros(
+            (final_rows.shape[0], 3), device=device, dtype=torch.float32
+        )
+        aggregate_normals = contribution_normals.new_zeros((centers.shape[0], 3))
+
+    # Select the maximum-weight contribution per C1024 entry.  This is the
+    # documented representative-point approximation and is deterministic for
+    # ties because the stable row order follows the original candidate order.
+    order = torch.argsort(final_rows, stable=True)
+    max_weight = torch.zeros_like(weight_sum)
+    if hasattr(max_weight, "scatter_reduce_"):
+        max_weight.scatter_reduce_(
+            0, final_rows, weights, reduce="amax", include_self=False
+        )
+    else:  # pragma: no cover - retained for older torch installations.
+        for row in torch.unique(final_rows, sorted=True).tolist():
+            row_value = int(row)
+            max_weight[row_value] = weights[final_rows == row_value].max()
+    candidate = weights >= (max_weight.index_select(0, final_rows) - 1e-7)
+    candidate_order = order[candidate.index_select(0, order)]
+    candidate_rows = final_rows.index_select(0, candidate_order)
+    first = torch.ones(candidate_rows.shape[0], device=device, dtype=torch.bool)
+    if candidate_rows.numel() > 1:
+        first[1:] = candidate_rows[1:] != candidate_rows[:-1]
+    representative_indices = torch.full(
+        (centers.shape[0],), -1, device=device, dtype=torch.long
+    )
+    representative_indices[candidate_rows[first]] = candidate_order[first]
+    if bool((representative_indices < 0).any().item()):
+        raise RuntimeError("failed to select one material representative per support entry")
+
+    rep = representative_indices
+    mapping = {
+        "local_c1024_coords": coords_cpu.to(torch.int32).cpu(),
+        "local_c1024_centers": centers.detach().cpu().float(),
+        "representative_local_surface_points": final_points.index_select(0, rep).detach().cpu().float(),
+        "representative_global_surface_points": global_surface.index_select(0, rep).detach().cpu().float(),
+        "representative_global_face_ids": global_face_ids.index_select(0, rep).detach().cpu().long(),
+        "representative_barycentric": final_barycentric.index_select(0, rep).detach().cpu().float(),
+        "representative_normals": contribution_normals.index_select(0, rep).detach().cpu().float(),
+        "aggregate_normals": aggregate_normals.detach().cpu().float(),
+        "representative_contribution_weights": weights.index_select(0, rep).detach().cpu().float(),
+        "weight_sum": weight_sum.detach().cpu().float(),
+        "contribution_rows": final_rows.detach().cpu().long(),
+        "contribution_weights": weights.detach().cpu().float(),
+        "contribution_global_surface_points": global_surface.detach().cpu().float(),
+        "contribution_global_face_ids": global_face_ids.detach().cpu().long(),
+        "contribution_normals": contribution_normals.detach().cpu().float(),
+        "representative_selection": "maximum inverse-distance contribution per local C1024 entry",
+        "visibility_aggregation": "all triangle contributions aggregated with the same inverse-distance weights",
+    }
+    stats["guidance_mapping"] = {
+        "returned": True,
+        "entries": int(centers.shape[0]),
+        "contributions": int(final_rows.shape[0]),
+        "has_global_face_normals": global_face_normals is not None,
+        "representative_is_approximation": True,
+    }
+    return local_attrs.to(device="cpu", dtype=torch.float32), stats, mapping
 
 
 def _encode_local_shape(
@@ -1166,8 +1285,11 @@ def _encode_local_pbr(
         device=device, dtype=torch.int32
     )
     attrs = attrs.to(device=device, dtype=torch.float32)
-    # The released PBR encoder is trained on [0,1] attributes mapped to [-1,1].
-    encoder_input = (attrs * 2.0 - 1.0).clamp(-1.0, 1.0)
+    # Map [0,1] attributes to [-1,1] without clipping the physical PBR field.
+    # MRA/hidden fields may intentionally leave [0,1]; clipping here changes
+    # the field before the PBR encoder and makes the single-tile route differ
+    # from the batch route.
+    encoder_input = attrs * 2.0 - 1.0
     sparse = SparseTensor(encoder_input, coords4)
     if low_vram:
         encoder.to(device)
@@ -1271,10 +1393,325 @@ def _native_noised_endpoint(
     )
 
 
+def _sparse_features(value: Any) -> torch.Tensor:
+    """Return feature data from a SparseTensor or a dense trajectory snapshot."""
+    return value.feats if hasattr(value, "feats") else value
+
+
+def _sampler_step_kwargs(params: Mapping[str, Any]) -> Dict[str, Any]:
+    """Keep only kwargs consumed by per-step model inference.
+
+    ``FlowEulerSampler.sample`` consumes the schedule and bookkeeping kwargs
+    before forwarding the rest to ``sample_once``.  The analysis must make the
+    same distinction when calling ``_get_model_prediction`` for the LR branch.
+    """
+    consumed = {
+        "steps",
+        "rescale_t",
+        "verbose",
+        "tqdm_desc",
+        "record_trajectory",
+        "trajectory_device",
+        "return_model_history",
+    }
+    return {key: value for key, value in params.items() if key not in consumed}
+
+
+def _finite_float(value: torch.Tensor) -> float:
+    value = value.detach().to(torch.float32)
+    if not bool(torch.isfinite(value).all().item()):
+        raise RuntimeError("velocity analysis encountered a non-finite tensor")
+    return float(value.item())
+
+
+def _summary_stats(values: torch.Tensor) -> Dict[str, float]:
+    """Summarize one value per token without dropping zero/degenerate tokens."""
+    values = values.detach().to(torch.float32).reshape(-1)
+    if values.numel() == 0:
+        raise RuntimeError("cannot summarize an empty per-token velocity array")
+    if not bool(torch.isfinite(values).all().item()):
+        raise RuntimeError("velocity analysis encountered non-finite per-token values")
+    return {
+        "mean": float(values.mean().item()),
+        "std": float(values.std(unbiased=False).item()),
+        "median": float(values.median().item()),
+        "p10": float(torch.quantile(values, 0.10).item()),
+        "p90": float(torch.quantile(values, 0.90).item()),
+    }
+
+
+def _pairwise_velocity_metrics(
+    first: torch.Tensor,
+    second: torch.Tensor,
+) -> Dict[str, Any]:
+    """Compute global and per-token cosine/angle for [tokens, channels]."""
+    if first.shape != second.shape:
+        raise RuntimeError(
+            "velocity tensors are not shape-aligned: "
+            f"{tuple(first.shape)} vs {tuple(second.shape)}"
+        )
+    if first.ndim != 2:
+        raise RuntimeError(
+            "velocity analysis expects sparse features shaped [tokens, channels], "
+            f"got {tuple(first.shape)}"
+        )
+    first = first.detach().to(torch.float32)
+    second = second.detach().to(torch.float32)
+    if not bool(torch.isfinite(first).all().item()) or not bool(torch.isfinite(second).all().item()):
+        raise RuntimeError("velocity analysis encountered a non-finite velocity")
+
+    eps = torch.finfo(torch.float32).eps
+    first_flat = first.reshape(-1)
+    second_flat = second.reshape(-1)
+    global_denominator = torch.linalg.vector_norm(first_flat) * torch.linalg.vector_norm(second_flat)
+    if float(global_denominator.item()) <= eps:
+        global_cosine = torch.zeros((), device=first.device, dtype=torch.float32)
+    else:
+        global_cosine = torch.dot(first_flat, second_flat) / global_denominator
+    global_cosine = global_cosine.clamp(-1.0, 1.0)
+    global_angle = torch.rad2deg(torch.acos(global_cosine))
+
+    first_norm = torch.linalg.vector_norm(first, dim=1)
+    second_norm = torch.linalg.vector_norm(second, dim=1)
+    token_denominator = first_norm * second_norm
+    token_dot = (first * second).sum(dim=1)
+    token_cosine = torch.where(
+        token_denominator > eps,
+        token_dot / token_denominator.clamp_min(eps),
+        torch.zeros_like(token_dot),
+    ).clamp(-1.0, 1.0)
+    token_angle = torch.rad2deg(torch.acos(token_cosine))
+    return {
+        "global": {
+            "cosine": _finite_float(global_cosine),
+            "angle_deg": _finite_float(global_angle),
+        },
+        "per_token": {
+            "cosine": _summary_stats(token_cosine),
+            "angle_deg": _summary_stats(token_angle),
+            "zero_norm_tokens_first": int((first_norm <= eps).sum().item()),
+            "zero_norm_tokens_second": int((second_norm <= eps).sum().item()),
+        },
+    }
+
+
+def _velocity_norm_metrics(value: torch.Tensor) -> Dict[str, float]:
+    value = value.detach().to(torch.float32)
+    if not bool(torch.isfinite(value).all().item()):
+        raise RuntimeError("velocity analysis encountered a non-finite velocity")
+    return {
+        "l2": float(torch.linalg.vector_norm(value.reshape(-1)).item()),
+        "rms": float(torch.sqrt(torch.mean(value.square())).item()),
+    }
+
+
+def _make_trajectory_state(
+    features: torch.Tensor,
+    coords: torch.Tensor,
+    device: torch.device,
+) -> SparseTensor:
+    features = features.to(device=device)
+    if features.ndim != 2 or features.shape[0] != coords.shape[0]:
+        raise RuntimeError(
+            "trajectory snapshot is not aligned with the local C64 support: "
+            f"features={tuple(features.shape)} coords={tuple(coords.shape)}"
+        )
+    return SparseTensor(feats=features, coords=coords)
+
+
+def _trajectory_integrity(
+    trajectory: Any,
+    final_sample: SparseTensor,
+) -> Dict[str, Any]:
+    """Audit the recorded native states against the native Euler recurrence."""
+    if trajectory is None:
+        raise RuntimeError("native sampler did not return a recorded trajectory")
+    states = list(trajectory.states)
+    velocities = list(trajectory.velocities)
+    times = [float(value) for value in trajectory.times]
+    if len(states) != len(velocities) + 1 or len(times) != len(states):
+        raise RuntimeError(
+            "invalid native trajectory lengths: "
+            f"states={len(states)} velocities={len(velocities)} times={len(times)}"
+        )
+    max_abs = 0.0
+    mean_abs_sum = 0.0
+    value_count = 0
+    for step, velocity in enumerate(velocities):
+        state = states[step].to(torch.float32)
+        next_state = states[step + 1].to(torch.float32)
+        predicted_next = state - float(times[step] - times[step + 1]) * velocity.to(
+            dtype=state.dtype
+        )
+        error = (predicted_next - next_state).abs()
+        if error.numel() > 0:
+            max_abs = max(max_abs, float(error.max().item()))
+            mean_abs_sum += float(error.sum().item())
+            value_count += int(error.numel())
+    final_error = (
+        states[-1].to(torch.float32)
+        - final_sample.feats.detach().to(device="cpu", dtype=torch.float32)
+    ).abs()
+    final_max_abs = float(final_error.max().item()) if final_error.numel() else 0.0
+    max_abs = max(max_abs, final_max_abs)
+    return {
+        "states": int(len(states)),
+        "velocities": int(len(velocities)),
+        "euler_recurrence": "x_next = x_t - (t - t_next) * v_HR",
+        "max_abs_recurrence_error": float(max_abs),
+        "mean_abs_recurrence_error": float(mean_abs_sum / max(value_count, 1)),
+        "final_state_vs_sampler_output_max_abs_error": final_max_abs,
+        "tolerance_for_diagnostic": 1e-5,
+    }
+
+
+@torch.no_grad()
+def _analyze_velocity_trajectory(
+    *,
+    pipeline: Any,
+    sampler: Any,
+    model: torch.nn.Module,
+    stage: str,
+    tile_id: int,
+    coords: torch.Tensor,
+    clean_reference_norm: SparseTensor,
+    normal_result: Any,
+    lr_condition: Mapping[str, Any],
+    model_step_kwargs: Mapping[str, Any],
+    sampler_params: Mapping[str, Any],
+    condition_metadata: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Analyze LR/G velocities on states copied from the untouched HR flow."""
+    if stage not in {"shape", "texture"}:
+        raise ValueError(f"unknown velocity-analysis stage: {stage}")
+    trajectory = getattr(normal_result, "trajectory", None)
+    integrity = _trajectory_integrity(trajectory, normal_result.samples)
+    states = list(trajectory.states)
+    velocities = list(trajectory.velocities)
+    times = [float(value) for value in trajectory.times]
+    device = torch.device(pipeline.device)
+    clean_reference_norm = clean_reference_norm.to(device)
+    if not torch.equal(clean_reference_norm.coords, coords):
+        raise RuntimeError(f"{stage} clean reference support differs from C64 flow support")
+
+    if pipeline.low_vram:
+        model.to(device)
+    records: List[Dict[str, Any]] = []
+    analysis_started = time.perf_counter()
+    try:
+        for step, (state_features, hr_features) in enumerate(zip(states[:-1], velocities)):
+            t = float(times[step])
+            t_next = float(times[step + 1])
+            state = _make_trajectory_state(state_features, coords, device)
+            v_hr = hr_features.to(device=device)
+            v_g = _sparse_features(
+                sampler._xstart_to_pred(state, t, clean_reference_norm)
+            )
+            _, _, v_lr_value = sampler._get_model_prediction(
+                model,
+                state,
+                t,
+                lr_condition["cond"],
+                neg_cond=lr_condition["neg_cond"],
+                **dict(model_step_kwargs),
+            )
+            v_lr = _sparse_features(v_lr_value)
+            if hasattr(v_lr_value, "coords") and not torch.equal(v_lr_value.coords, coords):
+                raise RuntimeError(f"{stage} LR velocity changed the local C64 support")
+            if v_hr.shape != v_lr.shape or v_g.shape != v_hr.shape:
+                raise RuntimeError(
+                    f"{stage} velocity shapes differ at step {step}: "
+                    f"G={tuple(v_g.shape)} HR={tuple(v_hr.shape)} LR={tuple(v_lr.shape)}"
+                )
+            v_detail = v_hr - v_lr
+            pair_metrics = {
+                "G_HR": _pairwise_velocity_metrics(v_g, v_hr),
+                "G_LR": _pairwise_velocity_metrics(v_g, v_lr),
+                "HR_LR": _pairwise_velocity_metrics(v_hr, v_lr),
+                "G_detail": _pairwise_velocity_metrics(v_g, v_detail),
+            }
+            g_norm = torch.linalg.vector_norm(v_g.to(torch.float32).reshape(-1))
+            detail_norm = torch.linalg.vector_norm(v_detail.to(torch.float32).reshape(-1))
+            records.append(
+                {
+                    "step": int(step),
+                    "t": t,
+                    "t_next": t_next,
+                    "dt": float(t - t_next),
+                    "norms": {
+                        "v_G": _velocity_norm_metrics(v_g),
+                        "v_HR": _velocity_norm_metrics(v_hr),
+                        "v_LR": _velocity_norm_metrics(v_lr),
+                        "v_detail": _velocity_norm_metrics(v_detail),
+                    },
+                    "cosine": {
+                        "global": {
+                            key: value["global"]["cosine"]
+                            for key, value in pair_metrics.items()
+                        },
+                        "per_token": {
+                            key: value["per_token"]["cosine"]
+                            for key, value in pair_metrics.items()
+                        },
+                    },
+                    "angle_deg": {
+                        "global": {
+                            key: value["global"]["angle_deg"]
+                            for key, value in pair_metrics.items()
+                        },
+                        "per_token": {
+                            key: value["per_token"]["angle_deg"]
+                            for key, value in pair_metrics.items()
+                        },
+                    },
+                    "detail_to_G_l2_ratio": float(
+                        (detail_norm / g_norm.clamp_min(torch.finfo(torch.float32).eps)).item()
+                    ),
+                    "detail_to_G_rms_ratio": float(
+                        (
+                            torch.sqrt(torch.mean(v_detail.to(torch.float32).square()))
+                            / torch.sqrt(torch.mean(v_g.to(torch.float32).square())).clamp_min(
+                                torch.finfo(torch.float32).eps
+                            )
+                        ).item()
+                    ),
+                }
+            )
+            del state, v_g, v_lr, v_detail, v_lr_value, v_hr  # keep the loop's live set small
+    finally:
+        if pipeline.low_vram:
+            model.cpu()
+    if len(records) != len(velocities):
+        raise RuntimeError(
+            f"{stage} velocity analysis recorded {len(records)} of {len(velocities)} steps"
+        )
+    return {
+        "format": "pixal3d_tile_velocity_analysis_v1",
+        "stage": stage,
+        "tile_id": int(tile_id),
+        "token_count": int(coords.shape[0]),
+        "channel_count": int(clean_reference_norm.feats.shape[1]),
+        "timestep_schedule": times,
+        "sampler": dict(sampler_params),
+        "condition": dict(condition_metadata),
+        "clean_reference": {
+            "name": "G_norm",
+            "source": "global-baseline mesh local C1024 encoder output",
+            "normalization": "stage-specific Pixal3D SLat normalization",
+            "used_for": "v_G = sampler._xstart_to_pred(x_t_HR, t, G_norm)",
+        },
+        "trajectory_integrity": integrity,
+        "steps": records,
+        "analysis_seconds": float(time.perf_counter() - analysis_started),
+    }
+
+
 def _run_native_tile_flow(
     *,
     pipeline: Any,
     tile_image: Image.Image,
+    lr_tile_image: Image.Image,
+    tile_box_4096: Sequence[int],
     transform: TileCameraTransform,
     shape_reference: SparseTensor,
     texture_reference: SparseTensor,
@@ -1293,7 +1730,7 @@ def _run_native_tile_flow(
     if coords.shape[0] > 0 and bool(((coords[:, 1:] < 0) | (coords[:, 1:] >= LATENT_RESOLUTION)).any().item()):
         raise RuntimeError("local latent coordinates lie outside C64")
 
-    shape_condition = pipeline.get_proj_cond_shape(
+    shape_condition_hr = pipeline.get_proj_cond_shape(
         pipeline.image_cond_model_shape_1024,
         [tile_image.convert("RGB")],
         coords,
@@ -1302,7 +1739,21 @@ def _run_native_tile_flow(
         mesh_scale=float(transform.mesh_scale),
         grid_resolution_override=LATENT_RESOLUTION,
     )
-    texture_condition = None
+    # This is deliberately a 256x256 crop from canonical/global 1024, enlarged
+    # to the same 1024x1024 input size as HR.  The camera and sparse support
+    # below remain exactly those of the HR tile.
+    with torch.random.fork_rng(
+        devices=[torch.cuda.current_device()] if device.type == "cuda" else []
+    ):
+        shape_condition_lr = pipeline.get_proj_cond_shape(
+            pipeline.image_cond_model_shape_1024,
+            [lr_tile_image.convert("RGB")],
+            coords,
+            camera_angle_x=float(transform.camera_angle_x),
+            distance=float(transform.distance),
+            mesh_scale=float(transform.mesh_scale),
+            grid_resolution_override=LATENT_RESOLUTION,
+        )
     shape_model = pipeline.models["shape_slat_flow_model_1024"]
     texture_model = pipeline.models["tex_slat_flow_model_1024"]
     merged_shape_params = {**pipeline.shape_slat_sampler_params, **dict(shape_params)}
@@ -1341,10 +1792,12 @@ def _run_native_tile_flow(
         shape_result = pipeline.shape_slat_sampler.sample(
             shape_model,
             shape_noised,
-            **shape_condition,
+            **shape_condition_hr,
             **merged_shape_params,
             verbose=True,
             tqdm_desc=f"Tile {tile_id:02d} shape SLat flow",
+            record_trajectory=True,
+            trajectory_device="cpu",
             return_model_history=False,
         )
     finally:
@@ -1358,10 +1811,51 @@ def _run_native_tile_flow(
     shape_denorm = _denormalize_slat(shape_norm, pipeline.shape_slat_normalization)
     shape_noise_range = _tensor_range(shape_noise.feats)
     shape_noised_reference_range = _tensor_range(shape_noised.feats)
-    del shape_condition, shape_result, shape_noised, shape_noise, shape_clean
+    shape_analysis_started = time.perf_counter()
+    with torch.random.fork_rng(
+        devices=[torch.cuda.current_device()] if device.type == "cuda" else []
+    ):
+        shape_velocity_analysis = _analyze_velocity_trajectory(
+            pipeline=pipeline,
+            sampler=pipeline.shape_slat_sampler,
+            model=shape_model,
+            stage="shape",
+            tile_id=tile_id,
+            coords=coords,
+            clean_reference_norm=shape_clean,
+            normal_result=shape_result,
+            lr_condition=shape_condition_lr,
+            model_step_kwargs=_sampler_step_kwargs(merged_shape_params),
+            sampler_params=merged_shape_params,
+            condition_metadata={
+                "hr_image_condition": "canonical_4096 crop: 1024x1024 HR tile",
+                "lr_image_condition": (
+                    "canonical/global_1024 corresponding 256x256 crop resized to 1024x1024"
+                ),
+                "canonical_4096_tile_box": [int(value) for value in tile_box_4096],
+                "canonical_1024_lr_crop_box": [int(value // 4) for value in tile_box_4096],
+                "hr_lr_only_difference": "image condition; same model, C64 support, local camera, CFG, and sampler parameters",
+                "local_camera": {
+                    "camera_angle_x": float(transform.camera_angle_x),
+                    "distance": float(transform.distance),
+                    "mesh_scale": float(transform.mesh_scale),
+                },
+                "grid_resolution": int(LATENT_RESOLUTION),
+                "support": "same exact encoder C64 coords for HR and LR",
+            },
+        )
+    shape_analysis_seconds = time.perf_counter() - shape_analysis_started
+    del (
+        shape_condition_hr,
+        shape_condition_lr,
+        shape_result,
+        shape_noised,
+        shape_noise,
+        shape_clean,
+    )
     _empty_cuda_cache()
 
-    texture_condition = pipeline.get_proj_cond_shape(
+    texture_condition_hr = pipeline.get_proj_cond_shape(
         pipeline.image_cond_model_tex_1024,
         [tile_image.convert("RGB")],
         coords,
@@ -1370,6 +1864,18 @@ def _run_native_tile_flow(
         mesh_scale=float(transform.mesh_scale),
         grid_resolution_override=LATENT_RESOLUTION,
     )
+    with torch.random.fork_rng(
+        devices=[torch.cuda.current_device()] if device.type == "cuda" else []
+    ):
+        texture_condition_lr = pipeline.get_proj_cond_shape(
+            pipeline.image_cond_model_tex_1024,
+            [lr_tile_image.convert("RGB")],
+            coords,
+            camera_angle_x=float(transform.camera_angle_x),
+            distance=float(transform.distance),
+            mesh_scale=float(transform.mesh_scale),
+            grid_resolution_override=LATENT_RESOLUTION,
+        )
     shape_cond_norm = _normalize_slat(shape_denorm, pipeline.shape_slat_normalization)
     texture_channels = int(texture_model.in_channels) - int(shape_cond_norm.feats.shape[1])
     if texture_channels <= 0:
@@ -1401,10 +1907,12 @@ def _run_native_tile_flow(
             texture_model,
             texture_noised,
             concat_cond=shape_cond_norm,
-            **texture_condition,
+            **texture_condition_hr,
             **merged_texture_params,
             verbose=True,
             tqdm_desc=f"Tile {tile_id:02d} texture SLat flow",
+            record_trajectory=True,
+            trajectory_device="cpu",
             return_model_history=False,
         )
     finally:
@@ -1416,6 +1924,49 @@ def _run_native_tile_flow(
         raise RuntimeError("texture flow changed local latent coordinates")
     texture_seconds = time.perf_counter() - texture_started
     texture_denorm = _denormalize_slat(texture_norm, pipeline.tex_slat_normalization)
+    texture_step_kwargs = _sampler_step_kwargs(merged_texture_params)
+    # The same generated shape support is passed by object identity to the HR
+    # and LR texture calls.  Only texture_condition_{hr,lr} differs.
+    texture_step_kwargs["concat_cond"] = shape_cond_norm
+    texture_analysis_started = time.perf_counter()
+    with torch.random.fork_rng(
+        devices=[torch.cuda.current_device()] if device.type == "cuda" else []
+    ):
+        texture_velocity_analysis = _analyze_velocity_trajectory(
+            pipeline=pipeline,
+            sampler=pipeline.tex_slat_sampler,
+            model=texture_model,
+            stage="texture",
+            tile_id=tile_id,
+            coords=coords,
+            clean_reference_norm=texture_clean,
+            normal_result=texture_result,
+            lr_condition=texture_condition_lr,
+            model_step_kwargs=texture_step_kwargs,
+            sampler_params=merged_texture_params,
+            condition_metadata={
+                "hr_image_condition": "canonical_4096 crop: 1024x1024 HR tile",
+                "lr_image_condition": (
+                    "canonical/global_1024 corresponding 256x256 crop resized to 1024x1024"
+                ),
+                "canonical_4096_tile_box": [int(value) for value in tile_box_4096],
+                "canonical_1024_lr_crop_box": [int(value // 4) for value in tile_box_4096],
+                "hr_lr_only_difference": "image condition; same model, C64 support, local camera, CFG, sampler parameters, and generated shape concat_cond",
+                "generated_shape_concat_cond": {
+                    "source": "normal HR shape flow final normalized SLat",
+                    "same_object_for_hr_and_lr": True,
+                    "support": "same exact local C64 coords",
+                },
+                "local_camera": {
+                    "camera_angle_x": float(transform.camera_angle_x),
+                    "distance": float(transform.distance),
+                    "mesh_scale": float(transform.mesh_scale),
+                },
+                "grid_resolution": int(LATENT_RESOLUTION),
+                "support": "same exact encoder C64 coords for HR and LR",
+            },
+        )
+    texture_analysis_seconds = time.perf_counter() - texture_analysis_started
     stats = {
         "seed": int(seed),
         "shape_tokens": int(shape_norm.feats.shape[0]),
@@ -1428,6 +1979,8 @@ def _run_native_tile_flow(
         "texture_noised_reference_range": _tensor_range(texture_noised.feats),
         "shape_flow_seconds": float(shape_seconds),
         "texture_flow_seconds": float(texture_seconds),
+        "shape_velocity_analysis_seconds": float(shape_analysis_seconds),
+        "texture_velocity_analysis_seconds": float(texture_analysis_seconds),
         "shape_sampler": dict(merged_shape_params),
         "texture_sampler": dict(merged_texture_params),
         "shape_timestep_schedule": [float(v) for v in shape_times],
@@ -1442,10 +1995,20 @@ def _run_native_tile_flow(
             "the unchanged Pixal3D Euler/CFG sampler"
         ),
         "tile_condition": "fresh shape_1024 and tex_1024 DINO projection for the 1024 tile",
+        "lr_analysis_condition": "canonical/global 1024 corresponding 256x256 crop resized to 1024x1024",
         "texture_condition": "generated shape SLat normalized support passed as concat_cond",
         "support_action": "exact local encoder support retained through both flows; no intersection",
     }
-    del texture_condition, texture_result, texture_noised, texture_noise, texture_clean, shape_cond_norm
+    del (
+        texture_condition_hr,
+        texture_condition_lr,
+        texture_result,
+        texture_noised,
+        texture_noise,
+        texture_clean,
+        shape_cond_norm,
+        texture_step_kwargs,
+    )
     _empty_cuda_cache()
     return TileFlowLatents(
         reference_shape=shape_reference,
@@ -1455,6 +2018,8 @@ def _run_native_tile_flow(
         texture_norm=texture_norm,
         texture_denorm=texture_denorm,
         stats=stats,
+        velocity_analysis_shape=shape_velocity_analysis,
+        velocity_analysis_texture=texture_velocity_analysis,
     )
 
 
@@ -2449,6 +3014,200 @@ def _write_tile_summary(tile_dir: Path, record: Mapping[str, Any]) -> None:
     _atomic_json(tile_dir / "summary.json", record)
 
 
+def _aggregate_velocity_stage(analyses: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
+    """Average the per-tile global metrics at each native timestep."""
+    groups: Dict[int, List[Mapping[str, Any]]] = {}
+    for analysis in analyses:
+        for record in analysis.get("steps", []):
+            groups.setdefault(int(record["step"]), []).append(record)
+
+    pair_keys = ("G_HR", "G_LR", "HR_LR", "G_detail")
+
+    def aggregate_values(values: Sequence[float]) -> Dict[str, float]:
+        array = np.asarray(list(values), dtype=np.float64)
+        if array.size == 0:
+            return {"mean": float("nan"), "std": float("nan")}
+        return {
+            "mean": float(array.mean()),
+            "std": float(array.std()),
+            "min": float(array.min()),
+            "max": float(array.max()),
+        }
+
+    per_timestep: List[Dict[str, Any]] = []
+    for step in sorted(groups):
+        records = groups[step]
+        cosine = {
+            key: aggregate_values(
+                row["cosine"]["global"][key] for row in records
+            )
+            for key in pair_keys
+        }
+        angles = {
+            key: aggregate_values(
+                row["angle_deg"]["global"][key] for row in records
+            )
+            for key in pair_keys
+        }
+        per_token_cosine = {
+            key: aggregate_values(
+                row["cosine"]["per_token"][key]["mean"] for row in records
+            )
+            for key in pair_keys
+        }
+        per_token_angles = {
+            key: aggregate_values(
+                row["angle_deg"]["per_token"][key]["mean"] for row in records
+            )
+            for key in pair_keys
+        }
+        per_timestep.append(
+            {
+                "step": int(step),
+                "tile_count": int(len(records)),
+                "t_mean": float(np.mean([float(row["t"]) for row in records])),
+                "t_min": float(min(float(row["t"]) for row in records)),
+                "t_max": float(max(float(row["t"]) for row in records)),
+                "global_cosine": cosine,
+                "global_angle_deg": angles,
+                "per_token_cosine_mean": per_token_cosine,
+                "per_token_angle_deg_mean": per_token_angles,
+                "detail_to_G_l2_ratio": aggregate_values(
+                    row["detail_to_G_l2_ratio"] for row in records
+                ),
+                "detail_to_G_rms_ratio": aggregate_values(
+                    row["detail_to_G_rms_ratio"] for row in records
+                ),
+            }
+        )
+
+    return {
+        "tile_count": int(len(analyses)),
+        "tile_ids": sorted(int(analysis["tile_id"]) for analysis in analyses),
+        "timestep_count": int(len(per_timestep)),
+        "per_timestep": per_timestep,
+        "curves": {
+            "t": [row["t_mean"] for row in per_timestep],
+            "cos_G_HR": [row["global_cosine"]["G_HR"]["mean"] for row in per_timestep],
+            "cos_G_LR": [row["global_cosine"]["G_LR"]["mean"] for row in per_timestep],
+            "cos_G_detail": [row["global_cosine"]["G_detail"]["mean"] for row in per_timestep],
+            "angle_G_HR_deg": [row["global_angle_deg"]["G_HR"]["mean"] for row in per_timestep],
+            "angle_G_LR_deg": [row["global_angle_deg"]["G_LR"]["mean"] for row in per_timestep],
+            "angle_G_detail_deg": [row["global_angle_deg"]["G_detail"]["mean"] for row in per_timestep],
+        },
+    }
+
+
+def _draw_velocity_analysis_plot(
+    output_path: Path,
+    stage_aggregates: Mapping[str, Mapping[str, Any]],
+) -> None:
+    """Draw a dependency-free compact shape/texture global-cosine figure."""
+    width, height = 1280, 720
+    canvas = Image.new("RGB", (width, height), (250, 250, 250))
+    draw = ImageDraw.Draw(canvas)
+    colors = {
+        "cos_G_HR": (207, 50, 70),
+        "cos_G_LR": (40, 110, 190),
+        "cos_G_detail": (45, 150, 85),
+    }
+    labels = {
+        "cos_G_HR": "cos(G,HR)",
+        "cos_G_LR": "cos(G,LR)",
+        "cos_G_detail": "cos(G,HR-LR)",
+    }
+    panel_margin_x = 85
+    panel_gap = 55
+    panel_width = (width - 2 * panel_margin_x - panel_gap) // 2
+    panel_top = 75
+    panel_bottom = height - 75
+    y_min, y_max = -1.05, 1.05
+
+    draw.text((24, 20), "Velocity analysis: global cosine along the real HR trajectory", fill=(20, 20, 20))
+    for panel_index, stage in enumerate(("shape", "texture")):
+        aggregate = stage_aggregates.get(stage, {})
+        curves = aggregate.get("curves", {})
+        left = panel_margin_x + panel_index * (panel_width + panel_gap)
+        right = left + panel_width
+        draw.rectangle((left, panel_top, right, panel_bottom), outline=(50, 50, 50), width=2)
+        draw.text((left, 43), f"{stage} (t: 1 -> 0)", fill=(20, 20, 20))
+        for tick in (-1.0, -0.5, 0.0, 0.5, 1.0):
+            y = int(round(panel_bottom - (tick - y_min) / (y_max - y_min) * (panel_bottom - panel_top)))
+            draw.line((left, y, right, y), fill=(220, 220, 220), width=1)
+            draw.text((left - 32, y - 6), f"{tick:.1f}", fill=(70, 70, 70))
+        draw.text((12, (panel_top + panel_bottom) // 2), "cosine", fill=(40, 40, 40))
+
+        t_values = list(curves.get("t", []))
+        if not t_values:
+            draw.text((left + 30, (panel_top + panel_bottom) // 2), "no successful analysis", fill=(100, 100, 100))
+            continue
+        x_count = len(t_values)
+        x_positions = [
+            left + (right - left) * (index / max(x_count - 1, 1))
+            for index in range(x_count)
+        ]
+        for key, color in colors.items():
+            values = list(curves.get(key, []))
+            points = []
+            for x, value in zip(x_positions, values):
+                y = panel_bottom - (float(value) - y_min) / (y_max - y_min) * (panel_bottom - panel_top)
+                points.append((int(round(x)), int(round(y))))
+            if len(points) == 1:
+                draw.ellipse((points[0][0] - 3, points[0][1] - 3, points[0][0] + 3, points[0][1] + 3), fill=color)
+            elif points:
+                draw.line(points, fill=color, width=3)
+                for point in points:
+                    draw.ellipse((point[0] - 2, point[1] - 2, point[0] + 2, point[1] + 2), fill=color)
+        legend_x = left + 14
+        legend_y = panel_top + 12
+        for key, color in colors.items():
+            draw.line((legend_x, legend_y + 6, legend_x + 24, legend_y + 6), fill=color, width=3)
+            draw.text((legend_x + 30, legend_y), labels[key], fill=(35, 35, 35))
+            legend_x += 150
+        draw.text((left + panel_width // 2 - 25, panel_bottom + 28), "step", fill=(40, 40, 40))
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    canvas.save(output_path)
+
+
+def _write_velocity_analysis_summary(
+    output_dir: Path,
+    velocity_analysis_tiles: Sequence[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    """Write the cross-tile timestep curves, summary JSON, and compact PNG."""
+    shape_analyses = [item["shape"] for item in velocity_analysis_tiles]
+    texture_analyses = [item["texture"] for item in velocity_analysis_tiles]
+    stage_aggregates = {
+        "shape": _aggregate_velocity_stage(shape_analyses),
+        "texture": _aggregate_velocity_stage(texture_analyses),
+    }
+    plot_path = output_dir / "velocity_analysis_curves.png"
+    _draw_velocity_analysis_plot(plot_path, stage_aggregates)
+    summary = {
+        "format": "pixal3d_tile_velocity_analysis_summary_v1",
+        "analysis_scope": "successful local tiles only; no fusion, mask, CCA, or new generation method",
+        "successful_tile_ids": sorted(int(item["tile_id"]) for item in velocity_analysis_tiles),
+        "successful_tile_count": int(len(velocity_analysis_tiles)),
+        "stages": stage_aggregates,
+        "curve_definition": {
+            "x": "native sampler t values, descending from 1 toward 0; step order is retained",
+            "y": "mean across successful tiles of each timestep's global flattened cosine or angle",
+            "global_cosine": "flatten all token/channel entries before cosine",
+            "per_token_cosine": "cosine over channels independently, with mean/std/median/p10/p90 saved per tile and averaged here",
+            "v_detail": "v_HR - v_LR",
+        },
+        "plot_png": str(plot_path),
+    }
+    summary_path = output_dir / "velocity_analysis_summary.json"
+    _atomic_json(summary_path, summary)
+    return {
+        "summary_json": str(summary_path),
+        "plot_png": str(plot_path),
+        "successful_tile_count": int(len(velocity_analysis_tiles)),
+        "shape_timestep_count": int(stage_aggregates["shape"]["timestep_count"]),
+        "texture_timestep_count": int(stage_aggregates["texture"]["timestep_count"]),
+    }
+
+
 def run(args: argparse.Namespace) -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
@@ -2585,6 +3344,7 @@ def run(args: argparse.Namespace) -> None:
 
     tile_records: List[Dict[str, Any]] = []
     returned_patches: List[ReturnedTilePatch] = []
+    velocity_analysis_tiles: List[Dict[str, Any]] = []
     attempted_tiles = 0
     for tile_id, box in enumerate(boxes):
         if requested_ids is not None and tile_id not in requested_ids:
@@ -2592,7 +3352,9 @@ def run(args: argparse.Namespace) -> None:
         tile_dir = output_dir / "tiles" / f"tile_{tile_id:02d}"
         tile_dir.mkdir(parents=True, exist_ok=True)
         tile_image = image_4096.crop(box).convert("RGB")
+        lr_tile_image = _make_lr_tile_image(image_1024, box)
         tile_image.save(tile_dir / "tile_reference.png")
+        lr_tile_image.save(tile_dir / "tile_lr_condition_reference.png")
         transform = _derive_tile_camera(
             tile_id=tile_id,
             box=box,
@@ -2690,6 +3452,8 @@ def run(args: argparse.Namespace) -> None:
             flow_latents = _run_native_tile_flow(
                 pipeline=pipeline,
                 tile_image=tile_image,
+                lr_tile_image=lr_tile_image,
+                tile_box_4096=box,
                 transform=transform,
                 shape_reference=shape_reference,
                 texture_reference=texture_reference,
@@ -2697,6 +3461,14 @@ def run(args: argparse.Namespace) -> None:
                 texture_params=texture_params,
                 seed=tile_seed,
                 tile_id=tile_id,
+            )
+            _atomic_json(
+                tile_dir / "velocity_analysis_shape.json",
+                flow_latents.velocity_analysis_shape,
+            )
+            _atomic_json(
+                tile_dir / "velocity_analysis_texture.json",
+                flow_latents.velocity_analysis_texture,
             )
             decode_started = time.perf_counter()
             with torch.no_grad():
@@ -2795,6 +3567,11 @@ def run(args: argparse.Namespace) -> None:
                 "latent_support": alignment_stats,
                 "reference_slat_decode_seconds": float(reference_decode_seconds),
                 "flow": flow_latents.stats,
+                "velocity_analysis": {
+                    "shape_json": str(tile_dir / "velocity_analysis_shape.json"),
+                    "texture_json": str(tile_dir / "velocity_analysis_texture.json"),
+                    "lr_condition_image": str(tile_dir / "tile_lr_condition_reference.png"),
+                },
                 "flow_decode_seconds": float(decode_seconds),
                 "flow_mesh_pbr_range": _tensor_range(flow_mesh.attrs),
                 "local_surface_similarity": local_surface,
@@ -2804,6 +3581,13 @@ def run(args: argparse.Namespace) -> None:
             }
             tile_records.append(record)
             _write_tile_summary(tile_dir, record)
+            velocity_analysis_tiles.append(
+                {
+                    "tile_id": int(tile_id),
+                    "shape": flow_latents.velocity_analysis_shape,
+                    "texture": flow_latents.velocity_analysis_texture,
+                }
+            )
             # A patch becomes part of the final direct concatenation only
             # after the complete tile flow, decode, PBR query, metrics,
             # optional render/checkpoint path, and tile summary have succeeded.
@@ -2861,6 +3645,10 @@ def run(args: argparse.Namespace) -> None:
     successful_rows = [row for row in tile_records if row["status"] == "success"]
     failed_rows = [row for row in tile_records if row["status"] == "failed"]
     skipped_rows = [row for row in tile_records if row["status"] == "skipped"]
+    velocity_analysis_summary = _write_velocity_analysis_summary(
+        output_dir,
+        velocity_analysis_tiles,
+    )
 
     final_render: Dict[str, Any] = {}
     stitched_mesh: Optional[MeshWithVertexPbr] = None
@@ -2991,6 +3779,7 @@ def run(args: argparse.Namespace) -> None:
             ),
             "mean_tile_flow_seconds": float(np.mean([row["flow"]["shape_flow_seconds"] + row["flow"]["texture_flow_seconds"] for row in successful_rows])),
         }
+    aggregate["velocity_analysis"] = velocity_analysis_summary
     summary = {
         "format": "pixal3d_local_c1024_dual_grid_reference_flow_stitched_v1",
         "image": str(Path(args.image).expanduser().resolve()),
@@ -3003,7 +3792,7 @@ def run(args: argparse.Namespace) -> None:
             "tile_stride": TILE_STRIDE,
             "tile_count": len(boxes),
             "halo": False,
-            "overlap": "natural 50% overlap from adjacent 1024 crops",
+            "overlap": "none; 4x4 disjoint 1024 crops",
             "face_selection": "projected triangle bbox intersects tile rectangle",
             "material": "local dual-grid support -> closest local triangle point -> exact inverse camera -> baseline MeshWithVoxel.query_attrs",
             "local_geometry": "fresh mesh_to_flexible_dual_grid at 1024 for every tile",
@@ -3020,6 +3809,7 @@ def run(args: argparse.Namespace) -> None:
         "failed_tiles": int(len(failed_rows)),
         "skipped_tiles": int(len(skipped_rows)),
         "aggregate": aggregate,
+        "velocity_analysis": velocity_analysis_summary,
         "final_stitched": final_render,
         "tiles": tile_records,
     }
