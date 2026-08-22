@@ -37,7 +37,7 @@ import tempfile
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
@@ -131,6 +131,14 @@ class TileCameraTransform:
     offaxis_cy: float
     tile_center_full_x: float
     tile_center_full_y: float
+    # These names were added after the original 4096 experiment.  The legacy
+    # ``full_*_4096`` fields intentionally remain the source of truth for
+    # backwards-compatible caches; they now describe an arbitrary source
+    # camera image whose dimensions are recorded below.
+    source_width: int = CANONICAL_IMAGE_SIZE
+    source_height: int = CANONICAL_IMAGE_SIZE
+    model_width: int = TILE_SIZE
+    model_height: int = TILE_SIZE
 
 
 @dataclass
@@ -271,6 +279,10 @@ def _derive_tile_camera(
     box: Sequence[int],
     global_camera: Mapping[str, float],
     extend_pixel: int,
+    source_width: int = CANONICAL_IMAGE_SIZE,
+    source_height: int = CANONICAL_IMAGE_SIZE,
+    model_width: int = TILE_SIZE,
+    model_height: int = TILE_SIZE,
 ) -> TileCameraTransform:
     x0, y0, x1, y1 = (int(v) for v in box)
     crop_width = x1 - x0
@@ -278,39 +290,49 @@ def _derive_tile_camera(
     if crop_width <= 0 or crop_height <= 0:
         raise ValueError("tile crop has non-positive dimensions")
 
-    rx = TILE_SIZE / float(crop_width)
-    ry = TILE_SIZE / float(crop_height)
+    if source_width <= 0 or source_height <= 0:
+        raise ValueError("source image dimensions must be positive")
+    if model_width <= 0 or model_height <= 0:
+        raise ValueError("model tile dimensions must be positive")
+    if x0 < 0 or y0 < 0 or x1 > int(source_width) or y1 > int(source_height):
+        raise ValueError(
+            f"tile box {tuple(box)} lies outside source image "
+            f"{source_width}x{source_height}"
+        )
+
+    rx = float(model_width) / float(crop_width)
+    ry = float(model_height) / float(crop_height)
     global_fx = _focal_pixels(
         float(global_camera["camera_angle_x"]), GLOBAL_IMAGE_SIZE
     )
     global_fy = global_fx
-    full_fx = global_fx * CANONICAL_IMAGE_SIZE / GLOBAL_IMAGE_SIZE
-    full_fy = global_fy * CANONICAL_IMAGE_SIZE / GLOBAL_IMAGE_SIZE
-    full_cx = CANONICAL_IMAGE_SIZE / 2.0
-    full_cy = CANONICAL_IMAGE_SIZE / 2.0
+    full_fx = global_fx * float(source_width) / GLOBAL_IMAGE_SIZE
+    full_fy = global_fy * float(source_height) / GLOBAL_IMAGE_SIZE
+    full_cx = float(source_width) / 2.0
+    full_cy = float(source_height) / 2.0
 
     local_fx = full_fx * rx
     local_fy = full_fy * ry
-    local_cx = TILE_SIZE / 2.0
-    local_cy = TILE_SIZE / 2.0
-    angle_x = 2.0 * math.atan(TILE_SIZE / (2.0 * local_fx))
-    angle_y = 2.0 * math.atan(TILE_SIZE / (2.0 * local_fy))
+    local_cx = float(model_width) / 2.0
+    local_cy = float(model_height) / 2.0
+    angle_x = 2.0 * math.atan(float(model_width) / (2.0 * local_fx))
+    angle_y = 2.0 * math.atan(float(model_height) / (2.0 * local_fy))
     mesh_scale = float(global_camera["mesh_scale"])
     distance = distance_from_fov(
         angle_x,
         torch.tensor([-1.0, 0.0, 0.0]),
         torch.tensor(
-            [0.0 - float(extend_pixel), TILE_SIZE - 1.0 + float(extend_pixel)]
+            [0.0 - float(extend_pixel), float(model_width) - 1.0 + float(extend_pixel)]
         ),
         mesh_scale,
-        TILE_SIZE,
+        int(model_width),
     )["distance_from_x"]
 
     return TileCameraTransform(
         tile_id=int(tile_id),
         box=(x0, y0, x1, y1),
-        output_width=TILE_SIZE,
-        output_height=TILE_SIZE,
+        output_width=int(model_width),
+        output_height=int(model_height),
         camera_angle_x=float(angle_x),
         camera_angle_y=float(angle_y),
         distance=float(distance),
@@ -333,6 +355,10 @@ def _derive_tile_camera(
         offaxis_cy=float((full_cy - y0) * ry),
         tile_center_full_x=float(x0 + local_cx / rx),
         tile_center_full_y=float(y0 + local_cy / ry),
+        source_width=int(source_width),
+        source_height=int(source_height),
+        model_width=int(model_width),
+        model_height=int(model_height),
     )
 
 
@@ -396,14 +422,47 @@ def _project_global_q_to_4096(
     )
 
 
+def _project_global_q_to_image(
+    q_global: torch.Tensor,
+    *,
+    global_camera: Mapping[str, float],
+    image_width: int,
+    image_height: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Project a canonical q field to an arbitrary camera-image resolution.
+
+    The original 4096 helper is retained for old experiments.  New callers
+    should use this explicit form so a native 1024 view never has to be
+    materialised at 4096 merely to define projective tiles.
+    """
+    if image_width <= 0 or image_height <= 0:
+        raise ValueError("image dimensions must be positive")
+    points = _camera_q_to_points(
+        q_global,
+        distance=float(global_camera["distance"]),
+        mesh_scale=float(global_camera["mesh_scale"]),
+    )
+    fx = _focal_pixels(float(global_camera["camera_angle_x"]), GLOBAL_IMAGE_SIZE)
+    return _project_points(
+        points,
+        fx=fx * float(image_width) / GLOBAL_IMAGE_SIZE,
+        fy=fx * float(image_height) / GLOBAL_IMAGE_SIZE,
+        cx=float(image_width) / 2.0,
+        cy=float(image_height) / 2.0,
+    )
+
+
 def _global_q_to_local_q(
     q_global: torch.Tensor,
     *,
     global_camera: Mapping[str, float],
     transform: TileCameraTransform,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    uv_full, _, finite = _project_global_q_to_4096(
-        q_global, global_camera=global_camera
+    uv_full, _, finite = _project_global_q_to_image(
+        q_global,
+        global_camera=global_camera,
+        image_width=int(getattr(transform, "source_width", CANONICAL_IMAGE_SIZE)),
+        image_height=int(getattr(transform, "source_height", CANONICAL_IMAGE_SIZE)),
     )
     if not bool(finite.all().item()):
         raise RuntimeError("global-to-local input contains invalid camera projections")
@@ -492,6 +551,8 @@ def _project_face_bboxes(
     mesh_scale: float,
     global_camera: Mapping[str, float],
     chunk_size: int,
+    source_width: int = CANONICAL_IMAGE_SIZE,
+    source_height: int = CANONICAL_IMAGE_SIZE,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Project all triangle corners and return their conservative 2-D bboxes.
 
@@ -508,9 +569,11 @@ def _project_face_bboxes(
     for start in range(0, int(faces.shape[0]), int(chunk_size)):
         face_chunk = faces_long[start : start + chunk_size]
         q = vertices.index_select(0, face_chunk.reshape(-1)).reshape(-1, 3, 3)
-        uv, _, finite = _project_global_q_to_4096(
+        uv, _, finite = _project_global_q_to_image(
             q.reshape(-1, 3) * (2.0 * float(mesh_scale)),
             global_camera=global_camera,
+            image_width=int(source_width),
+            image_height=int(source_height),
         )
         uv = uv.reshape(-1, 3, 2)
         finite = finite.reshape(-1, 3)
@@ -876,6 +939,7 @@ def _resample_local_attrs_from_global(
     face_chunk_size: int,
     global_face_normals: Optional[torch.Tensor] = None,
     return_mapping: bool = False,
+    local_q_to_attr_q: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
 ) -> Any:
     """Sample the baseline PBR field at local surface correspondences.
 
@@ -1089,7 +1153,17 @@ def _resample_local_attrs_from_global(
     q_global_surface, _ = _local_q_to_global_q(
         q_local_surface, global_camera=global_camera, transform=transform
     )
-    global_surface = q_global_surface / (2.0 * float(global_camera["mesh_scale"]))
+    # In the legacy front-camera route this q is already in the baseline
+    # attribute frame.  A multi-view caller supplies the fixed inverse yaw
+    # here before querying the one immutable baseline PBR field.
+    q_attr_surface = (
+        local_q_to_attr_q(q_global_surface)
+        if local_q_to_attr_q is not None
+        else q_global_surface
+    )
+    if q_attr_surface.shape != q_global_surface.shape or not torch.isfinite(q_attr_surface).all():
+        raise RuntimeError("local_q_to_attr_q returned invalid baseline-query coordinates")
+    global_surface = q_attr_surface / (2.0 * float(global_camera["mesh_scale"]))
     queried_attrs = _query_mesh_attrs_chunked(
         global_attr_field, global_surface, chunk_size=query_chunk_size
     )

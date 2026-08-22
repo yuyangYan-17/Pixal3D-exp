@@ -218,6 +218,42 @@ class MeshWithVertexPbr(Mesh):
         )
 
 
+class MeshWithFacePbr(Mesh):
+    """Triangle mesh with one constant PBR value per triangle.
+
+    ``face_attrs`` is intentionally indexed by the rasterizer's triangle id
+    in the renderer.  It must not be passed through ``dr.interpolate``: doing
+    so would turn this representation into vertex/barycentric PBR.
+    """
+
+    def __init__(
+        self,
+        vertices: torch.Tensor,
+        faces: torch.Tensor,
+        face_attrs: torch.Tensor,
+        layout: Dict = {},
+    ):
+        self.vertices = vertices.float()
+        self.faces = faces.int()
+        self.face_attrs = face_attrs
+        self.layout = layout
+        if (
+            self.face_attrs.ndim != 2
+            or self.face_attrs.shape[0] != self.faces.shape[0]
+        ):
+            raise ValueError(
+                "face_attrs must be [M,C] and aligned with faces"
+            )
+
+    def to(self, device, non_blocking=False):
+        return MeshWithFacePbr(
+            self.vertices.to(device, non_blocking=non_blocking),
+            self.faces.to(device, non_blocking=non_blocking),
+            self.face_attrs.to(device, non_blocking=non_blocking),
+            self.layout,
+        )
+
+
 class MeshWithVoxel(Mesh, Voxel):
     def __init__(self,
         vertices: torch.Tensor,

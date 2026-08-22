@@ -5,6 +5,7 @@ __attributes = {
     'Voxel': 'voxel',
     'MeshWithVoxel': 'mesh',
     'MeshWithVertexPbr': 'mesh',
+    'MeshWithFacePbr': 'mesh',
     'MeshWithPbrMaterial': 'mesh',
 }
 
@@ -28,5 +29,5 @@ def __getattr__(name):
 
 # For Pylance
 if __name__ == '__main__':
-    from .mesh import Mesh, MeshWithVoxel, MeshWithVertexPbr, MeshWithPbrMaterial
+    from .mesh import Mesh, MeshWithVoxel, MeshWithVertexPbr, MeshWithFacePbr, MeshWithPbrMaterial
     from .voxel import Voxel

@@ -1,0 +1,25 @@
+========== Input ==========
+Image 1 : 0.png
+Image 2 : 1.png
+Target width  : 3072
+Target height : 1024
+Target resolution : 3072 x 1024
+Resize : enabled
+Black threshold : 10
+
+========== Foreground Image Metrics ==========
+Foreground PSNR : 13.557407 dB
+Foreground SSIM : 0.143885
+
+========== Mask Metrics ==========
+Image 1 object pixels : 1349617
+Image 2 object pixels : 1332557
+Overlap pixels        : 1298665
+Only image 1          : 50952
+Only image 2          : 33892
+Union pixels          : 1383509
+IoU                   : 0.938675
+Mask1 overlap ratio   : 0.962247
+Mask2 overlap ratio   : 0.974566
+Image1 residual ratio : 0.037753
+Image2 residual ratio : 0.025434

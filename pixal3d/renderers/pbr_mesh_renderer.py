@@ -3,7 +3,7 @@ import torch
 from easydict import EasyDict as edict
 import numpy as np
 import utils3d
-from ..representations.mesh import Mesh, MeshWithVoxel, MeshWithVertexPbr, MeshWithPbrMaterial, TextureFilterMode, AlphaMode, TextureWrapMode
+from ..representations.mesh import Mesh, MeshWithVoxel, MeshWithVertexPbr, MeshWithFacePbr, MeshWithPbrMaterial, TextureFilterMode, AlphaMode, TextureWrapMode
 import torch.nn.functional as F
 
 
@@ -258,7 +258,7 @@ class PbrMeshRenderer:
 
     def _render_mesh_with_voxel_face_chunks(
         self,
-        mesh: Union[MeshWithVoxel, MeshWithVertexPbr],
+        mesh: Union[MeshWithVoxel, MeshWithVertexPbr, MeshWithFacePbr],
         extrinsics: torch.Tensor,
         intrinsics: torch.Tensor,
         envmap: Dict[str, EnvMap],
@@ -317,8 +317,13 @@ class PbrMeshRenderer:
         )
 
         vertex_pbr = isinstance(mesh, MeshWithVertexPbr)
+        face_pbr = isinstance(mesh, MeshWithFacePbr)
         material_channels = (
-            int(mesh.vertex_attrs.shape[-1]) if vertex_pbr else 3
+            int(mesh.vertex_attrs.shape[-1])
+            if vertex_pbr
+            else int(mesh.face_attrs.shape[-1])
+            if face_pbr
+            else 3
         )
         # Packed per-layer geometry:
         # camera depth (1), transformed position (3), world normal (3), then
@@ -390,6 +395,18 @@ class PbrMeshRenderer:
                             rast,
                             faces,
                         )[0][0]
+                    elif face_pbr:
+                        # nvdiffrast's triangle id is local to this face
+                        # chunk.  Convert it back to the global face index
+                        # before indexing the one-PBR-per-face table.
+                        tri_id = rast[0, ..., -1].long() - 1
+                        tri_id = tri_id.clamp(0, face_end - face_start - 1)
+                        material_payload = mesh.face_attrs[
+                            face_start + tri_id
+                        ]
+                        material_payload = material_payload * mask.to(
+                            material_payload.dtype
+                        )
                     else:
                         material_payload = dr.interpolate(
                             vertices_orig,
@@ -503,7 +520,7 @@ class PbrMeshRenderer:
         )
         alpha = torch.zeros_like(max_w)
         rotation = extrinsics_batched[..., :3, :3].reshape(1, 1, 3, 3)
-        if not vertex_pbr:
+        if not vertex_pbr and not face_pbr:
             ov_coords = torch.cat(
                 [torch.zeros_like(mesh.coords[..., :1]), mesh.coords],
                 dim=-1,
@@ -523,7 +540,7 @@ class PbrMeshRenderer:
 
             pos_orig = None
             xyz = None
-            if vertex_pbr:
+            if vertex_pbr or face_pbr:
                 img = packed[..., 7:] * layer_valid.to(packed.dtype)
                 gb_basecolor = img[..., mesh.layout['base_color']]
                 gb_metallic = img[..., mesh.layout['metallic']]
@@ -728,7 +745,7 @@ class PbrMeshRenderer:
             face_chunk_size=face_chunk_size,
         )
         if (
-            isinstance(mesh, (MeshWithVoxel, MeshWithVertexPbr))
+            isinstance(mesh, (MeshWithVoxel, MeshWithVertexPbr, MeshWithFacePbr))
             and face_chunk_size > 0
             and mesh.faces.shape[0] > face_chunk_size
         ):
@@ -810,6 +827,20 @@ class PbrMeshRenderer:
                     gb_metallic = img[0, ..., mesh.layout['metallic']]
                     gb_roughness = img[0, ..., mesh.layout['roughness']]
                     gb_alpha = img[0, ..., mesh.layout['alpha']]
+                elif isinstance(mesh, MeshWithFacePbr):
+                    # Use the rasterized global triangle id directly.  No
+                    # interpolation is performed, so every pixel in a face
+                    # receives exactly the centroid-sampled face PBR.
+                    tri_id = rast[0, ..., -1].long() - 1
+                    tri_id = tri_id.clamp(0, mesh.face_attrs.shape[0] - 1)
+                    mask = rast[0, ..., -1:] > 0
+                    img = mesh.face_attrs[tri_id] * mask.to(
+                        mesh.face_attrs.dtype
+                    )
+                    gb_basecolor = img[..., mesh.layout['base_color']]
+                    gb_metallic = img[..., mesh.layout['metallic']]
+                    gb_roughness = img[..., mesh.layout['roughness']]
+                    gb_alpha = img[..., mesh.layout['alpha']]
                 elif isinstance(mesh, MeshWithVoxel):
                     if 'grid_sample_3d' not in globals():
                         from flex_gemm.ops.grid_sample import grid_sample_3d

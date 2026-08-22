@@ -47,10 +47,6 @@ import pixal3d.models as pixal3d_models
 from inference import MODEL_PATH
 from o_voxel.convert import flexible_dual_grid_to_mesh
 from pixal3d.modules.sparse import SparseTensor
-from pixal3d.modules.sparse.basic import VarLenTensor, varlen_cat, sparse_cat
-import pixal3d.modules.sparse.conv.conv_flex_gemm as _flex_gemm_backend
-import pixal3d.modules.sparse.linear as _sparse_linear_backend
-import pixal3d.modules.sparse.attention.modules as _sparse_attention_modules
 from pixal3d.models.sc_vaes.sparse_unet_vae import SparseConvNeXtBlock3d
 from pixal3d.models.sc_vaes.sparse_unet_vae import SparseUnetVaeDecoder
 from pixal3d.modules.sparse.transformer.modulated import ModulatedSparseTransformerCrossBlock
@@ -235,7 +231,6 @@ def _parse_tile_id_list(value: Optional[str]) -> Tuple[int, ...]:
 
 _ACTIVE_LAYER_RECORDER: Optional["LayerTraceRecorder"] = None
 _ACTIVE_LAYER_TILE_IDS: Tuple[int, ...] = ()
-_ACTIVE_LAYER_CONTEXT_ID: int = 0
 
 
 def _layer_sample_summary(value: Any, tile_ids: Sequence[int]) -> Any:
@@ -299,7 +294,6 @@ class LayerTraceRecorder:
     def __init__(self) -> None:
         self.records: List[Dict[str, Any]] = []
         self.call_counts: Dict[str, int] = {}
-        self.context_counts: Dict[Tuple[int, str], int] = {}
 
     def attach(self, module_roots: Sequence[Tuple[str, torch.nn.Module]]) -> List[Any]:
         handles: List[Any] = []
@@ -324,23 +318,6 @@ class LayerTraceRecorder:
                     call_index = self.call_counts[module_name]
                     self.call_counts[module_name] = call_index + 1
                     output_summary = _layer_sample_summary(output, active_tiles)
-                    # The backend isolation fallback invokes a module once per
-                    # sample while the surrounding context still carries the
-                    # original B>1 tile list.  Assign those B=1 callbacks in
-                    # call order to the active tile ids so layer comparisons do
-                    # not mistake an implementation fallback for divergence.
-                    if (
-                        isinstance(output_summary, Mapping)
-                        and output_summary.get("type") == "SparseTensor"
-                        and len(active_tiles) > 1
-                        and len(output_summary.get("tiles", {})) == 1
-                    ):
-                        context_key = (_ACTIVE_LAYER_CONTEXT_ID, module_name)
-                        local_index = self.context_counts.get(context_key, 0)
-                        self.context_counts[context_key] = local_index + 1
-                        only_summary = next(iter(output_summary["tiles"].values()))
-                        assigned_tile = active_tiles[local_index % len(active_tiles)]
-                        output_summary["tiles"] = {str(assigned_tile): only_summary}
                     self.records.append(
                         {
                             "module": module_name,
@@ -390,16 +367,13 @@ def _layer_trace_hooks(pipeline: Any, pbr_encoder: torch.nn.Module) -> Iterable[
 
 @contextmanager
 def _layer_trace_active(tile_ids: Sequence[int]) -> Iterable[None]:
-    global _ACTIVE_LAYER_TILE_IDS, _ACTIVE_LAYER_CONTEXT_ID
+    global _ACTIVE_LAYER_TILE_IDS
     previous = _ACTIVE_LAYER_TILE_IDS
-    previous_context = _ACTIVE_LAYER_CONTEXT_ID
-    _ACTIVE_LAYER_CONTEXT_ID += 1
     _ACTIVE_LAYER_TILE_IDS = tuple(int(v) for v in tile_ids)
     try:
         yield
     finally:
         _ACTIVE_LAYER_TILE_IDS = previous
-        _ACTIVE_LAYER_CONTEXT_ID = previous_context
 
 
 @dataclass
@@ -1388,21 +1362,16 @@ def _prediction_phase(
             [base._move_condition(condition_by_tile[tile_id], torch.device("cuda")) for tile_id in tile_ids],
             tile_ids,
         )
-        # Keep the flow-model outer call batched.  Its internal sparse
-        # flex_gemm/Linear/ConvNeXt kernels can become batch-size dependent
-        # after the first Euler update, so isolate only those kernels exactly
-        # as in the decoder and PBR encoder paths.
         with _layer_trace_active(tile_ids):
-            with _batch_backend_kernel_isolation(enabled=len(group) > 1, batch_size=len(group)):
-                pred_x0_batch, _, pred_v_batch = sampler._get_model_prediction(
-                    model,
-                    packed_state.value,
-                    float(t),
-                    cond=condition["cond"],
-                    neg_cond=condition["neg_cond"],
-                    concat_cond=packed_shape.value,
-                    **dict(step_kwargs),
-                )
+            pred_x0_batch, _, pred_v_batch = sampler._get_model_prediction(
+                model,
+                packed_state.value,
+                float(t),
+                cond=condition["cond"],
+                neg_cond=condition["neg_cond"],
+                concat_cond=packed_shape.value,
+                **dict(step_kwargs),
+            )
         if not isinstance(pred_x0_batch, SparseTensor) or not isinstance(pred_v_batch, SparseTensor):
             raise RuntimeError("batched official prediction did not return SparseTensor")
         pred_x0_values = unpack_sparse_batch(pred_x0_batch, packed_state)
@@ -1440,9 +1409,8 @@ def _decode_one_batch(
     args: argparse.Namespace,
     low_vram: bool,
     step_index: int,
-    allow_fallback: bool = True,
 ) -> Tuple[Dict[int, MeshWithVoxel], Dict[int, torch.Tensor], Dict[int, Dict[str, Any]], Dict[str, Any]]:
-    """Decode one microbatch; query_attrs stays per tile after decoder batching."""
+    """Decode one physical sparse microbatch; never silently serialize it."""
     tile_ids = [int(context.tile_id) for context in contexts]
     shape_values = [
         _move_sparse(context.shape_denorm, torch.device("cuda")) if low_vram else context.shape_denorm
@@ -1458,44 +1426,13 @@ def _decode_one_batch(
     texture_pack = pack_sparse_batch(texture_values, tile_ids)
     texture_batch = _denormalize_slat(texture_pack.value, pipeline.tex_slat_normalization)
     decode_model_started = time.perf_counter()
-    try:
-        with _layer_trace_active(tile_ids):
-            decoded_list = _decode_latent_batch_safe(
-                pipeline=pipeline,
-                shape_batch=shape_batch,
-                texture_batch=texture_batch,
-            )
-        _sync_cuda()
-    except torch.cuda.OutOfMemoryError as exc:
-        if not allow_fallback or len(contexts) == 1:
-            raise
-        _empty_cuda_cache()
-        reason = f"decode batch {tile_ids} OOM: {type(exc).__name__}: {exc}"
-        all_meshes: Dict[int, MeshWithVoxel] = {}
-        all_fields: Dict[int, torch.Tensor] = {}
-        all_stats: Dict[int, Dict[str, Any]] = {}
-        total_stats = {"fallback_reason": reason, "requested_batch_size": len(contexts), "actual_batch_size": 1}
-        for context in contexts:
-            meshes, fields, stats, _ = _decode_one_batch(
-                contexts=[context],
-                predictions=predictions,
-                pipeline=pipeline,
-                args=args,
-                low_vram=low_vram,
-                step_index=step_index,
-                allow_fallback=False,
-            )
-            all_meshes.update(meshes)
-            all_fields.update(fields)
-            all_stats.update(stats)
-        total_stats["decoder_forward_calls"] = 2 * len(contexts)
-        total_stats["decode_model_seconds"] = float(
-            sum(float(value.get("decode_model_seconds", 0.0)) for value in all_stats.values())
+    with _layer_trace_active(tile_ids):
+        decoded_list = _decode_latent_batch_safe(
+            pipeline=pipeline,
+            shape_batch=shape_batch,
+            texture_batch=texture_batch,
         )
-        total_stats["query_attrs_seconds"] = float(
-            sum(float(value.get("query_attrs_seconds", 0.0)) for value in all_stats.values())
-        )
-        return all_meshes, all_fields, all_stats, total_stats
+    _sync_cuda()
     decode_model_seconds = float(time.perf_counter() - decode_model_started)
     if not isinstance(decoded_list, list) or len(decoded_list) != len(contexts):
         raise RuntimeError(
@@ -1543,7 +1480,6 @@ def _decode_one_batch(
         "decoder_forward_calls": 2,
         "decode_model_seconds": decode_model_seconds,
         "query_attrs_seconds": float(sum(float(value["query_attrs_seconds"]) for value in stats.values())),
-        "fallback_reason": None,
     }
 
 
@@ -1570,12 +1506,9 @@ def _decode_latent_batch_safe(
     if pipeline.low_vram:
         shape_decoder.to(pipeline.device)
         shape_decoder.low_vram = True
-    with _batch_backend_kernel_isolation(
-        enabled=int(shape_batch.shape[0]) > 1, batch_size=int(shape_batch.shape[0])
-    ):
-        decoded_shape = SparseUnetVaeDecoder.forward(
-            shape_decoder, shape_batch, return_subs=True
-        )
+    decoded_shape = SparseUnetVaeDecoder.forward(
+        shape_decoder, shape_batch, return_subs=True
+    )
     if pipeline.low_vram:
         shape_decoder.cpu()
         shape_decoder.low_vram = False
@@ -1608,10 +1541,7 @@ def _decode_latent_batch_safe(
                 )
             )
         )
-    with _batch_backend_kernel_isolation(
-        enabled=int(texture_batch.shape[0]) > 1, batch_size=int(texture_batch.shape[0])
-    ):
-        tex_voxels = pipeline.decode_tex_slat(texture_batch, subs)
+    tex_voxels = pipeline.decode_tex_slat(texture_batch, subs)
     if not isinstance(tex_voxels, SparseTensor) or len(meshes) != int(shape_batch.shape[0]):
         raise RuntimeError("safe batched decoder returned an unexpected shape/texture result")
     outputs: List[MeshWithVoxel] = []
@@ -1638,210 +1568,6 @@ def _decode_latent_batch_safe(
     return outputs
 
 
-def _split_sparse_batch(value: SparseTensor) -> List[SparseTensor]:
-    """Split a physically contiguous sparse batch into local B=1 tensors."""
-    values: List[SparseTensor] = []
-    for batch_id in range(int(value.shape[0])):
-        mask = value.coords[:, 0] == int(batch_id)
-        coords = value.coords[mask].detach().clone()
-        coords[:, 0] = 0
-        values.append(SparseTensor(value.feats[mask].contiguous(), coords.contiguous()))
-    return values
-
-
-def _pack_sparse_locals(values: Sequence[SparseTensor]) -> SparseTensor:
-    """Pack local B=1 sparse tensors after a targeted backend fallback."""
-    return pack_sparse_batch(values, tuple(range(len(values)))).value
-
-
-def _split_apply_sparse_module(
-    original_forward: Any, module: Any, value: SparseTensor
-) -> SparseTensor:
-    """Apply one backend module per sample and restore a real sparse batch."""
-    outputs = [original_forward(module, local) for local in _split_sparse_batch(value)]
-    if not all(isinstance(output, SparseTensor) for output in outputs):
-        raise RuntimeError("decoder backend fallback returned a non-sparse output")
-    return _pack_sparse_locals(outputs)
-
-
-@contextmanager
-def _batch_backend_kernel_isolation(enabled: bool, batch_size: int = 2):
-    """Isolate backend kernels known to change with sparse batch size.
-
-    The outer encoder/shape/texture forward remains a single batch call.  The
-    flex_gemm sparse convolution, SparseLinear GEMM, the sparse flow
-    transformer block (including its dense MLP/attention projections), the
-    ConvNeXt block, and sparse Flash Attention varlen kernels are the concrete
-    paths whose B=2 results diverged from B=1. Their per-sample outputs are
-    immediately repacked before the next model operation.
-    """
-    if not enabled:
-        yield
-        return
-    original_conv = _flex_gemm_backend.sparse_conv3d_forward
-    original_linear = _sparse_linear_backend.SparseLinear.forward
-    original_convnext = SparseConvNeXtBlock3d.forward
-    original_attention = _sparse_attention_modules.sparse_scaled_dot_product_attention
-    original_transformer_block = ModulatedSparseTransformerCrossBlock.forward
-    original_dense_linear = torch.nn.Linear.forward
-
-    def isolated_conv(module: Any, value: SparseTensor) -> SparseTensor:
-        if int(value.shape[0]) > 1:
-            return _split_apply_sparse_module(original_conv, module, value)
-        return original_conv(module, value)
-
-    def isolated_linear(module: Any, value: SparseTensor) -> SparseTensor:
-        if int(value.shape[0]) > 1:
-            return _split_apply_sparse_module(original_linear, module, value)
-        return original_linear(module, value)
-
-    def isolated_convnext(module: Any, value: SparseTensor) -> SparseTensor:
-        if int(value.shape[0]) > 1:
-            return _split_apply_sparse_module(original_convnext, module, value)
-        return original_convnext(module, value)
-
-    def select_batch_value(
-        value: Any, batch_id: int, total_tokens: int, token_slice: slice
-    ) -> Any:
-        if isinstance(value, SparseTensor):
-            if int(value.shape[0]) == int(batch_size):
-                return value[batch_id]
-            return value
-        if isinstance(value, VarLenTensor):
-            if int(value.shape[0]) == int(batch_size):
-                return value[batch_id]
-            return value
-        if isinstance(value, Mapping):
-            # Multi-tile contexts carry a tile bank rather than a sample
-            # batch; the paired attention module owns that routing metadata.
-            if value.get("mode") == "multi_tile_paired" or "global_bank" in value:
-                return value
-            return {
-                key: select_batch_value(item, batch_id, total_tokens, token_slice)
-                for key, item in value.items()
-            }
-        if isinstance(value, (list, tuple)):
-            selected = [
-                select_batch_value(item, batch_id, total_tokens, token_slice)
-                for item in value
-            ]
-            return type(value)(selected)
-        if (
-            isinstance(value, torch.Tensor)
-            and value.ndim >= 1
-            and int(value.shape[0]) == int(batch_size)
-        ):
-            return value[batch_id : batch_id + 1]
-        if (
-            isinstance(value, torch.Tensor)
-            and value.ndim >= 1
-            and int(value.shape[0]) == int(total_tokens)
-        ):
-            return value[token_slice]
-        return value
-
-    def isolated_transformer_block(
-        module: Any, value: SparseTensor, mod: torch.Tensor, context: Any
-    ) -> SparseTensor:
-        if int(value.shape[0]) <= 1:
-            return original_transformer_block(module, value, mod, context)
-        total_tokens = int(value.feats.shape[0])
-        outputs = []
-        for batch_id, token_slice in enumerate(value.layout):
-            local_value = value[batch_id]
-            local_mod = (
-                mod[batch_id : batch_id + 1]
-                if isinstance(mod, torch.Tensor)
-                and mod.ndim >= 1
-                and int(mod.shape[0]) == int(batch_size)
-                else mod
-            )
-            local_context = select_batch_value(
-                context, batch_id, total_tokens, token_slice
-            )
-            outputs.append(
-                original_transformer_block(
-                    module, local_value, local_mod, local_context
-                )
-            )
-        if not all(isinstance(output, SparseTensor) for output in outputs):
-            raise RuntimeError("isolated flow block returned a non-sparse output")
-        return sparse_cat(outputs, dim=0)
-
-    def isolated_dense_linear(module: Any, value: torch.Tensor) -> torch.Tensor:
-        if (
-            isinstance(value, torch.Tensor)
-            and value.ndim >= 1
-            and int(value.shape[0]) == int(batch_size)
-            and int(batch_size) > 1
-        ):
-            return torch.cat(
-                [original_dense_linear(module, value[i : i + 1]) for i in range(batch_size)],
-                dim=0,
-            )
-        return original_dense_linear(module, value)
-
-    def isolated_attention(*attention_args: Any, **attention_kwargs: Any) -> Any:
-        """Run each varlen attention sequence with the serial kernel shape."""
-        values = list(attention_args) + list(attention_kwargs.values())
-        batch_value = next(
-            (value for value in values if isinstance(value, VarLenTensor)), None
-        )
-        if batch_value is None or int(batch_value.shape[0]) <= 1:
-            return original_attention(*attention_args, **attention_kwargs)
-        batch_size = int(batch_value.shape[0])
-
-        def select(value: Any, batch_id: int) -> Any:
-            if isinstance(value, VarLenTensor):
-                return value[batch_id]
-            if (
-                isinstance(value, torch.Tensor)
-                and value.ndim >= 1
-                and int(value.shape[0]) == batch_size
-            ):
-                return value[batch_id : batch_id + 1]
-            return value
-
-        outputs = []
-        for batch_id in range(batch_size):
-            local_args = tuple(select(value, batch_id) for value in attention_args)
-            local_kwargs = {
-                key: select(value, batch_id)
-                for key, value in attention_kwargs.items()
-            }
-            outputs.append(original_attention(*local_args, **local_kwargs))
-        first = outputs[0]
-        if isinstance(first, SparseTensor):
-            if not all(isinstance(value, SparseTensor) for value in outputs):
-                raise RuntimeError("isolated attention changed sparse output type")
-            return sparse_cat(outputs, dim=0)
-        if isinstance(first, VarLenTensor):
-            if not all(isinstance(value, VarLenTensor) for value in outputs):
-                raise RuntimeError("isolated attention changed varlen output type")
-            return varlen_cat(outputs, dim=0)
-        if isinstance(first, torch.Tensor):
-            if not all(isinstance(value, torch.Tensor) for value in outputs):
-                raise RuntimeError("isolated attention changed dense output type")
-            return torch.cat(outputs, dim=0)
-        raise RuntimeError(f"unsupported isolated attention output type {type(first)!r}")
-
-    _flex_gemm_backend.sparse_conv3d_forward = isolated_conv
-    _sparse_linear_backend.SparseLinear.forward = isolated_linear
-    SparseConvNeXtBlock3d.forward = isolated_convnext
-    ModulatedSparseTransformerCrossBlock.forward = isolated_transformer_block
-    torch.nn.Linear.forward = isolated_dense_linear
-    _sparse_attention_modules.sparse_scaled_dot_product_attention = isolated_attention
-    try:
-        yield
-    finally:
-        _flex_gemm_backend.sparse_conv3d_forward = original_conv
-        _sparse_linear_backend.SparseLinear.forward = original_linear
-        SparseConvNeXtBlock3d.forward = original_convnext
-        ModulatedSparseTransformerCrossBlock.forward = original_transformer_block
-        torch.nn.Linear.forward = original_dense_linear
-        _sparse_attention_modules.sparse_scaled_dot_product_attention = original_attention
-
-
 def _decode_phase(
     *,
     contexts: Sequence[Any],
@@ -1857,7 +1583,6 @@ def _decode_phase(
     fields: Dict[int, torch.Tensor] = {}
     stats: Dict[int, Dict[str, Any]] = {}
     microbatches: List[int] = []
-    fallback_reasons: List[str] = []
     if mode == "serial":
         groups = [[context] for context in contexts]
     else:
@@ -1895,8 +1620,6 @@ def _decode_phase(
         model_seconds += float(call_stats.get("decode_model_seconds", 0.0))
         query_seconds += float(call_stats.get("query_attrs_seconds", 0.0))
         microbatches.append(int(call_stats.get("actual_batch_size", len(group))))
-        if call_stats.get("fallback_reason"):
-            fallback_reasons.append(str(call_stats["fallback_reason"]))
     return meshes, fields, stats, {
         "seconds": float(time.perf_counter() - started),
         "decoder_forward_calls": calls,
@@ -1904,7 +1627,6 @@ def _decode_phase(
         "actual_decode_batch_sizes": microbatches,
         "decode_model_seconds": model_seconds,
         "query_attrs_seconds": query_seconds,
-        "fallback_reason": "; ".join(fallback_reasons) if fallback_reasons else None,
     }
 
 
@@ -2066,11 +1788,8 @@ def _encode_pbr_batch(
         else input_pack.value
     )
     with _layer_trace_active(tile_ids):
-        with _batch_backend_kernel_isolation(
-            enabled=len(contexts) > 1, batch_size=len(contexts)
-        ):
-            with torch.no_grad():
-                latent_batch = pbr_encoder(encoder_input_batch, sample_posterior=False)
+        with torch.no_grad():
+            latent_batch = pbr_encoder(encoder_input_batch, sample_posterior=False)
     _sync_cuda()
     if low_vram:
         pbr_encoder.cpu()
@@ -2698,7 +2417,6 @@ def run_flow(
                     "decode": decode_phase_stats["actual_decode_batch_sizes"],
                     "encode": encode_stats["actual_batch_sizes"],
                     "correction": correction_stats["actual_batch_sizes"],
-                    "decode_fallback_reason": decode_phase_stats.get("fallback_reason"),
                 },
                 "tiles": tile_records,
                 "peak_cuda_memory": {
