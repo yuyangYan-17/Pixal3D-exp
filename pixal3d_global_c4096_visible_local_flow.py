@@ -572,12 +572,31 @@ def _run_global_flow(
             _empty_cuda_cache()
 
             corrected_x0: Dict[int, Any] = {}
+            cycle_diagnostics: Dict[int, Dict[str, Any]] = {}
             pbr_encoder = getattr(args, "_pbr_encoder_instance", None)
             if pbr_encoder is None:
                 raise RuntimeError("PBR encoder instance missing from global flow args")
             pbr_encoder.to("cuda")
             for group in pbr_encode_groups:
-                corrected_x0.update(mv._encode_fused_batch(group, fused_fields, predictions, pbr_encoder, pipeline))
+                encoded_result = mv._encode_fused_batch(
+                    group,
+                    fused_fields,
+                    predictions,
+                    pbr_encoder,
+                    pipeline,
+                    self_fields={
+                        context.context_id: snapshots[context.context_id].target_field.cpu()
+                        for context in group
+                    },
+                    cycle_correction=bool(args.cycle_correction),
+                    return_diagnostics=bool(args.cycle_correction),
+                )
+                if bool(args.cycle_correction):
+                    encoded_batch, diagnostics_batch = encoded_result
+                    corrected_x0.update(encoded_batch)
+                    cycle_diagnostics.update(diagnostics_batch)
+                else:
+                    corrected_x0.update(encoded_result)
             pbr_encoder.cpu()
             _empty_cuda_cache()
 
@@ -592,6 +611,8 @@ def _run_global_flow(
                     "tile_id": int(context.tile_id),
                     **mv._quantiles(delta),
                 })
+                if bool(args.cycle_correction):
+                    correction_rows[-1].update(cycle_diagnostics[context.context_id])
 
             next_states: Dict[int, Any] = {}
             for group in flow_groups:
@@ -632,7 +653,7 @@ def _run_global_flow(
             }
             _atomic_json(output_dir / "steps" / f"step_{step_index:02d}_summary.json", record)
             rows.append(record)
-            del predictions, snapshots, fused_fields, corrected_x0, global_count, global_view_mask, correction_rows
+            del predictions, snapshots, fused_fields, corrected_x0, cycle_diagnostics, global_count, global_view_mask, correction_rows
             _empty_cuda_cache()
     finally:
         model.cpu()
@@ -641,7 +662,9 @@ def _run_global_flow(
         "schedule": schedule,
         "start_index": start,
         "steps": rows,
-        "route": "all context flow forward -> endpoint decode -> global C4096 visible donor Gaussian fusion -> local query -> PBR re-encode -> xstart_to_pred -> synchronous Euler",
+        "route": "all context flow forward -> endpoint decode -> global C4096 visible donor Gaussian fusion -> local query -> fused/self PBR re-encode -> cycle residual -> xstart_to_pred -> synchronous Euler" if bool(args.cycle_correction) else "all context flow forward -> endpoint decode -> global C4096 visible donor Gaussian fusion -> local query -> PBR re-encode -> xstart_to_pred -> synchronous Euler",
+        "cycle_correction": bool(args.cycle_correction),
+        "cycle_correction_coefficient": 1.0 if bool(args.cycle_correction) else 0.0,
         "flow_batch_size": flow_batch_size,
         "decode_batch_size": decode_batch_size,
         "pbr_encode_batch_size": pbr_encode_batch_size,
@@ -829,6 +852,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--texture-guidance-strength", type=float, default=1.0)
     parser.add_argument("--texture-guidance-rescale", type=float, default=0.0)
     parser.add_argument("--texture-rescale-t", type=float, default=3.0)
+    parser.add_argument(
+        "--cycle-correction",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="use x0_pred + (E(P_fused)-E(P_self)); fixed coefficient 1.0",
+    )
     parser.add_argument("--low-vram", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--debug", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--render", action=argparse.BooleanOptionalAction, default=True)
@@ -884,6 +913,8 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         "initial_encode_batch_size": int(args.initial_encode_batch_size),
         "decode_batch_size": int(args.decode_batch_size),
         "pbr_encode_batch_size": int(args.pbr_encode_batch_size),
+        "cycle_correction": bool(args.cycle_correction),
+        "cycle_correction_coefficient": 1.0 if bool(args.cycle_correction) else 0.0,
         "global_to_local": "continuous point query only; no integer C4096/C1024 mapping",
     })
     baseline = _load_baseline(raw_mesh_path)

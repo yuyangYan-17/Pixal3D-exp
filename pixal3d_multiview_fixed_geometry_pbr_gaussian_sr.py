@@ -1283,31 +1283,115 @@ def _predict_flow_batch(group: Sequence[TileContext], states: Mapping[int, Spars
 
 
 @torch.no_grad()
-def _encode_fused_batch(group: Sequence[TileContext], fused_fields: Mapping[int, torch.Tensor], predictions: Mapping[int, Mapping[str, SparseTensor]], pbr_encoder: torch.nn.Module, pipeline: Any) -> Dict[int, SparseTensor]:
-    """Directly encode multiple fused PBR fields in one sparse PBR-encoder call."""
+def _encode_pbr_fields_batch(
+    group: Sequence[TileContext],
+    fields: Mapping[int, torch.Tensor],
+    references: Mapping[int, SparseTensor],
+    pbr_encoder: torch.nn.Module,
+    pipeline: Any,
+    label: str,
+) -> Dict[int, SparseTensor]:
+    """Encode fixed-support PBR fields and return normalized texture SLat."""
     values: List[SparseTensor] = []
-    references: List[SparseTensor] = []
+    reference_values: List[SparseTensor] = []
     for context in group:
         coords = context.geometry.coords
-        attrs = fused_fields[context.context_id].detach().to(torch.float32)
+        attrs = fields[context.context_id].detach().to(torch.float32)
         if attrs.shape[0] != coords.shape[0]:
-            raise RuntimeError(f"context {context.context_id}: fused PBR rows do not match geometry")
+            raise RuntimeError(
+                f"context {context.context_id}: {label} PBR rows do not match geometry"
+            )
         local_coords = torch.cat((torch.zeros_like(coords[:, :1]), coords), dim=1)
         values.append(SparseTensor(attrs * 2.0 - 1.0, local_coords))
-        references.append(predictions[context.context_id]["x0"])
-    packed = _pack_sparse_batch([_sparse_cuda(value) for value in values], "PBR encode")
+        reference_values.append(references[context.context_id])
+    packed = _pack_sparse_batch([_sparse_cuda(value) for value in values], label)
     pbr_encoder.to("cuda")
     raw_batch = pbr_encoder(packed, sample_posterior=False)
-    _require_finite_sparse(raw_batch, "batched PBR encoder output")
-    raw_values = _unpack_sparse_batch(raw_batch, references, "PBR encode output")
-    corrected: Dict[int, SparseTensor] = {}
+    _require_finite_sparse(raw_batch, f"batched {label} PBR encoder output")
+    raw_values = _unpack_sparse_batch(raw_batch, reference_values, f"{label} PBR encode output")
+    encoded: Dict[int, SparseTensor] = {}
     for context, raw in zip(group, raw_values):
         endpoint = _sparse_cpu(cross_tile._normalize_slat(raw, pipeline.tex_slat_normalization))
-        _require_finite_sparse(endpoint, f"context {context.context_id} direct fused endpoint")
-        cross_tile._strict_sparse_check(predictions[context.context_id]["x0"], endpoint, f"context {context.context_id} direct fused endpoint")
-        corrected[context.context_id] = endpoint
-    del values, references, packed, raw_batch, raw_values
+        _require_finite_sparse(endpoint, f"context {context.context_id} {label} endpoint")
+        cross_tile._strict_sparse_check(
+            references[context.context_id],
+            endpoint,
+            f"context {context.context_id} {label} endpoint",
+        )
+        encoded[context.context_id] = endpoint
+    del values, reference_values, packed, raw_batch, raw_values
     _empty_cuda_cache()
+    return encoded
+
+
+@torch.no_grad()
+def _encode_fused_batch(
+    group: Sequence[TileContext],
+    fused_fields: Mapping[int, torch.Tensor],
+    predictions: Mapping[int, Mapping[str, SparseTensor]],
+    pbr_encoder: torch.nn.Module,
+    pipeline: Any,
+    *,
+    self_fields: Optional[Mapping[int, torch.Tensor]] = None,
+    cycle_correction: bool = False,
+    return_diagnostics: bool = False,
+) -> Any:
+    """Encode fused PBR fields, optionally applying an exact cycle residual.
+
+    With ``cycle_correction=True`` the endpoint is
+
+        x0_guided = x0_pred + (E(P_fused) - E(P_self))
+
+    where ``P_self`` is the decoded prediction before global fusion.  The
+    coefficient is intentionally fixed at one for the diagnostic experiment;
+    there is no weight/ratio hyper-parameter in this route.
+    """
+    references = {
+        context.context_id: predictions[context.context_id]["x0"]
+        for context in group
+    }
+    fused_norm = _encode_pbr_fields_batch(
+        group,
+        fused_fields,
+        references,
+        pbr_encoder,
+        pipeline,
+        "fused",
+    )
+    if not cycle_correction:
+        return fused_norm
+
+    if self_fields is None:
+        raise ValueError("cycle_correction requires the decoded self_fields mapping")
+    self_norm = _encode_pbr_fields_batch(
+        group,
+        self_fields,
+        references,
+        pbr_encoder,
+        pipeline,
+        "self-cycle",
+    )
+    corrected: Dict[int, SparseTensor] = {}
+    diagnostics: Dict[int, Dict[str, Any]] = {}
+    for context in group:
+        context_id = context.context_id
+        pred_x0 = references[context_id]
+        fused_endpoint = fused_norm[context_id]
+        self_endpoint = self_norm[context_id]
+        cross_tile._strict_sparse_check(pred_x0, fused_endpoint, f"context {context_id} fused endpoint")
+        cross_tile._strict_sparse_check(pred_x0, self_endpoint, f"context {context_id} self-cycle endpoint")
+        guided = pred_x0.replace(pred_x0.feats + fused_endpoint.feats - self_endpoint.feats)
+        _require_finite_sparse(guided, f"context {context_id} cycle-corrected endpoint")
+        corrected[context_id] = guided
+        diagnostics[context_id] = {
+            "cycle_roundtrip_error": _quantiles((self_endpoint.feats - pred_x0.feats).abs()),
+            "fused_minus_self_cycle": _quantiles((fused_endpoint.feats - self_endpoint.feats).abs()),
+            "cycle_corrected_minus_prediction": _quantiles((guided.feats - pred_x0.feats).abs()),
+        }
+    del fused_norm, self_norm, self_fields
+    _empty_cuda_cache()
+    if return_diagnostics:
+        return corrected, diagnostics
     return corrected
 
 

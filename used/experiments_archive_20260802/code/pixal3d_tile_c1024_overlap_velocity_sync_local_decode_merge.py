@@ -215,6 +215,7 @@ class VelocitySyncStageResult:
     times: Tuple[float, ...]
     per_tile_prediction_seconds: Tuple[float, ...]
     step_records: Tuple[Dict[str, Any], ...]
+    initial_noise_sync: Dict[str, Any]
     elapsed_seconds: float
 
 
@@ -1697,6 +1698,119 @@ def _average_corresponding_velocities(
     return synchronized, metrics
 
 
+def _build_shared_initial_noise(
+    *,
+    pipeline: Any,
+    tiles: Sequence[PreparedVelocitySyncTile],
+    correspondence: VelocityCorrespondence,
+    seeds: Sequence[int],
+    noise_channels: int,
+) -> Tuple[Tuple[torch.Tensor, ...], Dict[str, Any]]:
+    """Build one global-C1024-keyed noise field and share linked local nodes.
+
+    A local C64 token can receive several global C1024 source rows after the
+    camera transform and quantization.  The source-keyed noise is averaged
+    within each local token, then the same correspondence consensus used for
+    velocity is applied once so every linked local token starts identically.
+    """
+    if not tiles or not seeds:
+        raise ValueError("shared initial noise requires tiles and seeds")
+    if noise_channels < 1:
+        raise ValueError("noise_channels must be positive")
+
+    source_key_parts: List[torch.Tensor] = []
+    source_rows_per_tile: List[int] = []
+    for tile in tiles:
+        source_keys = _global_c1024_linear_keys(
+            tile.mapping.source_global_coords1024
+        )
+        source_key_parts.append(source_keys)
+        source_rows_per_tile.append(int(source_keys.shape[0]))
+    all_source_keys = torch.cat(source_key_parts, dim=0)
+    unique_source_keys, inverse = torch.unique(
+        all_source_keys,
+        sorted=True,
+        return_inverse=True,
+    )
+
+    shared_seed = int(min(int(seed) for seed in seeds))
+    source_noise = _randn(
+        int(unique_source_keys.shape[0]),
+        int(noise_channels),
+        device=pipeline.device,
+        seed=shared_seed,
+    )
+    local_features: List[torch.Tensor] = []
+    row_start = 0
+    for tile, source_rows in zip(tiles, source_rows_per_tile):
+        row_stop = row_start + source_rows
+        row_noise = source_noise.index_select(
+            0,
+            inverse[row_start:row_stop].to(
+                device=pipeline.device,
+                dtype=torch.long,
+            ),
+        )
+        local_ids = tile.mapping.source_to_local_index.to(
+            device=pipeline.device,
+            dtype=torch.long,
+        )
+        local_count = int(tile.mapping.local_coords64.shape[0])
+        local_sum = torch.zeros(
+            (local_count, int(noise_channels)),
+            device=pipeline.device,
+            dtype=row_noise.dtype,
+        )
+        local_sum.index_add_(0, local_ids, row_noise)
+        local_counts = torch.bincount(
+            local_ids,
+            minlength=local_count,
+        ).to(device=pipeline.device, dtype=row_noise.dtype)
+        if bool((local_counts <= 0).any().item()):
+            raise RuntimeError(
+                f"tile {tile.tile_id}: shared source noise left a local token empty"
+            )
+        local_features.append(
+            (local_sum / local_counts[:, None]).detach().cpu()
+        )
+        row_start = row_stop
+
+    raw_features = torch.cat(local_features, dim=0)
+    synchronized, consensus_metrics = _average_corresponding_velocities(
+        raw_features,
+        correspondence,
+    )
+    offsets = correspondence.node_offsets.tolist()
+    output = tuple(
+        synchronized[int(start):int(stop)].contiguous()
+        for start, stop in zip(offsets[:-1], offsets[1:])
+    )
+    metrics = {
+        "mode": "shared_global_c1024_source_noise_then_linked_local_consensus",
+        "shared_noise_seed": shared_seed,
+        "unique_global_c1024_sources": int(unique_source_keys.shape[0]),
+        "linked_local_nodes": int(correspondence.linked_nodes.shape[0]),
+        "initial_consensus_mean_abs_delta": float(
+            consensus_metrics["mean_abs_velocity_delta"]
+        ),
+        "initial_consensus_max_abs_delta": float(
+            consensus_metrics["max_abs_velocity_delta"]
+        ),
+        "initial_consensus_relative_l2_delta": float(
+            consensus_metrics["relative_l2_velocity_delta"]
+        ),
+    }
+    del (
+        all_source_keys,
+        unique_source_keys,
+        inverse,
+        source_noise,
+        raw_features,
+        synchronized,
+    )
+    return output, metrics
+
+
 def _extract_tile_proj_conditions_cpu(
     *,
     pipeline: Any,
@@ -1756,6 +1870,9 @@ def _run_correspondence_velocity_synced_stage(
     noise_channels: int,
     stage: str,
     concat_features: Optional[Sequence[torch.Tensor]] = None,
+    shared_initial_noise: bool = False,
+    apply_velocity_sync: bool = True,
+    sync_endpoint_after_update: bool = False,
 ) -> VelocitySyncStageResult:
     """Run all local tile flows in lockstep and synchronize velocity each step."""
     tile_count = len(tiles)
@@ -1780,23 +1897,44 @@ def _run_correspondence_velocity_synced_stage(
         raise RuntimeError("sampler timestep schedule is invalid")
     prediction_kwargs = _sampler_prediction_kwargs(params)
     coords_device: List[torch.Tensor] = []
-    current_features: List[torch.Tensor] = []
+    current_features: List[torch.Tensor]
+    if shared_initial_noise:
+        current_features_tuple, initial_noise_sync = _build_shared_initial_noise(
+            pipeline=pipeline,
+            tiles=tiles,
+            correspondence=correspondence,
+            seeds=seeds,
+            noise_channels=noise_channels,
+        )
+        current_features = list(current_features_tuple)
+    else:
+        current_features = []
+        initial_noise_sync = {
+            "mode": "per_tile_seed",
+            "shared_noise_seed": None,
+            "unique_global_c1024_sources": None,
+            "linked_local_nodes": int(correspondence.linked_nodes.shape[0]),
+            "initial_consensus_mean_abs_delta": None,
+            "initial_consensus_max_abs_delta": None,
+            "initial_consensus_relative_l2_delta": None,
+        }
     for tile, seed in zip(tiles, seeds):
         coords = tile.mapping.local_coords64.to(
             device=pipeline.device,
             dtype=torch.int32,
         ).contiguous()
         coords_device.append(coords)
-        noise = _randn(
-            int(coords.shape[0]),
-            int(noise_channels),
-            device=pipeline.device,
-            seed=int(seed),
-        )
-        current_features.append(
-            noise.detach().to(device="cpu", copy=True)
-        )
-        del noise
+        if not shared_initial_noise:
+            noise = _randn(
+                int(coords.shape[0]),
+                int(noise_channels),
+                device=pipeline.device,
+                seed=int(seed),
+            )
+            current_features.append(
+                noise.detach().to(device="cpu", copy=True)
+            )
+            del noise
 
     expected_offsets = [0]
     for features in current_features:
@@ -1895,6 +2033,17 @@ def _run_correspondence_velocity_synced_stage(
                     correspondence,
                 )
             )
+            if not apply_velocity_sync:
+                synchronized_velocity = raw_velocity
+                sync_metrics = {
+                    **sync_metrics,
+                    "applied": False,
+                }
+            else:
+                sync_metrics = {
+                    **sync_metrics,
+                    "applied": True,
+                }
             for index in range(tile_count):
                 start = int(correspondence.node_offsets[index].item())
                 stop = int(
@@ -1909,6 +2058,40 @@ def _run_correspondence_velocity_synced_stage(
                     )
                 )
 
+            endpoint_sync_metrics = {
+                "applied": False,
+                "mean_abs_delta": 0.0,
+                "max_abs_delta": 0.0,
+                "relative_l2_delta": 0.0,
+            }
+            if sync_endpoint_after_update:
+                raw_endpoint = torch.cat(current_features, dim=0)
+                synchronized_endpoint, endpoint_metrics = (
+                    _average_corresponding_velocities(
+                        raw_endpoint,
+                        correspondence,
+                    )
+                )
+                current_features = [
+                    synchronized_endpoint[int(start):int(stop)].contiguous()
+                    for start, stop in zip(
+                        expected_offsets[:-1], expected_offsets[1:]
+                    )
+                ]
+                endpoint_sync_metrics = {
+                    "applied": True,
+                    "mean_abs_delta": float(
+                        endpoint_metrics["mean_abs_velocity_delta"]
+                    ),
+                    "max_abs_delta": float(
+                        endpoint_metrics["max_abs_velocity_delta"]
+                    ),
+                    "relative_l2_delta": float(
+                        endpoint_metrics["relative_l2_velocity_delta"]
+                    ),
+                }
+                del raw_endpoint, synchronized_endpoint
+
             step_seconds = time.perf_counter() - step_started
             record = {
                 "stage": stage,
@@ -1918,6 +2101,7 @@ def _run_correspondence_velocity_synced_stage(
                 "dt": dt,
                 "tile_model_calls": tile_count,
                 "step_seconds": float(step_seconds),
+                "endpoint_sync": endpoint_sync_metrics,
                 **sync_metrics,
             }
             step_records.append(record)
@@ -1944,6 +2128,7 @@ def _run_correspondence_velocity_synced_stage(
             float(value) for value in per_tile_seconds
         ),
         step_records=tuple(step_records),
+        initial_noise_sync=initial_noise_sync,
         elapsed_seconds=float(time.perf_counter() - started),
     )
 
@@ -4250,6 +4435,9 @@ def run(args: argparse.Namespace) -> None:
         seeds=[tile.seed + 201 for tile in prepared_tiles],
         noise_channels=int(shape_model.in_channels),
         stage="shape1024",
+        shared_initial_noise=bool(args.shared_initial_noise),
+        apply_velocity_sync=not bool(args.no_velocity_sync),
+        sync_endpoint_after_update=bool(args.sync_endpoint_after_update),
     )
     del shape_conditions
     shape_std, shape_mean = _normalization(
@@ -4288,6 +4476,9 @@ def run(args: argparse.Namespace) -> None:
         noise_channels=texture_channels,
         stage="texture1024",
         concat_features=shape_sync.normalized_features,
+        shared_initial_noise=bool(args.shared_initial_noise),
+        apply_velocity_sync=not bool(args.no_velocity_sync),
+        sync_endpoint_after_update=bool(args.sync_endpoint_after_update),
     )
     del texture_conditions
     texture_std, texture_mean = _normalization(
@@ -4302,6 +4493,15 @@ def run(args: argparse.Namespace) -> None:
 
     velocity_sync_summary = {
         "mode": "exact_global_c1024_correspondence_velocity_mean",
+        "velocity_sync_enabled": not bool(args.no_velocity_sync),
+        "endpoint_sync_after_update": bool(args.sync_endpoint_after_update),
+        "shared_initial_noise": bool(args.shared_initial_noise),
+        "initial_noise_policy": (
+            "one global-C1024-keyed noise field, averaged into local C64, "
+            "then linked local-node consensus"
+            if bool(args.shared_initial_noise)
+            else "independent deterministic noise per tile"
+        ),
         "unlinked_token_policy": "retain each tile token's own predicted velocity",
         "multi_source_local_token_policy": (
             "mean the per-global-C1024 consensus proposals before one Euler update"
@@ -4310,12 +4510,14 @@ def run(args: argparse.Namespace) -> None:
             "step_count": len(shape_sync.step_records),
             "step_records": list(shape_sync.step_records),
             "times": list(shape_sync.times),
+            "initial_noise_sync": shape_sync.initial_noise_sync,
             "elapsed_seconds": shape_sync.elapsed_seconds,
         },
         "texture": {
             "step_count": len(texture_sync.step_records),
             "step_records": list(texture_sync.step_records),
             "times": list(texture_sync.times),
+            "initial_noise_sync": texture_sync.initial_noise_sync,
             "elapsed_seconds": texture_sync.elapsed_seconds,
         },
         "correspondence": correspondence.stats,
@@ -4585,6 +4787,15 @@ def run(args: argparse.Namespace) -> None:
             "correspondence_key": "exact integer global C1024 coordinate",
             "synchronized_stages": ["shape1024", "texture1024"],
             "synchronization_frequency": "every Euler flow step before state update",
+            "velocity_sync_enabled": not bool(args.no_velocity_sync),
+            "endpoint_sync_after_update": bool(args.sync_endpoint_after_update),
+            "shared_initial_noise": bool(args.shared_initial_noise),
+            "initial_noise_policy": (
+                "one global-C1024-keyed noise field, averaged into local C64, "
+                "then linked local-node consensus"
+                if bool(args.shared_initial_noise)
+                else "independent deterministic noise per tile"
+            ),
             "linked_source_policy": "arithmetic mean of predicted velocity",
             "unlinked_local_token_policy": "use its own predicted velocity",
             "multi_source_local_token_policy": (
@@ -4739,6 +4950,33 @@ def build_parser() -> argparse.ArgumentParser:
         "--low-vram",
         action=argparse.BooleanOptionalAction,
         default=False,
+    )
+    parser.add_argument(
+        "--shared-initial-noise",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Use one deterministic noise field keyed by global C1024 source "
+            "coordinates, then make linked local tokens share its initial state."
+        ),
+    )
+    parser.add_argument(
+        "--no-velocity-sync",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Control run: keep the same support and initial noise, but apply "
+            "each tile's raw velocity without overlap consensus."
+        ),
+    )
+    parser.add_argument(
+        "--sync-endpoint-after-update",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "After each Euler update, explicitly apply the same overlap "
+            "consensus to x_t before the next tile prediction."
+        ),
     )
     parser.add_argument(
         "--envmap",
