@@ -611,6 +611,7 @@ class Pixal3DImageTo3DPipeline(Pipeline):
         grid_resolution_override: int = None,
         projection_crop_box: Optional[Sequence[float]] = None,
         transform_matrix: Optional[torch.Tensor] = None,
+        preserve_image_resolution: bool = False,
     ) -> dict:
         """
         Get proj conditioning for shape/texture stages (sparse-token aligned).
@@ -630,6 +631,9 @@ class Pixal3DImageTo3DPipeline(Pipeline):
                 or [1, 4, 4]. When omitted, the standard centered front-view
                 camera is used. Sparse tensor identity still comes from
                 ``coords``; this matrix only controls image-feature sampling.
+            preserve_image_resolution: Forward a patch-aligned native-size
+                crop to DINO/NAF instead of resizing it to the model's nominal
+                square input size.
 
         Returns:
             dict with 'cond' and 'neg_cond', each containing {'global': ..., 'proj': SparseTensor}
@@ -665,16 +669,18 @@ class Pixal3DImageTo3DPipeline(Pipeline):
                     "transform_matrix must have shape [4, 4] or [1, 4, 4], "
                     f"got {tuple(transform_matrix.shape)}"
                 )
-        z_global, z_proj = image_cond_model(
-            image,
-            camera_angle_x=cam_angle,
-            distance=dist_tensor,
-            mesh_scale=scale_tensor,
-            transform_matrix=transform_matrix,
-            grid_indices=coords[:, 1:4],
-            grid_resolution=grid_res,
-            projection_crop_box=projection_crop_box,
-        )
+        image_model_kwargs = {
+            "camera_angle_x": cam_angle,
+            "distance": dist_tensor,
+            "mesh_scale": scale_tensor,
+            "transform_matrix": transform_matrix,
+            "grid_indices": coords[:, 1:4],
+            "grid_resolution": grid_res,
+            "projection_crop_box": projection_crop_box,
+        }
+        if preserve_image_resolution:
+            image_model_kwargs["preserve_input_resolution"] = True
+        z_global, z_proj = image_cond_model(image, **image_model_kwargs)
         if z_proj.shape[0] != B or z_proj.shape[1] != coords.shape[0]:
             raise RuntimeError(
                 "Sparse projection output is not aligned with coords: "

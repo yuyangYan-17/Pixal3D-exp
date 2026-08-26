@@ -11,6 +11,13 @@
 
 这里不使用点云质心、点云包围盒或 min-max 归一化。X/Y 的移动和缩放完全由相机焦距、crop、像素位置和点深度决定。
 
+> **重要澄清（2026-08-25）**：这里的 local `[-1,1]^3` 不是 global
+> `[-1,1]^3` 中一个轴对齐的小立方体。它在 global 空间中的逆像是一个
+> full-depth projective region：中心射线和 X/Y 边界都随深度变化。本文的
+> `q_l,z=q_g,z` 是有意保留完整规范深度参数，而不是假设 X/Y/Z 都缩放 4
+> 倍。只有 2D crop 时不存在可由相机唯一推出的 `z_center` 或 depth slab；
+> 额外切 Z 属于另一个三维分块方案，不能混入本文的相机变换。
+
 ## 1. 坐标约定
 
 Pixal3D 的规范坐标记为：
@@ -383,3 +390,92 @@ max_abs_error < 2e-5
 5. local→global 使用固定 affine shear；重规范化后的正确变换依赖 `q_z`。
 6. 在 1024 tile resize 到 512 时再次修改 FOV 或 distance。
 7. 同时对点做 local recanonicalization、又在 local 相机上重复施加 off-axis shift；这会重复计算光心偏移。
+
+## 12. Local 立方体在 global 空间中的真实区域
+
+### 12.1 它不是 global 的立方体或长方体
+
+对任意 global 深度：
+
+```text
+D_g(q_g,z) = d_g - q_g,z/(2s_g)
+```
+
+投影落入 tile `[x0,x1) × [y0,y1)` 的 global X 范围是：
+
+```text
+(x0-c_g,x) D_g/f_g,x <= X_g < (x1-c_g,x) D_g/f_g,x
+```
+
+global Y 范围是：
+
+```text
+(c_g,y-y1) D_g/f_g,y < Y_g <= (c_g,y-y0) D_g/f_g,y
+```
+
+因此深度改变时，允许的 X/Y 中心和宽度都会改变。把它写回 global q：
+
+```text
+q_g,x bounds = 2s_g D_g(q_g,z) (pixel_x_bounds-c_g,x)/f_g,x
+q_g,y bounds = 2s_g D_g(q_g,z) (c_g,y-pixel_y_bounds)/f_g,y
+```
+
+这就是相机视锥与 global 规范空间的交集，不是固定的 XYZ bbox。实现必须先
+逐点投影判断 half-open tile membership，不能用固定的 global X/Y 范围裁剪。
+
+### 12.2 光心偏移为什么必须依赖每个点的深度
+
+设 tile 中心在 4096 上为：
+
+```text
+u_c = x0 + c_l,x/r_x
+v_c = y0 + c_l,y/r_y
+```
+
+对应中心射线斜率：
+
+```text
+a_x = (u_c-c_g,x)/f_g,x
+a_y = (c_g,y-v_c)/f_g,y
+```
+
+global 点相对该中心射线的横向位置为：
+
+```text
+X_rel = X_g - a_x D_g
+Y_rel = Y_g - a_y D_g
+```
+
+其中 `D_g` 是每个点自己的深度，所以同样的 global X/Y 在不同 Z 上会得到
+不同的 local X/Y。第 7 节从 `u_t/v_t` 和 local depth 反投影，正是在逐点
+实现这个 depth-dependent 光心重定向；它不是固定平移、固定 shear 或 bbox
+normalization。
+
+### 12.3 为什么不引入 z_center
+
+本文描述的是一个 2D image tile 穿过完整 global 规范深度的 projective
+context，因此：
+
+```text
+q_l,z = q_g,z
+```
+
+如果额外给出 `z_min/z_max`，可以另行构造 3D frustum slabs，并把每个 slab
+的 Z 重新归一化；但那些 depth bounds 来自新的三维分块策略，不是由 2D
+crop 或光心偏移推导出来的。没有显式 depth partition 时不得猜测
+`z_center`，也不得把 tile 错画成 global 中的轴对齐小立方体。
+
+### 12.4 对 sparse lattice 的含义
+
+4096→1024 crop 使 local X/Y 获得约 4 倍的角分辨率，但 full-depth 约定没有
+同时把 Z 放大 4 倍。因此一个 local C64 不能被解释为三轴都等价于 global
+C256：
+
+```text
+global C256 X/Y -> local C64 X/Y：约一格对一格，且受透视深度影响
+global C256 Z   -> local C64 Z：约四个 global 格量化到一个 local 格
+```
+
+这不说明相机公式错误；它说明“直接把 full-depth global C256 rows gather
+成 local C64 sparse rows”这一离散 support 假设不成立。continuous camera
+roundtrip 与 discrete lattice one-to-one 是两个不同问题，必须分开审计。

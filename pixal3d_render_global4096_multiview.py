@@ -149,10 +149,16 @@ def _output_names(output_dir: Path, angle: int) -> Sequence[Path]:
     )
 
 
-def _make_contact_sheet(output_dir: Path, angles: Iterable[int]) -> Path:
+def _make_contact_sheet(
+    output_dir: Path,
+    angles: Iterable[int],
+    image_suffix: str = "render_rgb_4096.png",
+    output_name: str = "multiview_rgb_contact_sheet.png",
+    title: str = "RGB",
+) -> Path:
     images = []
     for angle in angles:
-        path = output_dir / f"view_{angle:03d}_render_rgb_4096.png"
+        path = output_dir / f"view_{angle:03d}_{image_suffix}"
         with Image.open(path) as image:
             images.append((angle, image.convert("RGB")))
     thumb_size = 768
@@ -171,8 +177,8 @@ def _make_contact_sheet(output_dir: Path, angles: Iterable[int]) -> Path:
         x = margin + index * (thumb_size + margin)
         y = margin + label_height
         sheet.paste(image, (x, y))
-        draw.text((x, margin), f"view {angle}°", fill=(255, 255, 255))
-    path = output_dir / "multiview_rgb_contact_sheet.png"
+        draw.text((x, margin), f"{title} · view {angle}°", fill=(255, 255, 255))
+    path = output_dir / output_name
     sheet.save(path)
     return path
 
@@ -334,7 +340,21 @@ def render(args: argparse.Namespace) -> Dict[str, Any]:
             torch.cuda.empty_cache()
 
     contact_sheet = _make_contact_sheet(output_dir, angles)
+    normal_camera_sheet = _make_contact_sheet(
+        output_dir, angles,
+        image_suffix="render_normal_camera_4096.png",
+        output_name="multiview_normal_camera_contact_sheet.png",
+        title="Camera normal",
+    )
+    normal_world_sheet = _make_contact_sheet(
+        output_dir, angles,
+        image_suffix="render_normal_world_4096.png",
+        output_name="multiview_normal_world_contact_sheet.png",
+        title="World normal",
+    )
     manifest["contact_sheet"] = str(contact_sheet)
+    manifest["normal_camera_contact_sheet"] = str(normal_camera_sheet)
+    manifest["normal_world_contact_sheet"] = str(normal_world_sheet)
     manifest["status"] = "complete"
     manifest["seconds"] = time.time() - started
     _atomic_json(manifest_path, manifest)

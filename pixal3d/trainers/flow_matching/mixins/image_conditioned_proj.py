@@ -638,6 +638,7 @@ class DinoV3ProjFeatureExtractor(nn.Module):
         projection_crop_box: Optional[
             Union[torch.Tensor, Sequence[float]]
         ] = None,
+        preserve_input_resolution: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Extract view-aligned features from the image.
@@ -654,6 +655,11 @@ class DinoV3ProjFeatureExtractor(nn.Module):
             projection_crop_box: Optional normalized crop in the complete
                 camera image. Projection remains global and only the resulting
                 2D coordinates are transformed into crop-local coordinates.
+            preserve_input_resolution: Keep PIL inputs at their native spatial
+                size instead of resizing them to ``self.image_size``. Both
+                dimensions must then be divisible by the DINO patch size. NAF
+                keeps its configured nominal scale while preserving the input
+                crop's aspect ratio.
         
         Returns:
             Tuple of (global_features, proj_features):
@@ -663,18 +669,43 @@ class DinoV3ProjFeatureExtractor(nn.Module):
               where proj_channels = embed_dim (no NAF) or embed_dim*2 (with NAF)
         """
         # Handle input types
+        model_device = next(self.model.parameters()).device
         if isinstance(image, torch.Tensor):
             assert image.ndim == 4, "Image tensor should be batched (B, C, H, W)"
+            image = image.to(device=model_device)
         elif isinstance(image, list):
             assert all(isinstance(i, Image.Image) for i in image), "Image list should be list of PIL images"
-            image = [i.resize((self.image_size, self.image_size), Image.LANCZOS) for i in image]
+            if preserve_input_resolution:
+                image_sizes = {i.size for i in image}
+                if len(image_sizes) != 1:
+                    raise ValueError(
+                        "native-resolution image batches must have one shared size"
+                    )
+            else:
+                image = [
+                    i.resize(
+                        (self.image_size, self.image_size),
+                        Image.Resampling.LANCZOS,
+                    )
+                    for i in image
+                ]
             image = [np.array(i.convert('RGB')).astype(np.float32) / 255 for i in image]
             image = [torch.from_numpy(i).permute(2, 0, 1).float() for i in image]
-            image = torch.stack(image).cuda()
+            image = torch.stack(image).to(device=model_device)
         else:
             raise ValueError(f"Unsupported type of image: {type(image)}")
         
         B = image.shape[0]
+        input_height, input_width = (int(image.shape[-2]), int(image.shape[-1]))
+        if input_height <= 0 or input_width <= 0:
+            raise ValueError("image dimensions must be positive")
+        if input_height % self.patch_size or input_width % self.patch_size:
+            raise ValueError(
+                "DINO input height and width must be divisible by patch size "
+                f"{self.patch_size}, got {(input_width, input_height)}"
+            )
+        patch_height = input_height // self.patch_size
+        patch_width = input_width // self.patch_size
         
         # Keep a copy of the unnormalized image for NAF guide
         if self.use_naf_upsample:
@@ -694,8 +725,15 @@ class DinoV3ProjFeatureExtractor(nn.Module):
             z_patchtokens = z[:, 1+num_reg:]  # [B, num_patches, D]
             
             # Reshape patch tokens to spatial grid: [B, h, w, D]
+            expected_patch_tokens = patch_height * patch_width
+            if z_patchtokens.shape[1] != expected_patch_tokens:
+                raise RuntimeError(
+                    "DINO patch-token count does not match the native image "
+                    f"layout: tokens={z_patchtokens.shape[1]} expected="
+                    f"{patch_height}x{patch_width}={expected_patch_tokens}"
+                )
             z_patchtokens_spatial = z_patchtokens.reshape(
-                B, self.patch_number, self.patch_number, -1
+                B, patch_height, patch_width, -1
             )  # [B, h, w, D]
             
             if camera_angle_x is None or distance is None or mesh_scale is None:
@@ -718,8 +756,33 @@ class DinoV3ProjFeatureExtractor(nn.Module):
                 self._load_naf()
                 # NAF expects: guide [B, 3, H, W], lr_features [B, C, h, w], target_size (H', W')
                 lr_features_bchw = z_patchtokens_spatial.permute(0, 3, 1, 2)  # [B, D, h, w]
+                if preserve_input_resolution:
+                    naf_target_size = (
+                        max(
+                            1,
+                            int(
+                                round(
+                                    input_height
+                                    * self.naf_target_size[0]
+                                    / self.image_size
+                                )
+                            ),
+                        ),
+                        max(
+                            1,
+                            int(
+                                round(
+                                    input_width
+                                    * self.naf_target_size[1]
+                                    / self.image_size
+                                )
+                            ),
+                        ),
+                    )
+                else:
+                    naf_target_size = self.naf_target_size
                 hr_features = self.naf_model(
-                    image_for_naf, lr_features_bchw, self.naf_target_size
+                    image_for_naf, lr_features_bchw, naf_target_size
                 )  # [B, D, H', W']
                 
                 # Sample from high-res feature map using same projection coordinates

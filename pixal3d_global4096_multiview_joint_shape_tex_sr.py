@@ -13,9 +13,10 @@ The two stages use the same Jacobi barrier:
     -> gather endpoint back to every local context
     -> official _xstart_to_pred and Euler update
 
-Texture additionally decodes each frozen endpoint to PBR, fuses only direct
-visible donors, re-encodes the complete local C1024 fields in real batches,
-and applies the official cycle correction before the master endpoint fusion.
+Shape and texture both fuse normalized latent endpoints directly on the same
+dense master support.  PBR is used only to build the immutable texture
+reference/fallback and to decode the final result; it is never transported
+between views during a flow step.
 """
 from __future__ import annotations
 
@@ -59,7 +60,7 @@ from pixal3d.modules.sparse import SparseTensor
 from pixal3d.representations import MeshWithFacePbr, MeshWithVertexPbr, MeshWithVoxel
 
 
-FORMAT = "pixal3d_global4096_multiview_joint_shape_tex_sr_cuda4_v1"
+FORMAT = "pixal3d_global4096_multiview_joint_shape_tex_sr_cuda4_v3_local_to_global"
 CANONICAL_SIZE = 4096
 VIEW_SIZE = 1024
 FIRST_TILE_SIZE = 1024
@@ -128,6 +129,7 @@ class PreparedContext:
     view: first_view_route.TileView
     master_ids: torch.Tensor
     local_coords: torch.Tensor
+    donor_representative: torch.Tensor
     uv_virtual: torch.Tensor
     gaussian_weight: torch.Tensor
     shape_reference: torch.Tensor
@@ -209,6 +211,14 @@ def _tensor_hash(value: torch.Tensor) -> str:
     digest.update(str(value.dtype).encode("utf-8"))
     digest.update(repr(tuple(value.shape)).encode("utf-8"))
     digest.update(value.numpy().tobytes())
+    return digest.hexdigest()
+
+
+def _image_hash(value: Image.Image) -> str:
+    image = value.convert("RGB")
+    digest = hashlib.sha256()
+    digest.update(repr(image.size).encode("ascii"))
+    digest.update(image.tobytes())
     return digest.hexdigest()
 
 
@@ -382,8 +392,26 @@ def _prepare_geometry(
 ) -> core.LocalGeometry:
     if output_path.is_file():
         payload = torch.load(output_path, map_location="cpu", weights_only=False)
-        if payload.get("format") == FORMAT and payload.get("status") == "active":
-            return _geometry_from_payload(payload["geometry"])
+        geometry_payload = payload.get("geometry")
+        if payload.get("status") == "active" and isinstance(geometry_payload, Mapping):
+            required = {
+                "vertices", "faces", "coords", "dual_vertices",
+                "dual_vertices_world", "intersected", "selected_global_face_ids",
+            }
+            if required.issubset(geometry_payload):
+                geometry = _geometry_from_payload(geometry_payload)
+                if (
+                    geometry.coords.ndim == 2
+                    and geometry.coords.shape[1] == 3
+                    and geometry.coords.shape[0] == geometry.dual_vertices.shape[0]
+                    and geometry.coords.shape[0] == geometry.dual_vertices_world.shape[0]
+                    and torch.isfinite(geometry.vertices).all()
+                    and torch.isfinite(geometry.dual_vertices).all()
+                    and torch.isfinite(geometry.dual_vertices_world).all()
+                ):
+                    geometry.stats["fixed_geometry_cache_source_format"] = payload.get("format")
+                    geometry.stats["fixed_geometry_input_independent_reuse"] = True
+                    return geometry
     # The previous first-view formal run persisted only C1024 dual rows.  It
     # is safe to reuse those rows after checking the fixed geometry/camera
     # route; local vertices/faces are reconstructed here, so no old feature
@@ -654,99 +682,144 @@ def _map_master_to_context(
     transform: Any,
     camera: Mapping[str, float],
     virtual_box: Tuple[int, int, int, int],
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, Any]]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, Any]]:
+    """Lift every native local row to world and attach it to the dense master.
+
+    The fixed-geometry reference always starts from a local C64 row and maps
+    it through the tile camera/yaw.  The old reverse route started from every
+    master row, quantized into local C64, then discarded all but one master in
+    a collision.  Here the complete native local support is retained.  A
+    nearest-distance representative is marked only to prevent one context
+    contributing more than once to the same global master during scatter;
+    every local row still gathers the fused master endpoint for Euler update.
+    """
+    from scipy.spatial import cKDTree
+
+    native = native_coords.detach().cpu().to(torch.int32).contiguous()
+    empty_ids = torch.empty((0,), dtype=torch.int64)
+    empty_coords = torch.empty((0, 4), dtype=torch.int32)
+    empty_uv = torch.empty((0, 2), dtype=torch.float32)
+    empty_rep = torch.empty((0,), dtype=torch.bool)
+    empty_global = torch.zeros((master_q_world.shape[0],), dtype=torch.bool)
+    if native.numel() == 0:
+        return empty_ids, empty_coords, empty_uv, empty_global, empty_rep, {
+            "native_support_count": 0,
+            "selected_local_rows": 0,
+            "unique_master_rows": 0,
+            "duplicate_local_receipts": 0,
+            "mapping_direction": "local_c64_to_world_to_nearest_global_master",
+            "virtual_box": list(virtual_box),
+        }
+    if native.ndim != 2 or native.shape[1] != 4 or not bool((native[:, 0] == 0).all()):
+        raise ValueError("native local support must be unique [N,4] coordinates with batch zero")
+    native_keys = _coord_keys(native)
+    if torch.unique(native_keys).numel() != native.shape[0]:
+        raise RuntimeError("native local support contains duplicate C64 coordinates")
+
     rotation = _yaw_matrix(angle)
-    q_view = _world_to_view_q(master_q_world, rotation)
-    q_local, uv_tile = core._global_q_to_local_q(
-        q_view, global_camera=camera, transform=transform
+    xyz = native[:, 1:].to(torch.float32)
+    # Match the projection-condition model's torch.linspace(-1, 1, 64)
+    # coordinate convention exactly.
+    q_local = xyz / ((LATENT_SIZE - 1) / 2.0) - 1.0
+    q_view, uv_tile = core._local_q_to_global_q(
+        q_local, global_camera=camera, transform=transform
     )
+    q_world = _view_to_world_q(q_view, rotation).cpu().to(torch.float32)
+    source_width = int(transform.source_width)
+    source_height = int(transform.source_height)
+    virtual_scale_x = float(CANONICAL_SIZE) / float(source_width)
+    virtual_scale_y = float(CANONICAL_SIZE) / float(source_height)
     uv_full, _, finite = core._project_global_q_to_image(
         q_view,
         global_camera=camera,
-        image_width=VIEW_SIZE,
-        image_height=VIEW_SIZE,
+        image_width=source_width,
+        image_height=source_height,
     )
-    local_xyz, local_valid = first_view_route._c64_coords_from_q(q_local)
-    normalized = q_local / (2.0 * float(transform.mesh_scale))
-    local_valid &= (
-        torch.isfinite(uv_tile).all(dim=1)
+    local_valid = (
+        torch.isfinite(q_world).all(dim=1)
+        & torch.isfinite(uv_tile).all(dim=1)
         & torch.isfinite(uv_full).all(dim=1)
-        & (normalized >= -0.5 - 1e-5).all(dim=1)
-        & (normalized <= 0.5 + 1e-5).all(dim=1)
     )
-    native = native_coords.detach().cpu().to(torch.int32)
-    if native.numel() == 0:
-        empty_ids = torch.empty((0,), dtype=torch.int64)
-        empty_coords = torch.empty((0, 4), dtype=torch.int32)
-        empty_uv = torch.empty((0, 2), dtype=torch.float32)
-        return empty_ids, empty_coords, empty_uv, torch.zeros((master_q_world.shape[0],), dtype=torch.bool), {
-            "candidate_count": 0,
-            "selected_count": 0,
-            "collision_count": 0,
-            "roundtrip_max_abs_error": 0.0,
-            "native_support_count": 0,
-            "virtual_box": list(virtual_box),
-        }
-    native_keys = _coord_keys(native)
-    native_order = torch.argsort(native_keys, stable=True)
-    sorted_native = native_keys.index_select(0, native_order)
-    local_coords = torch.cat((torch.zeros((local_xyz.shape[0], 1), dtype=torch.int32), local_xyz), dim=1)
-    local_keys = _coord_keys(local_coords)
-    positions = torch.searchsorted(sorted_native, local_keys)
-    in_native = positions < sorted_native.numel()
-    safe = positions.clamp_max(max(0, sorted_native.numel() - 1))
-    in_native &= sorted_native.index_select(0, safe) == local_keys
-    candidate = finite & local_valid & in_native
-    candidate_ids = torch.where(candidate)[0]
-    if not candidate_ids.numel():
-        empty_ids = torch.empty((0,), dtype=torch.int64)
-        empty_coords = torch.empty((0, 4), dtype=torch.int32)
-        empty_uv = torch.empty((0, 2), dtype=torch.float32)
-        return empty_ids, empty_coords, empty_uv, torch.zeros((master_q_world.shape[0],), dtype=torch.bool), {
-            "candidate_count": 0,
-            "collision_count": 0,
-            "roundtrip_max_abs_error": 0.0,
-        }
-    q_back, _ = core._local_q_to_global_q(
-        q_local.index_select(0, candidate_ids),
-        global_camera=camera,
-        transform=transform,
+    x0, y0, x1, y1 = (float(value) for value in transform.box)
+    inside_tile = (
+        (uv_full[:, 0] >= x0)
+        & (uv_full[:, 0] < x1)
+        & (uv_full[:, 1] >= y0)
+        & (uv_full[:, 1] < y1)
     )
-    errors = (q_back - q_view.index_select(0, candidate_ids)).abs().amax(dim=1)
-    keys = local_keys.index_select(0, candidate_ids)
-    ids = candidate_ids.to(torch.int64)
-    # Stable lexicographic sort: master id, round-trip error, local key.  The
-    # final key sort groups equal quantized local coordinates; within a group
-    # the smallest error wins and an exact tie keeps the smallest master id.
-    order = torch.arange(ids.numel(), dtype=torch.long)
-    order = order[torch.argsort(ids.index_select(0, order), stable=True)]
-    order = order[torch.argsort(errors.index_select(0, order), stable=True)]
-    order = order[torch.argsort(keys.index_select(0, order), stable=True)]
-    sorted_keys = keys.index_select(0, order)
+    candidate = finite.cpu() & local_valid.cpu() & inside_tile.cpu()
+    rows = torch.where(candidate)[0]
+    if not rows.numel():
+        return empty_ids, empty_coords, empty_uv, empty_global, empty_rep, {
+            "native_support_count": int(native.shape[0]),
+            "selected_local_rows": 0,
+            "unique_master_rows": 0,
+            "rejected_outside_current_tile": int((local_valid.cpu() & ~inside_tile.cpu()).sum()),
+            "mapping_direction": "local_c64_to_world_to_nearest_global_master",
+        }
+    tree = cKDTree(master_q_world.detach().cpu().to(torch.float32).numpy())
+    distances_np, master_np = tree.query(q_world.index_select(0, rows).numpy(), k=1, workers=-1)
+    distances = torch.as_tensor(np.asarray(distances_np), dtype=torch.float32)
+    master_ids = torch.as_tensor(np.asarray(master_np), dtype=torch.int64)
+    # Two global C64 half-diagonals are a guard against mapping unrelated
+    # surfaces while retaining the rotated-grid receipts seen in the fixed
+    # geometry reference.
+    max_distance = 2.0 * math.sqrt(3.0) / float(LATENT_SIZE - 1)
+    near = torch.isfinite(distances) & (distances <= max_distance)
+    rows = rows[near]
+    distances = distances[near]
+    master_ids = master_ids[near]
+    if not rows.numel():
+        return empty_ids, empty_coords, empty_uv, empty_global, empty_rep, {
+            "native_support_count": int(native.shape[0]),
+            "selected_local_rows": 0,
+            "unique_master_rows": 0,
+            "rejected_by_master_distance": int((~near).sum()),
+            "max_master_distance": max_distance,
+            "mapping_direction": "local_c64_to_world_to_nearest_global_master",
+        }
+
+    selected_coords = native.index_select(0, rows).contiguous()
+    selected_keys = native_keys.index_select(0, rows)
+    selected_uv_full = uv_full.cpu().index_select(0, rows).to(torch.float32)
+    selected_uv = selected_uv_full * selected_uv_full.new_tensor(
+        [virtual_scale_x, virtual_scale_y]
+    )
+    # One donor per context/master, as in the continuous PBR query route.
+    # Non-representative local rows remain in the flow and gather the same
+    # global master endpoint; they are not deleted from sparse support.
+    order = torch.arange(master_ids.numel(), dtype=torch.long)
+    order = order[torch.argsort(selected_keys.index_select(0, order), stable=True)]
+    order = order[torch.argsort(distances.index_select(0, order), stable=True)]
+    order = order[torch.argsort(master_ids.index_select(0, order), stable=True)]
+    sorted_master = master_ids.index_select(0, order)
     first = torch.ones((order.numel(),), dtype=torch.bool)
     if order.numel() > 1:
-        first[1:] = sorted_keys[1:] != sorted_keys[:-1]
-    keep = order[first]
-    selected_master = ids.index_select(0, keep)
-    selected_local = local_xyz.index_select(0, candidate_ids.index_select(0, keep))
-    selected_uv = uv_full.index_select(0, candidate_ids.index_select(0, keep)) * 4.0
-    selected_coords = torch.cat(
-        (torch.zeros((selected_local.shape[0], 1), dtype=torch.int32), selected_local), dim=1
-    )
+        first[1:] = sorted_master[1:] != sorted_master[:-1]
+    representative = torch.zeros((master_ids.numel(),), dtype=torch.bool)
+    representative[order[first]] = True
     valid_global = torch.zeros((master_q_world.shape[0],), dtype=torch.bool)
-    valid_global[selected_master] = True
-    collision_count = int(sorted_keys.numel() - torch.unique(sorted_keys).numel())
+    valid_global[master_ids] = True
     return (
-        selected_master.contiguous(),
+        master_ids.contiguous(),
         selected_coords.contiguous(),
-        selected_uv.to(torch.float32).contiguous(),
+        selected_uv.contiguous(),
         valid_global,
+        representative.contiguous(),
         {
-            "candidate_count": int(candidate_ids.numel()),
-            "selected_count": int(selected_master.numel()),
-            "collision_count": collision_count,
-            "roundtrip_max_abs_error": float(errors.max()) if errors.numel() else 0.0,
             "native_support_count": int(native.shape[0]),
+            "selected_local_rows": int(master_ids.numel()),
+            "unique_master_rows": int(representative.sum()),
+            "duplicate_local_receipts": int((~representative).sum()),
+            "rejected_outside_current_tile": int((local_valid.cpu() & ~inside_tile.cpu()).sum()),
+            "rejected_by_master_distance": int((~near).sum()),
+            "nearest_master_distance_mean": float(distances.mean()),
+            "nearest_master_distance_p95": float(torch.quantile(distances, 0.95)),
+            "nearest_master_distance_max": float(distances.max()),
+            "max_master_distance": max_distance,
+            "tile_gate_source_box": [x0, y0, x1, y1],
+            "mapping_direction": "local_c64_to_world_to_nearest_global_master",
+            "local_support_preserved_before_distance_gate": True,
             "virtual_box": list(virtual_box),
         },
     )
@@ -828,6 +901,16 @@ def _build_visibility(
     output_dir: Path,
     render_face_chunk_size: int,
 ) -> Dict[str, Any]:
+    """Freeze per-local-row visibility using the fixed-PBR reference route.
+
+    Visibility belongs to the local C64 endpoint row, not to the nearest
+    global master's nearest face.  Each row is lifted with the exact local
+    cell-centre convention used by ``_slat_visibility`` in the fixed-geometry
+    multiview SR implementation, then attached to the nearest baseline vertex
+    whose binary z-buffer visibility is queried for that yaw.
+    """
+    from scipy.spatial import cKDTree
+
     count = int(master_q_world.shape[0])
     context_count = len(ANGLES) * TILE_COUNT
     visible_matrix = torch.zeros((context_count, count), dtype=torch.bool)
@@ -835,12 +918,14 @@ def _build_visibility(
     depth_error = torch.full((context_count, count), float("nan"), dtype=torch.float32)
     tile_center_distance = torch.full((context_count, count), float("inf"), dtype=torch.float32)
     face_visible_ids: List[torch.Tensor] = [torch.empty((0,), dtype=torch.int64) for _ in range(context_count)]
+    row_visibility: Dict[str, Any] = {}
     context_lookup = {context.context_id: context for context in contexts}
     nearest_face = nearest["nearest_face_id"].long()
+    vertex_tree = cKDTree(baseline.vertices.cpu().float().numpy())
     for angle_index, angle in enumerate(ANGLES):
         rotation = _yaw_matrix(angle)
-        native_visibility_resolution = CANONICAL_SIZE if angle == 0 else VIEW_SIZE
-        native_boxes = _tile_boxes(angle == 0)
+        native_visibility_resolution = VIEW_SIZE
+        native_boxes = _tile_boxes(False)
         root = output_dir / "support" / "face_visibility" / f"view_{angle:03d}"
         tri_path = root / "triangle_id.pt"
         depth_path = root / "depth.pt"
@@ -873,6 +958,10 @@ def _build_visibility(
             _atomic_save(depth_path, {"depth": depth})
             del buffers, view_mesh, rotated
             _empty_cuda_cache()
+        all_visible_faces = torch.unique(tri[tri >= 0].to(torch.int64), sorted=True)
+        visible_vertices = torch.zeros((baseline.vertices.shape[0],), dtype=torch.bool)
+        if all_visible_faces.numel():
+            visible_vertices[baseline.faces.cpu().long().index_select(0, all_visible_faces).reshape(-1)] = True
         for tile_id, source_box in enumerate(native_boxes):
             context_id = angle_index * TILE_COUNT + tile_id
             x0, y0, x1, y1 = source_box
@@ -884,9 +973,21 @@ def _build_visibility(
                 continue
             ids = context.master_ids
             mapping_matrix[context_id, ids] = True
-            face_flags = torch.isin(nearest_face.index_select(0, ids), faces)
-            context.visible = face_flags.bool().contiguous()
-            visible_matrix[context_id, ids] = context.visible
+            xyz = context.local_coords[:, 1:].float()
+            q_local = ((xyz + 0.5) / float(LATENT_SIZE) - 0.5) * (
+                2.0 * float(context.transform.mesh_scale)
+            )
+            q_view, _ = core._local_q_to_global_q(
+                q_local, global_camera=camera, transform=context.transform
+            )
+            q_world = _view_to_world_q(q_view, rotation) / (
+                2.0 * float(camera["mesh_scale"])
+            )
+            _, nearest_vertex_np = vertex_tree.query(q_world.cpu().numpy(), k=1, workers=-1)
+            nearest_vertex = torch.as_tensor(np.asarray(nearest_vertex_np), dtype=torch.int64)
+            context.visible = visible_vertices.index_select(0, nearest_vertex).contiguous()
+            donor_visible = context.visible & context.donor_representative
+            visible_matrix[context_id, ids[donor_visible]] = True
             tile_center = torch.tensor(
                 [(context.virtual_box[0] + context.virtual_box[2]) * 0.5,
                  (context.virtual_box[1] + context.virtual_box[3]) * 0.5],
@@ -911,10 +1012,17 @@ def _build_visibility(
             depth_error[context_id, ids] = values.index_select(0, ids)
             context.support_stats.update({
                 "face_visible_count": int(faces.numel()),
-                "visible_master_count": int(context.visible.sum()),
+                "visible_local_row_count": int(context.visible.sum()),
+                "visible_donor_count": int(donor_visible.sum()),
                 "mapping_master_count": int(ids.numel()),
-                "visibility_rule": "independent source-256 crop of exact 1024 face-id/depth raster",
+                "visibility_rule": "local C64 cell centre -> tile camera -> inverse yaw -> nearest baseline vertex -> full-view binary z-buffer visibility",
             })
+            row_visibility[str(context_id)] = {
+                "master_ids": ids,
+                "visible": context.visible,
+                "donor_representative": context.donor_representative,
+                "nearest_baseline_vertex": nearest_vertex,
+            }
     _atomic_save(
         output_dir / "support" / "face_visibility_per_context.pt",
         {
@@ -925,6 +1033,7 @@ def _build_visibility(
             "visible": visible_matrix,
             "mapping_valid": mapping_matrix,
             "nearest_face_id": nearest_face,
+            "row_visibility": row_visibility,
         },
     )
     _atomic_save(
@@ -939,6 +1048,7 @@ def _build_visibility(
             "tile_center_distance": tile_center_distance,
             "frozen": True,
             "donor_only": True,
+            "row_visibility": row_visibility,
         },
     )
     _atomic_json(
@@ -948,6 +1058,7 @@ def _build_visibility(
             "frozen_before_flow": True,
             "independent_per_context_face_tables": True,
             "view_level_bit_broadcast": False,
+            "visibility_reference": "pixal3d_multiview_fixed_geometry_pbr_gaussian_sr._slat_visibility",
             "contexts": [
                 {
                     "context_id": int(context.context_id),
@@ -955,6 +1066,7 @@ def _build_visibility(
                     "tile_id": int(context.tile_id),
                     "mapping_count": int(context.master_ids.numel()),
                     "visible_count": int(context.visible.sum()),
+                    "visible_donor_count": int((context.visible & context.donor_representative).sum()),
                     "face_visible_count": int(face_visible_ids[context.context_id].numel()),
                 }
                 for context in contexts
@@ -1010,6 +1122,10 @@ def _save_context_mapping(
             "status": item.get("status", "active"),
             "master_ids": item["master_ids"],
             "local_coords_c64": item["local_coords"],
+            "donor_representative": item.get(
+                "donor_representative",
+                torch.ones((item["master_ids"].numel(),), dtype=torch.bool),
+            ),
             "uv_virtual_4096": item["uv_virtual"],
             "gaussian_weight": item["gaussian_weight"],
             "stats": dict(item.get("mapping_stats", {})),
@@ -1018,6 +1134,7 @@ def _save_context_mapping(
         mapping_hash_values[str(item["context_id"])] = {
             "master_ids": item["master_ids"],
             "local_coords": item["local_coords"],
+            "donor_representative": item.get("donor_representative"),
             "uv": item["uv_virtual"],
         }
     mapping_hash = _hash_many(mapping_hash_values)
@@ -1058,27 +1175,148 @@ def _pack_conditions(
     stage: str,
     device: torch.device,
     batch_size: int,
+    full_view_images: Mapping[int, Image.Image],
+    camera: Mapping[str, float],
 ) -> Dict[int, Mapping[str, Any]]:
+    """Build hierarchical conditions: one full-view global per yaw, tile proj per context."""
     if not contexts:
         return {}
-    views = {context.context_id: context.view for context in contexts}
-    images = {context.context_id: context.tile_image for context in contexts}
     model = (
         pipeline.image_cond_model_shape_1024
         if stage == "shape"
         else pipeline.image_cond_model_tex_1024
     )
-    return first_view_route._build_batched_image_conditions(
-        pipeline,
-        model,
-        views,
-        images,
-        output_dir,
-        stage,
-        {"camera_angle_x": 0.517371749106554, "distance": 1.889538288116455, "mesh_scale": 1.0},
-        device,
-        int(batch_size),
-    )
+    condition_root = output_dir / "conditions" / stage
+    condition_root.mkdir(parents=True, exist_ok=True)
+    full_hashes = {int(angle): _image_hash(image) for angle, image in full_view_images.items()}
+    context_keys: Dict[int, str] = {}
+    conditions: Dict[int, Mapping[str, Any]] = {}
+    pending: List[PreparedContext] = []
+    for context in contexts:
+        key = _hash_many({
+            "format": FORMAT,
+            "condition_route": "full_view_global_shared_per_yaw_tile_proj_v2",
+            "stage": stage,
+            "angle": context.angle,
+            "full_view_sha256": full_hashes[context.angle],
+            "tile_image_sha256": _image_hash(context.tile_image),
+            "camera": dict(camera),
+            "tile_camera": {
+                "camera_angle_x": float(context.transform.camera_angle_x),
+                "distance": float(context.transform.distance),
+                "mesh_scale": float(context.transform.mesh_scale),
+            },
+            "coords": context.local_coords,
+        })
+        context_keys[context.context_id] = key
+        path = condition_root / f"context_{context.context_id:03d}.pt"
+        if path.is_file():
+            payload = torch.load(path, map_location="cpu", weights_only=False)
+            if (
+                payload.get("format") == FORMAT
+                and payload.get("cache_key") == key
+                and torch.equal(payload.get("coords", torch.empty(0)).to(torch.int32), context.local_coords)
+            ):
+                conditions[context.context_id] = payload
+                continue
+        pending.append(context)
+
+    model.to(device)
+    try:
+        # This is the exact hierarchy used by the visible-local-flow reference:
+        # full panel + base camera for global, then crop + off-axis camera for proj.
+        global_by_angle: Dict[int, torch.Tensor] = {}
+        for angle in sorted({context.angle for context in contexts}):
+            dummy = torch.tensor(
+                [[[LATENT_SIZE // 2, LATENT_SIZE // 2, LATENT_SIZE // 2]]],
+                dtype=torch.int64,
+                device=device,
+            )
+            z_global, _ = model(
+                [full_view_images[angle].convert("RGB")],
+                camera_angle_x=torch.tensor([float(camera["camera_angle_x"])], device=device),
+                distance=torch.tensor([float(camera["distance"])], device=device),
+                mesh_scale=torch.tensor([float(camera["mesh_scale"])], device=device),
+                grid_indices=dummy,
+                grid_resolution=LATENT_SIZE,
+            )
+            if z_global.shape[0] != 1:
+                raise RuntimeError(f"{stage} yaw {angle}: full-view condition returned B={z_global.shape[0]}")
+            global_by_angle[angle] = z_global.detach().cpu().contiguous()
+            del z_global
+
+        for start in range(0, len(pending), int(batch_size)):
+            group = pending[start : start + int(batch_size)]
+            max_tokens = max(int(context.local_coords.shape[0]) for context in group)
+            grid_indices = torch.zeros((len(group), max_tokens, 3), dtype=torch.int64, device=device)
+            for batch_id, context in enumerate(group):
+                n = int(context.local_coords.shape[0])
+                grid_indices[batch_id, :n] = context.local_coords[:, 1:].to(device=device, dtype=torch.int64)
+            _, z_proj = model(
+                [context.tile_image.convert("RGB") for context in group],
+                camera_angle_x=torch.tensor(
+                    [float(context.transform.camera_angle_x) for context in group], device=device
+                ),
+                distance=torch.tensor(
+                    [float(context.transform.distance) for context in group], device=device
+                ),
+                mesh_scale=torch.tensor(
+                    [float(context.transform.mesh_scale) for context in group], device=device
+                ),
+                grid_indices=grid_indices,
+                grid_resolution=LATENT_SIZE,
+            )
+            if z_proj.shape[0] != len(group):
+                raise RuntimeError(f"{stage}: tile condition returned wrong batch size")
+            for batch_id, context in enumerate(group):
+                n = int(context.local_coords.shape[0])
+                proj = z_proj[batch_id, :n].detach().cpu().contiguous()
+                glob = global_by_angle[context.angle].clone()
+                payload = {
+                    "format": FORMAT,
+                    "cache_key": context_keys[context.context_id],
+                    "context_id": int(context.context_id),
+                    "angle": int(context.angle),
+                    "tile_id": int(context.tile_id),
+                    "coords": context.local_coords.clone(),
+                    "cond": {"global": glob, "proj": proj},
+                    "neg_cond": {"global": torch.zeros_like(glob), "proj": torch.zeros_like(proj)},
+                    "full_view_sha256": full_hashes[context.angle],
+                    "global_source": "full_view_base_camera_shared_per_yaw",
+                    "proj_source": "tile_crop_off_axis_camera",
+                    "image_batch_size": len(group),
+                    "stage": stage,
+                }
+                conditions[context.context_id] = payload
+                _atomic_save(condition_root / f"context_{context.context_id:03d}.pt", payload)
+            del z_proj, grid_indices
+            _empty_cuda_cache()
+    finally:
+        model.cpu()
+        _empty_cuda_cache()
+
+    rows = []
+    for angle in ANGLES:
+        angle_contexts = [context for context in contexts if context.angle == angle]
+        hashes = {
+            _tensor_hash(conditions[context.context_id]["cond"]["global"])
+            for context in angle_contexts
+        }
+        if angle_contexts and len(hashes) != 1:
+            raise RuntimeError(f"{stage} yaw {angle}: global token is not shared across tiles")
+        rows.append({
+            "angle": angle,
+            "active_contexts": len(angle_contexts),
+            "exact_unique_global_tensors": len(hashes),
+            "full_view_sha256": full_hashes[angle],
+        })
+    _atomic_json(condition_root / "hierarchy_audit.json", {
+        "format": FORMAT,
+        "stage": stage,
+        "route": "full-view global per yaw; tile-only proj",
+        "rows": rows,
+    })
+    return conditions
 
 
 def _pack_local_states(
@@ -1227,7 +1465,11 @@ def _fuse_endpoint(
         pred = predictions[context.context_id].feats.detach().cpu().float()
         if pred.shape[0] != context.master_ids.numel():
             raise RuntimeError(f"{stage}: prediction rows do not match context mapping")
-        valid = context.visible & torch.isfinite(pred).all(dim=1)
+        valid = (
+            context.visible
+            & context.donor_representative
+            & torch.isfinite(pred).all(dim=1)
+        )
         if bool(valid.any()):
             ids = context.master_ids[valid]
             weights = context.gaussian_weight[valid].float()
@@ -1663,16 +1905,13 @@ def _run_texture_flow(
     contexts: Sequence[PreparedContext],
     shape_global_final: torch.Tensor,
     texture_fallback: torch.Tensor,
-    baseline_pbr_global: torch.Tensor,
     pipeline: Any,
-    pbr_encoder: torch.nn.Module,
     output_dir: Path,
     device: torch.device,
     seed: int,
     steps_override: Optional[int],
     resume: bool,
     save_step_tensors: bool,
-    query_chunk_size: int,
     master_count: int,
 ) -> Tuple[torch.Tensor, Dict[str, Any]]:
     model = pipeline.models["tex_slat_flow_model_1024"]
@@ -1732,63 +1971,9 @@ def _run_texture_flow(
             concat=shape_concat,
             stage="texture",
         )
-        snapshots = _decode_texture_batches(
-            contexts=contexts,
-            predictions=predictions,
-            shape_concat=shape_concat,
-            pipeline=pipeline,
-            device=device,
-            query_chunk_size=query_chunk_size,
-        )
-        fused_pbr, donor_count, pbr_stats = _fuse_pbr_at_master(
-            contexts, snapshots, baseline_pbr_global, master_count
-        )
-        fused_fields = {
-            context.context_id: _pbr_global_to_context(context, fused_pbr, master_count)
-            for context in contexts
-        }
-        self_fields = {
-            context.context_id: snapshots[context.context_id].self_field
-            for context in contexts
-        }
-        corrected: Dict[int, SparseTensor] = {}
-        cycle_rows: List[Dict[str, Any]] = []
-        pbr_encoder.to(device)
-        for start in range(0, len(contexts), PBR_ENCODE_BATCH_SIZE):
-            group = contexts[start : start + PBR_ENCODE_BATCH_SIZE]
-            fused_encoded = _encode_pbr_fields_batch(
-                group=group,
-                fields=fused_fields,
-                pbr_encoder=pbr_encoder,
-                pipeline=pipeline,
-                device=device,
-                label="texture fused PBR encode",
-            )
-            self_encoded = _encode_pbr_fields_batch(
-                group=group,
-                fields=self_fields,
-                pbr_encoder=pbr_encoder,
-                pipeline=pipeline,
-                device=device,
-                label="texture self PBR encode",
-            )
-            for context in group:
-                pred = predictions[context.context_id]
-                correction = fused_encoded[context.context_id] - self_encoded[context.context_id]
-                corrected_features = pred.feats + correction
-                if not torch.isfinite(corrected_features).all():
-                    raise FloatingPointError(f"texture context {context.context_id}: cycle endpoint non-finite")
-                corrected[context.context_id] = pred.replace(corrected_features)
-                cycle_rows.append({
-                    "context_id": int(context.context_id),
-                    "correction": _stats(correction),
-                    "cycle_coefficient": 1.0,
-                })
-            del fused_encoded, self_encoded
-        pbr_encoder.cpu()
         endpoint, visible_count, fallback_mask, fusion_stats = _fuse_endpoint(
             contexts=contexts,
-            predictions=corrected,
+            predictions=predictions,
             fallback=texture_fallback,
             master_count=master_count,
             channel_count=texture_fallback.shape[1],
@@ -1810,30 +1995,15 @@ def _run_texture_flow(
             _atomic_save(step_dir / "global_endpoint.pt", {"master_id": torch.arange(master_count), "features": endpoint})
             _atomic_save(step_dir / "visible_count.pt", visible_count)
             _atomic_save(step_dir / "fallback_mask.pt", fallback_mask)
-        _atomic_json(step_dir / "pbr_fusion_stats.json", pbr_stats)
-        _atomic_json(
-            step_dir / "cycle_stats.json",
-            {
-                "cycle_coefficient": 1.0,
-                "rows": cycle_rows,
-                "correction_mean_abs": float(torch.cat([
-                    (corrected[c.context_id].feats - predictions[c.context_id].feats).abs().reshape(-1)
-                    for c in contexts
-                ]).mean()),
-                "self_endpoint_and_fused_endpoint_are_real_batched_encodes": True,
-            },
-        )
         record = {
             "step": step,
             "t": t,
             "t_next": t_next,
             "contexts": len(contexts),
             "prediction": prediction_stats,
-            "decode_batch_size": DECODE_BATCH_SIZE,
-            "pbr_encode_batch_size": PBR_ENCODE_BATCH_SIZE,
-            "pbr_fusion": pbr_stats,
             "endpoint_fusion": fusion_stats,
-            "cycle": "pred_x0 + normalize(E_fused) - normalize(E_self)",
+            "fusion_space": "normalized_texture_latent_endpoint",
+            "cross_view_pbr_fusion": False,
             "jacobi_barrier": True,
             "local_state_independent_noise": True,
             "velocity_averaging": False,
@@ -1853,7 +2023,7 @@ def _run_texture_flow(
                 "records": records,
             },
         )
-        del predictions, snapshots, fused_fields, self_fields, corrected
+        del predictions
         _empty_cuda_cache()
     if final_endpoint is None:
         raise RuntimeError("texture flow did not produce a final endpoint")
@@ -1865,10 +2035,9 @@ def _run_texture_flow(
         "schedule": list(schedule),
         "records": records,
         "flow_batch_size": FLOW_BATCH_SIZE,
-        "decode_batch_size": DECODE_BATCH_SIZE,
-        "pbr_encode_batch_size": PBR_ENCODE_BATCH_SIZE,
         "real_multi_batch": True,
-        "cycle_coefficient": 1.0,
+        "fusion_space": "normalized_texture_latent_endpoint",
+        "cross_view_pbr_fusion": False,
         "suffix_rollout_used": False,
         "velocity_averaging": False,
         "final_endpoint": str(output_dir / "final" / "texture_global_final.pt"),
@@ -1896,6 +2065,7 @@ def _build_baseline_endpoints(
     source_mask = torch.zeros((len(contexts), master_count), dtype=torch.bool)
     shape_per_context: Dict[str, Any] = {}
     texture_per_context: Dict[str, Any] = {}
+    fallback_context_ids: List[int] = []
     for row, context in enumerate(contexts):
         ids = context.master_ids
         weight = context.gaussian_weight.float()
@@ -1911,23 +2081,33 @@ def _build_baseline_endpoints(
             raise FloatingPointError(
                 f"context {context.context_id}: baseline endpoint contains invalid rows"
             )
-        source_mask[row, ids] = True
-        shape_sum.index_add_(0, ids, shape_ref * weight[:, None])
-        texture_sum.index_add_(0, ids, texture_ref * weight[:, None])
-        weight_sum.index_add_(0, ids, weight)
-        reference_count.index_add_(0, ids, torch.ones_like(ids, dtype=torch.int32))
         shape_per_context[str(context.context_id)] = {
             "master_ids": ids,
             "endpoint": shape_ref,
             "valid": valid,
             "weight": weight,
+            "donor_representative": context.donor_representative,
         }
         texture_per_context[str(context.context_id)] = {
             "master_ids": ids,
             "endpoint": texture_ref,
             "valid": valid,
             "weight": weight,
+            "donor_representative": context.donor_representative,
         }
+        # The zero-donor fallback is the immutable canonical/global baseline.
+        # Attached yaws are proposals only and must never redefine it.
+        if context.angle != 0:
+            continue
+        fallback_context_ids.append(int(context.context_id))
+        donor = valid & context.donor_representative
+        donor_ids = ids[donor]
+        donor_weight = weight[donor]
+        source_mask[row, donor_ids] = True
+        shape_sum.index_add_(0, donor_ids, shape_ref[donor] * donor_weight[:, None])
+        texture_sum.index_add_(0, donor_ids, texture_ref[donor] * donor_weight[:, None])
+        weight_sum.index_add_(0, donor_ids, donor_weight)
+        reference_count.index_add_(0, donor_ids, torch.ones_like(donor_ids, dtype=torch.int32))
     if bool((weight_sum <= 0.0).any()):
         missing = torch.where(weight_sum <= 0.0)[0][:32].tolist()
         raise RuntimeError(f"baseline fallback has no reference for master IDs {missing}")
@@ -1956,7 +2136,7 @@ def _build_baseline_endpoints(
         baseline_dir / "reference_sources.pt",
         {
             "format": FORMAT,
-            "source_context_ids": torch.tensor([c.context_id for c in contexts], dtype=torch.int64),
+            "source_context_ids": torch.tensor(fallback_context_ids, dtype=torch.int64),
             "reference_mask": source_mask,
             "reference_count": reference_count,
             "sum_weight": weight_sum,
@@ -1970,15 +2150,17 @@ def _build_baseline_endpoints(
             "all_master_ids_covered": True,
             "reference_count": reference_count.tolist(),
             "sum_weight": weight_sum.tolist(),
-            "source_context_ids": [int(c.context_id) for c in contexts],
+            "source_context_ids": fallback_context_ids,
             "encoder_unit": "one complete local C1024 subgraph per context before row gather",
-            "shape_global_rule": "tile-center Gaussian mean of per-context normalized shape endpoints",
-            "texture_global_rule": "tile-center Gaussian mean of per-context normalized PBR-encoded texture endpoints",
+            "shape_global_rule": "yaw-0 canonical/global baseline only; tile-centre Gaussian mean of representative normalized shape endpoints",
+            "texture_global_rule": "yaw-0 canonical/global baseline only; tile-centre Gaussian mean of representative normalized texture endpoints",
         },
     )
     return shape_global, texture_global, {
         "master_count": master_count,
         "context_count": len(contexts),
+        "fallback_context_count": len(fallback_context_ids),
+        "fallback_context_ids": fallback_context_ids,
         "min_reference_count": int(reference_count.min()),
         "max_reference_count": int(reference_count.max()),
         "shape_channels": shape_channels,
@@ -2023,27 +2205,19 @@ def _query_baseline_pbr_on_dual_support(
     rotation: torch.Tensor,
     device: torch.device,
     query_chunk_size: int,
+    face_chunk_size: int,
 ) -> torch.Tensor:
-    """Query the immutable baseline field directly at every local C1024 dual row.
-
-    The local C1024 support is complete before this function is called.  Each
-    dual vertex is mapped through the official local-camera transform and the
-    fixed view yaw into the baseline object frame; no local triangle
-    correspondence or support mutation is involved.
-    """
-    if query_chunk_size <= 0:
-        raise ValueError("material query chunk size must be positive")
-    local_q = geometry.dual_vertices_world.to(device=device, dtype=torch.float32) * (
-        2.0 * float(transform.mesh_scale)
+    """Resample baseline PBR at local triangle surfaces, never empty cell centers."""
+    values, _ = core._resample_local_attrs_from_global(
+        geometry=geometry,
+        global_attr_field=baseline_field,
+        global_camera=camera,
+        transform=transform,
+        query_chunk_size=int(query_chunk_size),
+        face_chunk_size=int(face_chunk_size),
+        local_q_to_attr_q=lambda q: _view_to_world_q(q, rotation),
     )
-    q_view, _ = core._local_q_to_global_q(
-        local_q, global_camera=camera, transform=transform
-    )
-    q_world = _view_to_world_q(q_view, rotation)
-    points = q_world / (2.0 * float(camera["mesh_scale"]))
-    values = cross_tile._query_mesh_chunked(
-        baseline_field, points, int(query_chunk_size)
-    ).detach().cpu().float()
+    values = values.detach().cpu().float()
     expected = (int(geometry.coords.shape[0]), 6)
     if values.shape != expected or not torch.isfinite(values).all():
         raise FloatingPointError(
@@ -2113,6 +2287,10 @@ def _load_prepared_context_cache(
             return None
         master_ids = row["master_ids"].to(torch.int64).contiguous()
         local_coords = row["local_coords_c64"].to(torch.int32).contiguous()
+        donor_representative = row.get("donor_representative")
+        if not isinstance(donor_representative, torch.Tensor):
+            return None
+        donor_representative = donor_representative.to(torch.bool).contiguous()
         uv_virtual = row["uv_virtual_4096"].to(torch.float32).contiguous()
         shape_reference = shape_row["endpoint"].to(torch.float32).contiguous()
         texture_reference = texture_row["endpoint"].to(torch.float32).contiguous()
@@ -2121,6 +2299,7 @@ def _load_prepared_context_cache(
             or texture_reference.shape[0] != master_ids.numel()
             or shape_reference.ndim != 2
             or texture_reference.ndim != 2
+            or donor_representative.shape != (master_ids.numel(),)
             or not torch.isfinite(shape_reference).all()
             or not torch.isfinite(texture_reference).all()
         ):
@@ -2179,6 +2358,7 @@ def _load_prepared_context_cache(
                 view=view,
                 master_ids=master_ids,
                 local_coords=local_coords,
+                donor_representative=donor_representative,
                 uv_virtual=uv_virtual,
                 gaussian_weight=row["gaussian_weight"].to(torch.float32).contiguous(),
                 shape_reference=shape_reference,
@@ -2250,15 +2430,8 @@ def _prepare_contexts(
         print(f"[support] reuse first-view dense master rows={support.master_q_global.shape[0]}", flush=True)
 
     face_bounds_cache: Dict[int, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
-    face_bounds_cache[0] = _face_bounds(
-        baseline,
-        camera,
-        output_dir / "support" / "face_projection_bounds_4096.pt",
-        source_size=CANONICAL_SIZE,
-        chunk_size=int(args.face_projection_chunk_size),
-    )
     rotations = {angle: _yaw_matrix(angle) for angle in ANGLES}
-    for angle in ANGLES[1:]:
+    for angle in ANGLES:
         face_bounds_cache[angle] = _face_bounds(
             baseline,
             camera,
@@ -2272,26 +2445,13 @@ def _prepare_contexts(
     preparation_rows: List[Dict[str, Any]] = []
     baseline_field: Optional[MeshWithVoxel] = None
     for angle_index, angle in enumerate(ANGLES):
-        canonical_view = angle == 0
-        boxes = first_boxes if canonical_view else view_boxes
+        # All three endpoint-flow inputs follow the fixed-PBR route: the full
+        # 1024 panel is global conditioning and its own 256 crop is proj.
+        canonical_view = False
+        boxes = view_boxes
         for tile_id, source_box in enumerate(boxes):
             context_id = angle_index * TILE_COUNT + tile_id
-            if canonical_view and support is not None and tile_id not in support.tile_views:
-                preparation_rows.append({
-                    "context_id": context_id,
-                    "angle": angle,
-                    "tile_id": tile_id,
-                    "source_box": source_box,
-                    "virtual_box": _virtual_box(source_box, canonical_view),
-                    "status": "inactive_first_view_support",
-                    "master_ids": torch.empty((0,), dtype=torch.int64),
-                    "local_coords": torch.empty((0, 4), dtype=torch.int32),
-                    "uv_virtual": torch.empty((0, 2), dtype=torch.float32),
-                    "gaussian_weight": torch.empty((0,), dtype=torch.float32),
-                    "mapping_stats": {"reason": "not in immutable first-view support"},
-                })
-                continue
-            transform = first_transforms[tile_id] if canonical_view else core._derive_tile_camera(
+            transform = core._derive_tile_camera(
                 tile_id=tile_id,
                 box=source_box,
                 global_camera=camera,
@@ -2301,26 +2461,15 @@ def _prepare_contexts(
                 model_width=MODEL_TILE_SIZE,
                 model_height=MODEL_TILE_SIZE,
             )
-            if canonical_view:
-                tile_image = canonical["image_4096"].crop(source_box).convert("RGB")
-                if tile_image.size != (MODEL_TILE_SIZE, MODEL_TILE_SIZE):
-                    raise RuntimeError(f"first-view tile {tile_id} is not native 1024")
-            else:
-                tile_image = multiview_images[angle].crop(source_box).convert("RGB")
-                if tile_image.size != (VIEW_TILE_SIZE, VIEW_TILE_SIZE):
-                    raise RuntimeError(f"view {angle} tile {tile_id} is not native 256")
-                tile_image = tile_image.resize((MODEL_TILE_SIZE, MODEL_TILE_SIZE), Image.Resampling.BICUBIC)
+            tile_image = multiview_images[angle].crop(source_box).convert("RGB")
+            if tile_image.size != (VIEW_TILE_SIZE, VIEW_TILE_SIZE):
+                raise RuntimeError(f"view {angle} tile {tile_id} is not native 256")
+            tile_image = tile_image.resize((MODEL_TILE_SIZE, MODEL_TILE_SIZE), Image.Resampling.BICUBIC)
             tile_dir = output_dir / "contexts" / f"context_{context_id:03d}"
             tile_dir.mkdir(parents=True, exist_ok=True)
             geometry_path = tile_dir / "geometry.pt"
             try:
                 legacy_dual_path = None
-                if angle == 0:
-                    legacy_dual_path = (
-                        args.first_view_support.expanduser().resolve().parent
-                        / "tile_geometry"
-                        / f"tile_{tile_id:02d}.pt"
-                    )
                 geometry = _prepare_geometry(
                     baseline=baseline,
                     camera=camera,
@@ -2349,17 +2498,47 @@ def _prepare_contexts(
                 raise
             pbr_cache = tile_dir / "baseline_pbr_field.pt"
             pbr_cache_key = _hash_many({
-                "query_route": "direct_dual_support_v1",
+                "format": FORMAT,
+                "query_route": "triangle_surface_resample_inverse_yaw_v2",
                 "coords": geometry.coords,
                 "selected_faces": geometry.selected_global_face_ids,
                 "angle": angle,
                 "camera": dict(camera),
             })
-            if pbr_cache.is_file():
-                pbr_payload = torch.load(pbr_cache, map_location="cpu", weights_only=False)
-                baseline_pbr = pbr_payload["pbr"].float() if pbr_payload.get("cache_key") == pbr_cache_key else None
-            else:
-                baseline_pbr = None
+            baseline_pbr = None
+            pbr_sources = [pbr_cache]
+            prepared_source = getattr(args, "prepared_context_cache", None)
+            if prepared_source is not None:
+                pbr_sources.append(
+                    Path(prepared_source).expanduser().resolve()
+                    / "contexts" / f"context_{context_id:03d}" / "baseline_pbr_field.pt"
+                )
+            for pbr_source in pbr_sources:
+                if not pbr_source.is_file():
+                    continue
+                pbr_payload = torch.load(pbr_source, map_location="cpu", weights_only=False)
+                candidate_pbr = pbr_payload.get("pbr")
+                if (
+                    isinstance(candidate_pbr, torch.Tensor)
+                    and candidate_pbr.shape == (geometry.coords.shape[0], 6)
+                    and torch.isfinite(candidate_pbr).all()
+                    # Reject the old direct-cell query cache: most rows were
+                    # exactly zero.  Surface-resampled fixed-PBR references
+                    # have a material value for every geometry row.
+                    and bool((candidate_pbr.abs().sum(dim=1) > 1e-8).all())
+                ):
+                    baseline_pbr = candidate_pbr.float()
+                    if pbr_source != pbr_cache:
+                        _atomic_save(
+                            pbr_cache,
+                            {
+                                "format": FORMAT,
+                                "cache_key": pbr_cache_key,
+                                "pbr": baseline_pbr,
+                                "input_independent_source": str(pbr_source),
+                            },
+                        )
+                    break
             if baseline_pbr is None:
                 if baseline_field is None:
                     baseline_field = core._make_attribute_query_mesh(baseline, device)
@@ -2371,6 +2550,7 @@ def _prepare_contexts(
                     rotation=rotations[angle],
                     device=device,
                     query_chunk_size=int(args.material_query_chunk_size),
+                    face_chunk_size=int(args.material_face_chunk_size),
                 )
                 _atomic_save(pbr_cache, {"format": FORMAT, "cache_key": pbr_cache_key, "pbr": baseline_pbr})
             if baseline_pbr.shape != (geometry.coords.shape[0], 6) or not torch.isfinite(baseline_pbr).all():
@@ -2429,16 +2609,7 @@ def _prepare_contexts(
             if not torch.equal(shape_full.coords, texture_full.coords):
                 raise RuntimeError(f"context {item['context_id']}: shape/texture baseline support differs")
             virtual_box = item["virtual_box"]
-            if item["angle"] == 0 and support is not None:
-                source_view = support.tile_views[item["tile_id"]]
-                master_ids = source_view.master_ids.clone()
-                local_coords = source_view.local_coords.clone()
-                uv_virtual = source_view.master_uv_4096.clone()
-                mapping_stats = {"source": "immutable first-view support tile mapping"}
-                valid_global = torch.zeros((int(support.master_q_global.shape[0]),), dtype=torch.bool)
-                valid_global[master_ids] = True
-            else:
-                if support is None:
+            if support is None:
                     first_native = {
                         int(other["tile_id"]): other["shape_full"].coords
                         for other in []
@@ -2448,10 +2619,11 @@ def _prepare_contexts(
                     master_ids = torch.empty((0,), dtype=torch.int64)
                     local_coords = torch.empty((0, 4), dtype=torch.int32)
                     uv_virtual = torch.empty((0, 2), dtype=torch.float32)
+                    donor_representative = torch.empty((0,), dtype=torch.bool)
                     mapping_stats = {"postponed_until_support_build": True}
                     valid_global = torch.empty((0,), dtype=torch.bool)
-                else:
-                    master_ids, local_coords, uv_virtual, valid_global, mapping_stats = _map_master_to_context(
+            else:
+                    master_ids, local_coords, uv_virtual, valid_global, donor_representative, mapping_stats = _map_master_to_context(
                         master_q_world=support.master_q_global,
                         native_coords=shape_full.coords,
                         angle=int(item["angle"]),
@@ -2489,6 +2661,7 @@ def _prepare_contexts(
                     view=view,
                     master_ids=master_ids,
                     local_coords=local_coords,
+                    donor_representative=donor_representative,
                     uv_virtual=uv_virtual,
                     gaussian_weight=view.gaussian_weight,
                     shape_reference=shape_reference,
@@ -2521,6 +2694,7 @@ def _prepare_contexts(
                     "status": "active",
                     "master_ids": master_ids,
                     "local_coords": local_coords,
+                    "donor_representative": donor_representative,
                     "uv_virtual": uv_virtual,
                     "gaussian_weight": view.gaussian_weight,
                     "mapping_stats": mapping_stats,
@@ -2543,6 +2717,7 @@ def _prepare_contexts(
                         "status": "empty_mapping",
                         "master_ids": master_ids,
                         "local_coords": local_coords,
+                        "donor_representative": donor_representative,
                         "uv_virtual": uv_virtual,
                         "gaussian_weight": torch.empty((0,), dtype=torch.float32),
                         "mapping_stats": mapping_stats,
@@ -2574,7 +2749,7 @@ def _prepare_contexts(
         for item in pending:
             if item["angle"] != 0:
                 continue
-            master_ids, local_coords, uv_virtual, _, mapping_stats = _map_master_to_context(
+            master_ids, local_coords, uv_virtual, _, donor_representative, mapping_stats = _map_master_to_context(
                 master_q_world=support.master_q_global,
                 native_coords=item["shape_full"].coords,
                 angle=0,
@@ -2584,7 +2759,7 @@ def _prepare_contexts(
             )
             if master_ids.numel():
                 rebuilt_first_views[item["tile_id"]] = _make_local_view(
-                    item["context_id"], item["transform"], item["virtual_box"],
+                    item["context_id"], first_transforms[item["tile_id"]], item["virtual_box"],
                     master_ids, local_coords, uv_virtual,
                     {"source": "current first-view native C64 support", **mapping_stats},
                 )
@@ -2610,19 +2785,14 @@ def _prepare_contexts(
                 continue
             shape_full = item["shape_full"]
             texture_full = item["texture_full"]
-            if item["angle"] == 0:
-                source_view = support.tile_views[item["tile_id"]]
-                master_ids, local_coords, uv_virtual = source_view.master_ids, source_view.local_coords, source_view.master_uv_4096
-                mapping_stats = {"source": "new first-view first-owner support"}
-            else:
-                master_ids, local_coords, uv_virtual, _, mapping_stats = _map_master_to_context(
-                    master_q_world=support.master_q_global,
-                    native_coords=shape_full.coords,
-                    angle=item["angle"],
-                    transform=item["transform"],
-                    camera=camera,
-                    virtual_box=item["virtual_box"],
-                )
+            master_ids, local_coords, uv_virtual, _, donor_representative, mapping_stats = _map_master_to_context(
+                master_q_world=support.master_q_global,
+                native_coords=shape_full.coords,
+                angle=item["angle"],
+                transform=item["transform"],
+                camera=camera,
+                virtual_box=item["virtual_box"],
+            )
             if not master_ids.numel():
                 preparation_rows.append({"context_id": item["context_id"], "angle": item["angle"], "tile_id": item["tile_id"], "source_box": item["source_box"], "virtual_box": item["virtual_box"], "status": "empty_mapping", "master_ids": master_ids, "local_coords": local_coords, "uv_virtual": uv_virtual, "gaussian_weight": torch.empty((0,), dtype=torch.float32), "mapping_stats": mapping_stats})
                 continue
@@ -2635,10 +2805,10 @@ def _prepare_contexts(
             target_world_points = _view_to_world_q(q_view, rotation) / (2.0 * float(camera["mesh_scale"]))
             encoded_contexts.append(PreparedContext(
                 context_id=item["context_id"], angle=item["angle"], angle_index=item["angle_index"], tile_id=item["tile_id"],
-                source_box=item["source_box"], virtual_box=item["virtual_box"], transform=item["transform"], tile_image=item["tile_image"], tile_dir=item["tile_dir"], geometry=item["geometry"], baseline_pbr=item["baseline_pbr"], shape_full=shape_full, texture_full=texture_full, native_coords=shape_full.coords.clone(), view=view, master_ids=master_ids, local_coords=local_coords, uv_virtual=uv_virtual, gaussian_weight=view.gaussian_weight, shape_reference=shape_reference, texture_reference=texture_reference, target_points=item["geometry"].dual_vertices_world.clone(), target_world_points=target_world_points.cpu(), nearest_local_points=torch.zeros((master_ids.numel(), 3), dtype=torch.float32), nearest_local_uv=torch.zeros((master_ids.numel(), 2), dtype=torch.float32), visible=torch.zeros((master_ids.numel(),), dtype=torch.bool), mapping_valid_global=torch.zeros((support.master_q_global.shape[0],), dtype=torch.bool), shape_state=None, texture_state=None, condition_shape=None, condition_texture=None, support_stats={"status": "active", "mapping": mapping_stats, "local_ovoxel_count": int(item["geometry"].coords.shape[0]), "shape_encoder": item["shape_stats"], "texture_encoder": item["texture_stats"]},
+                source_box=item["source_box"], virtual_box=item["virtual_box"], transform=item["transform"], tile_image=item["tile_image"], tile_dir=item["tile_dir"], geometry=item["geometry"], baseline_pbr=item["baseline_pbr"], shape_full=shape_full, texture_full=texture_full, native_coords=shape_full.coords.clone(), view=view, master_ids=master_ids, local_coords=local_coords, donor_representative=donor_representative, uv_virtual=uv_virtual, gaussian_weight=view.gaussian_weight, shape_reference=shape_reference, texture_reference=texture_reference, target_points=item["geometry"].dual_vertices_world.clone(), target_world_points=target_world_points.cpu(), nearest_local_points=torch.zeros((master_ids.numel(), 3), dtype=torch.float32), nearest_local_uv=torch.zeros((master_ids.numel(), 2), dtype=torch.float32), visible=torch.zeros((master_ids.numel(),), dtype=torch.bool), mapping_valid_global=torch.zeros((support.master_q_global.shape[0],), dtype=torch.bool), shape_state=None, texture_state=None, condition_shape=None, condition_texture=None, support_stats={"status": "active", "mapping": mapping_stats, "local_ovoxel_count": int(item["geometry"].coords.shape[0]), "shape_encoder": item["shape_stats"], "texture_encoder": item["texture_stats"]},
             ))
             encoded_contexts[-1].mapping_valid_global[master_ids] = True
-            preparation_rows.append({"context_id": item["context_id"], "angle": item["angle"], "tile_id": item["tile_id"], "source_box": item["source_box"], "virtual_box": item["virtual_box"], "status": "active", "master_ids": master_ids, "local_coords": local_coords, "uv_virtual": uv_virtual, "gaussian_weight": view.gaussian_weight, "mapping_stats": mapping_stats})
+            preparation_rows.append({"context_id": item["context_id"], "angle": item["angle"], "tile_id": item["tile_id"], "source_box": item["source_box"], "virtual_box": item["virtual_box"], "status": "active", "master_ids": master_ids, "local_coords": local_coords, "donor_representative": donor_representative, "uv_virtual": uv_virtual, "gaussian_weight": view.gaussian_weight, "mapping_stats": mapping_stats})
 
     if not encoded_contexts:
         raise RuntimeError("support mapping left no active contexts")
@@ -2733,6 +2903,67 @@ def _final_decode_and_render(
     decode_batch_size: int,
     render: bool,
 ) -> Dict[str, Any]:
+    final_dir = output_dir / "final"
+    decode_views = {
+        str(tile_id): {
+            "box": list(view.box),
+            "transform": dict(view.transform.__dict__),
+            "master_ids": view.master_ids,
+            "local_coords": view.local_coords,
+        }
+        for tile_id, view in sorted(support.tile_views.items())
+    }
+    decode_key = _hash_many({
+        "format": FORMAT,
+        "route": "canonical_first_view_decode_v3_transform_bound",
+        "master_q": support.master_q_global,
+        "tile_views": decode_views,
+        "shape_endpoint": shape_global,
+        "texture_endpoint": texture_global,
+        "camera": dict(camera),
+        "decode_batch_size": int(decode_batch_size),
+    })
+    cache_metadata_path = final_dir / "decode_cache_metadata.json"
+    cached_key = None
+    if cache_metadata_path.is_file():
+        cached_key = json.loads(cache_metadata_path.read_text(encoding="utf-8")).get("decode_key")
+    cache_invalidated = cached_key != decode_key
+    if cache_invalidated:
+        # The shared decoder's legacy existence-only cache can otherwise bind
+        # a newly completed latent flow to an older decoded mesh/render.  Only
+        # exact generated final artifacts are invalidated; global endpoints
+        # and all flow checkpoints remain untouched.
+        stale_names = (
+            "unwelded_tile_patches.pt",
+            "final_per_vertex_pbr_mesh.pt",
+            "final_per_face_pbr_mesh.pt",
+            "face_ownership.json",
+            "final_render_rgb_4096.png",
+            "final_render_alpha_4096.png",
+            "final_render_normal_camera_4096.png",
+            "final_render_normal_world_4096.png",
+            "final_pbr_base_color_4096.png",
+            "final_pbr_metallic_4096.png",
+            "final_pbr_roughness_4096.png",
+            "final_pbr_alpha_4096.png",
+            "final_depth_4096.pt",
+            "render_rgb_4096.png",
+            "render_alpha_4096.png",
+            "render_normal_camera_4096.png",
+            "render_normal_world_4096.png",
+            "pbr_base_color_4096.png",
+            "pbr_metallic_4096.png",
+            "pbr_roughness_4096.png",
+            "pbr_alpha_4096.png",
+            "depth_4096.pt",
+        )
+        for name in stale_names:
+            path = final_dir / name
+            if path.is_file():
+                path.unlink()
+        metrics_path = output_dir / "metrics_4096.json"
+        if metrics_path.is_file():
+            metrics_path.unlink()
     # The shared decoder performs only canonical first-view local->world
     # decoding and fixed 2-D face ownership.  It never sees attached-view
     # contexts and therefore cannot create or reorder master support rows.
@@ -2752,6 +2983,8 @@ def _final_decode_and_render(
         "faces": int(decoded["faces"]),
         "decoded_tiles": decoded.get("decoded_tiles", []),
         "mesh_decode": "official local C1024 decoder; first-view 2-D Gaussian face ownership",
+        "decode_cache_key": decode_key,
+        "decode_cache_invalidated": cache_invalidated,
     }
     if render:
         reference = np.asarray(canonical["image_4096"].convert("RGB"), dtype=np.float32) / 255.0
@@ -2779,6 +3012,16 @@ def _final_decode_and_render(
             output_dir,
             {"final": render_summary},
         )
+    _atomic_json(cache_metadata_path, {
+        "format": FORMAT,
+        "decode_key": decode_key,
+        "shape_endpoint_sha256": _tensor_hash(shape_global),
+        "texture_endpoint_sha256": _tensor_hash(texture_global),
+        "master_support_sha256": _tensor_hash(support.master_q_global),
+        "camera": dict(camera),
+        "decode_batch_size": int(decode_batch_size),
+        "render": bool(render),
+    })
     return result
 
 
@@ -2942,12 +3185,20 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         render_face_chunk_size=int(args.render_face_chunk_size),
     )
     _write_context_metadata(contexts, output_dir)
-    active_views = {context.context_id: context.view for context in contexts}
+    condition_full_views = {
+        # Match global_c4096_visible_local_flow exactly: every yaw global
+        # token comes from its complete 1024 panel in the three-view input.
+        0: multiview_images[0].convert("RGB"),
+        120: multiview_images[120].convert("RGB"),
+        240: multiview_images[240].convert("RGB"),
+    }
     shape_conditions = _pack_conditions(
-        contexts, pipeline, output_dir, "shape", device, PBR_ENCODE_BATCH_SIZE
+        contexts, pipeline, output_dir, "shape", device, PBR_ENCODE_BATCH_SIZE,
+        condition_full_views, camera,
     )
     texture_conditions = _pack_conditions(
-        contexts, pipeline, output_dir, "texture", device, TEXTURE_CONDITION_BATCH_SIZE
+        contexts, pipeline, output_dir, "texture", device, TEXTURE_CONDITION_BATCH_SIZE,
+        condition_full_views, camera,
     )
     for context in contexts:
         if context.context_id not in shape_conditions or context.context_id not in texture_conditions:
@@ -3000,16 +3251,13 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         contexts=contexts,
         shape_global_final=shape_global,
         texture_fallback=texture_fallback,
-        baseline_pbr_global=baseline_pbr_global,
         pipeline=pipeline,
-        pbr_encoder=pbr_encoder,
         output_dir=output_dir,
         device=device,
         seed=int(args.texture_seed),
         steps_override=args.steps,
         resume=bool(args.resume),
         save_step_tensors=bool(args.save_step_tensors),
-        query_chunk_size=int(args.query_chunk_size),
         master_count=master_count,
     )
     final_summary = _final_decode_and_render(
