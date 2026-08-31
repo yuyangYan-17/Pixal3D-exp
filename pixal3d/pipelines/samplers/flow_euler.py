@@ -151,6 +151,7 @@ class FlowEulerSampler(Sampler):
         record_trajectory: bool = False,
         trajectory_device: Union[str, torch.device] = "cpu",
         return_model_history: bool = True,
+        endpoint_callback: Optional[Callable[..., None]] = None,
         **kwargs
     ):
         """
@@ -192,8 +193,23 @@ class FlowEulerSampler(Sampler):
                 ],
                 "velocities": [],
             })
-        for t, t_prev in tqdm(t_pairs, desc=tqdm_desc, disable=not verbose):
+        for step_index, (t, t_prev) in enumerate(
+            tqdm(t_pairs, desc=tqdm_desc, disable=not verbose)
+        ):
+            # Keep this reference before the Euler update.  A predicted
+            # endpoint is defined by the model velocity at the *current*
+            # state/time, not by pred_x_prev.
+            current_sample = sample
             out = self.sample_once(model, sample, t, t_prev, cond, **kwargs)
+            if endpoint_callback is not None:
+                endpoint_callback(
+                    step_index=step_index,
+                    x_t=current_sample,
+                    v=out.pred_v,
+                    t=float(t),
+                    t_next=float(t_prev),
+                    endpoint=out.pred_x_0,
+                )
             sample = out.pred_x_prev
             if return_model_history:
                 ret.pred_x_t.append(out.pred_x_prev)
