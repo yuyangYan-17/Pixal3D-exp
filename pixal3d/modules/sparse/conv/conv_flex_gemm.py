@@ -1,4 +1,5 @@
 import math
+import os
 import torch
 import torch.nn as nn
 from .. import SparseTensor
@@ -35,8 +36,13 @@ def sparse_conv3d_init(self, in_channels, out_channels, kernel_size, stride=1, d
 
 
 def sparse_conv3d_forward(self, x: SparseTensor) -> SparseTensor:
-    flex_gemm.ops.spconv.set_algorithm(config.FLEX_GEMM_ALGO)
-    flex_gemm.ops.spconv.set_hashmap_ratio(config.FLEX_GEMM_HASHMAP_RATIO)
+    flex_gemm.ops.spconv.set_algorithm(os.environ.get(
+        "PIXAL3D_FLEX_GEMM_ALGO", config.FLEX_GEMM_ALGO))
+    hashmap_ratio = float(os.environ.get(
+        "PIXAL3D_FLEX_GEMM_HASHMAP_RATIO", config.FLEX_GEMM_HASHMAP_RATIO))
+    if hashmap_ratio < 1.0:
+        raise ValueError("PIXAL3D_FLEX_GEMM_HASHMAP_RATIO must be >= 1.0")
+    flex_gemm.ops.spconv.set_hashmap_ratio(hashmap_ratio)
 
     # check if neighbor map is already computed
     Co, Kd, Kh, Kw, Ci = self.weight.shape

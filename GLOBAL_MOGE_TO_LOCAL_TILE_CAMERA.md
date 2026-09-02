@@ -1,481 +1,1892 @@
-# Global MoGe 相机到 Local Tile 相机与点坐标变换
+请修改 Pixal3D 当前的 global→tile 相机与三维坐标变换。目标不是简单做 2D crop，也不是保持 global depth，而是为每个 4096 图像 tile 构造一个真正对应局部三维区域的、各向同性的 local generation space。
 
-本文档对应 `pixal3d_projective_tile_generation_eval.py` 中的实现，目标是：
+整个实现必须严格遵循下面的数学定义。不要使用 bbox normalization、点云质心归一化、固定 XYZ 缩放、`q_l,z=q_g,z`、depth clamp 等旧方案。
 
-1. 在 canonical 1024 图上用 MoGe-2 推断 global 相机。
-2. 把相机内参连续缩放到 canonical 4096。
-3. 在 4096 图上按 `tile_size=1024, stride=512` 切 tile。
-4. 为每个 tile 构造 Pixal3D 可使用的、光心位于 tile 中心的 local 相机。
-5. 在需要复用 global 支持点时，将 global `q` 点严格变换到 local tile `q`。
-6. 将 local tile 生成的点严格反变换回 global 相机坐标。
+# 一、目标
 
-这里不使用点云质心、点云包围盒或 min-max 归一化。X/Y 的移动和缩放完全由相机焦距、crop、像素位置和点深度决定。
+现有流程中：
 
-> **重要澄清（2026-08-25）**：这里的 local `[-1,1]^3` 不是 global
-> `[-1,1]^3` 中一个轴对齐的小立方体。它在 global 空间中的逆像是一个
-> full-depth projective region：中心射线和 X/Y 边界都随深度变化。本文的
-> `q_l,z=q_g,z` 是有意保留完整规范深度参数，而不是假设 X/Y/Z 都缩放 4
-> 倍。只有 2D crop 时不存在可由相机唯一推出的 `z_center` 或 depth slab；
-> 额外切 Z 属于另一个三维分块方案，不能混入本文的相机变换。
+1. Pixal3D global generation space 对应完整 global 图像；
+2. 将 canonical 图像放大到 4096；
+3. 在 4096 上按 `tile_size=1024, stride=512` 切 tile；
+4. 每个 tile 对应更小 FOV，因此 local generation space 不能继续使用 global camera distance；
+5. tile 中心射线原本通常不在 global camera Z 轴上，因此还需要重新定义 local camera frame；
+6. 最终每个 tile 都应对应一个新的：
 
-## 1. 坐标约定
+$$
+g_l\in[-0.5,0.5]^3
+$$
 
-Pixal3D 的规范坐标记为：
+local generation cube；
 
-```text
-q = (qx, qy, qz), q ∈ [-1, 1]³
-```
+7. 该 cube 对应 global 空间中的一个以 tile 中心表面点为中心、沿 tile center viewing direction 定向的局部三维 cube；
+8. XYZ 三轴必须使用同一个尺度，不能出现原方案中 `XY × 4、Z × 1` 的各向异性；
+9. 原始高清 tile 图像不要 warp；
+10. local 3D 点查询 DINO / projected image feature 时，应 inverse 回 global，再投影到原始 4096 图像，最后换算到 raw tile pixel。
 
-相机位于规范物体前方，camera-space 中看向 `-Z`。`q` 到 camera-space 点的变换为：
+---
 
-```text
-C(d) = (0, 0, -d)
-P(q; d, s) = C(d) + q / (2s)
-```
+# 二、坐标约定
 
-其中：
+为了避免 Pixal3D 当前 `Z` 正负号造成混淆，统一区分：
 
-- `d` 是 Pixal3D camera distance；
-- `s` 是 `mesh_scale`；
-- 点的正深度是：
-
-```text
-D = -Pz = d - qz / (2s)
-```
-
-像素投影约定为：
-
-```text
-u = fx X / D + cx
-v = -fy Y / D + cy
-```
-
-负号来自图像坐标的 Y 轴向下。
-
-## 2. Global MoGe 相机从 1024 缩放到 4096
-
-MoGe-2 在 canonical 1024 图上给出 global 水平 FOV：
-
-```text
-theta_g
-```
-
-Pixal3D 再根据 FOV 计算 `distance=d_g`。设：
-
-```text
-W_g = H_g = 1024
-f_g,1024 = W_g / (2 tan(theta_g / 2))
-c_g,1024 = (512, 512)
-```
-
-canonical 4096 与 canonical 1024 是同一张图的连续缩放，因此：
-
-```text
-a_x = 4096 / 1024 = 4
-a_y = 4096 / 1024 = 4
-
-f_g,4096,x = a_x f_g,1024
-f_g,4096,y = a_y f_g,1024
-c_g,4096   = (2048, 2048)
-```
-
-相机 FOV、`distance` 和 `mesh_scale` 不因图像 resize 改变；只有以像素为单位的 `f`、`cx`、`cy` 随分辨率缩放。
-
-## 3. 4096 tile 布局
-
-使用：
-
-```text
-tile_size = 1024
-tile_stride = 512
-```
-
-每个轴的起点为：
-
-```text
-0, 512, 1024, 1536, 2048, 2560, 3072
-```
-
-所以一共是 `7 × 7 = 49` 个 tile。
-
-一个 tile 的 4096 crop box 记为：
-
-```text
-B = (x0, y0, x1, y1)
-W_c = x1 - x0
-H_c = y1 - y0
-```
-
-crop 后送入流程的尺寸记为 `W_t × H_t`，当前是 `1024 × 1024`：
-
-```text
-r_x = W_t / W_c
-r_y = H_t / H_c
-```
-
-当前 `W_c=H_c=W_t=H_t=1024`，所以 `r_x=r_y=1`。公式仍保留 resize 系数，避免以后改变 tile 输出大小时出错。
-
-## 4. Exact off-axis crop 相机
-
-如果不移动 global 几何，只想直接渲染 global 相机的 crop，那么 tile 内参是：
-
-```text
-fx_off = f_g,4096,x r_x
-fy_off = f_g,4096,y r_y
-
-cx_off = (c_g,4096,x - x0) r_x
-cy_off = (c_g,4096,y - y0) r_y
-```
-
-`cx_off/cy_off` 可以位于 tile 外。例如当前数据：
-
-```text
-tile 26, box=(2560,1536,3584,2560): cx_off=-512
-tile 27, box=(3072,1536,4096,2560): cx_off=-1024
-```
-
-这是正确的离轴 crop 相机，适合“global 几何不变，只换渲染窗口”的情况。
-
-## 5. Pixal3D centered local tile 相机
-
-Pixal3D 的现有投影条件只接受中心光心，因此 local 相机使用：
-
-```text
-fx_l = fx_off
-fy_l = fy_off
-cx_l = W_t / 2
-cy_l = H_t / 2
-```
-
-对应 FOV：
-
-```text
-theta_l,x = 2 atan(W_t / (2 fx_l))
-theta_l,y = 2 atan(H_t / (2 fy_l))
-```
-
-仅修改 FOV、保留 global distance 是错误的。因为中心 local 相机面对的是一个完整的 local 规范立方体，必须重新计算其 Pixal3D distance：
-
-```text
-d_l = distance_from_fov(
-    theta_l,x,
-    grid_point=(-1,0,0),
-    target_point=(-extend_pixel, W_t-1+extend_pixel),
-    mesh_scale=s_l,
-    image_resolution=W_t,
-)
-```
-
-在 `extend_pixel=0` 时近似满足：
-
-```text
-d_l s_l = fx_l / W_t
-```
-
-本项目的 1024/4096/tile 配置下：
-
-```text
-f_g,1024 = 1934.887
-d_g      = 1.889538
-
-fx_l     = 7739.549
-d_l      = 7.558153
-
-(d_l s_l) / (d_g s_g) = 4
-```
-
-这个 4 倍就是 4096 上 1024 crop 相对于整幅图的重规范化倍率。
-
-## 6. 为什么 1024 和 512 使用同一组 FOV/distance
-
-tile 最初从 4096 上裁成 1024，shape512 阶段再把 tile resize 到 512。resize 不改变视锥，只改变像素内参：
-
-```text
-f_l,512 = f_l,1024 × 512 / 1024
-c_l,512 = (256, 256)
-```
-
-FOV、`distance`、`mesh_scale` 保持不变。因此 1024 和 512 阶段应传同一组：
-
-```text
-(camera_angle_x=theta_l, distance=d_l, mesh_scale=s_l)
-```
-
-不能在 512 阶段再次按 512/1024 修改 distance。
-
-## 7. Global q 到 local tile q
-
-### 7.1 Global q 投影到 4096
-
-对 global 点 `q_g`：
-
-```text
-P_g = (0,0,-d_g) + q_g / (2s_g)
-D_g = d_g - q_g,z / (2s_g)
-```
-
-投影到 4096：
-
-```text
-u_4096 = f_g,4096,x P_g,x / D_g + 2048
-v_4096 = -f_g,4096,y P_g,y / D_g + 2048
-```
-
-### 7.2 4096 crop 坐标变成 tile 像素
-
-```text
-u_t = (u_4096 - x0) r_x
-v_t = (v_4096 - y0) r_y
-```
-
-### 7.3 保留规范深度，不保留 global 物理深度
+## 2.1 generation/world coordinate
 
 定义：
 
-```text
-q_l,z = q_g,z
-D_l = d_l - q_l,z / (2s_l)
-```
+$$
+g=(x,y,z)
+$$
 
-必须使用 local depth `D_l` 做 local 反投影。若错误地沿用 `D_g`，在 `d_l≈4d_g` 时会把 local `q_z` 推到规范立方体之外。
+其中：
 
-### 7.4 从 tile 像素反投影 local X/Y
+$$
+g\in[-0.5,0.5]^3.
+$$
 
-```text
-X_l = (u_t - cx_l) D_l / fx_l
-Y_l = -(v_t - cy_l) D_l / fy_l
-Z_l = -D_l
+相机位于 generation/world space：
 
-q_l = 2s_l (P_l - (0,0,-d_l))
-```
+$$
+C=(0,0,d)
+$$
 
-按构造有：
+并朝向：
 
-```text
-q_l,z = q_g,z
-```
+$$
+-Z
+$$
 
-其 X/Y 闭式写法为：
+观察原点。
 
-```text
-tile_center_4096,x = x0 + cx_l / r_x
-tile_center_4096,y = y0 + cy_l / r_y
+注意：
 
-q_l,x = 2s_l D_l [
-    q_g,x / (2s_g D_g)
-    + (c_g,4096,x - tile_center_4096,x) / f_g,4096,x
+如果现有代码使用：
+
+$$
+q\in[-1,1]^3
+$$
+
+并通过：
+
+$$
+g=\frac{q}{2s}
+$$
+
+变成实际 generation coordinate，则必须显式完成该转换。
+
+不要在代码中混用 `q∈[-1,1]` 和 `g∈[-0.5,0.5]`。
+
+如果 `s=1`：
+
+$$
+g=q/2.
+$$
+
+---
+
+## 2.2 OpenCV camera coordinates
+
+为了方便投影，定义：
+
+$$
+p^{cv}=(X,Y,Z)
+$$
+
+满足：
+
+* X：图像右；
+* Y：图像下；
+* Z：相机前方；
+* \(Z>0\)。
+
+global generation point：
+
+$$
+g_g=(x_g,y_g,z_g)
+$$
+
+变成 global camera coordinate：
+
+$$
+\boxed{
+p_g^{cv}
+=
+\begin{bmatrix}
+x_g\\
+-y_g\\
+d_g-z_g
+\end{bmatrix}
+}
+$$
+
+因此：
+
+$$
+D_g=d_g-z_g.
+$$
+
+投影为：
+
+$$
+\boxed{
+u_g=f_x\frac{X_g}{Z_g}+c_x
+}
+$$
+
+$$
+\boxed{
+v_g=f_y\frac{Y_g}{Z_g}+c_y.
+}
+$$
+
+这与原 Pixal3D：
+
+$$
+v=-f_yY_{\text{world}}/D+c_y
+$$
+
+完全等价。
+
+---
+
+# 三、global 1024 相机变成 global 4096 相机
+
+MoGe / Pixal3D 已经得到 global FOV 和：
+
+$$
+d_g.
+$$
+
+1024 → 4096 只是连续 resize。
+
+因此：
+
+$$
+f_{4096,x}=4f_{1024,x}
+$$
+
+$$
+f_{4096,y}=4f_{1024,y}
+$$
+
+以及：
+
+$$
+c_{4096}=(2048,2048).
+$$
+
+FOV、`distance=d_g`、`mesh_scale` 不变。
+
+实现中形成：
+
+```python
+K_global_4096 = [
+    [fx4096, 0,      cx4096],
+    [0,      fy4096, cy4096],
+    [0,      0,      1],
 ]
-
-q_l,y = 2s_l D_l [
-    q_g,y / (2s_g D_g)
-    + (tile_center_4096,y - c_g,4096,y) / f_g,4096,y
-]
 ```
 
-可以看到：
+---
 
-- 光心偏移项乘以点深度；
-- 缩放项包含 `D_l / D_g`；
-- 这不是固定平移或简单 bbox normalization。
+# 四、global 三维点先投影到 global 4096 图像
 
-## 8. Local tile q 到 global q
+对于任意 global generation point：
 
-反向变换同样使用投影/反投影。
+$$
+g_g
+$$
 
-先把 local q 投影到 tile：
+先转换：
 
-```text
-P_l = (0,0,-d_l) + q_l / (2s_l)
-D_l = d_l - q_l,z / (2s_l)
+$$
+p_g^{cv}
+=
+[x_g,-y_g,d_g-z_g]^T.
+$$
 
-u_t = fx_l P_l,x / D_l + cx_l
-v_t = -fy_l P_l,y / D_l + cy_l
+要求：
+
+$$
+Z_g>0.
+$$
+
+投影：
+
+$$
+u_{4096}
+=
+f_xX_g/Z_g+c_x
+$$
+
+$$
+v_{4096}
+=
+f_yY_g/Z_g+c_y.
+$$
+
+这一步用于：
+
+1. 判断 global point 是否投影到当前 tile；
+2. 后续查询 raw tile 图像 feature；
+3. debug correspondence。
+
+一个 tile：
+
+$$
+B=(x_0,y_0,x_1,y_1)
+$$
+
+使用 half-open membership：
+
+$$
+x_0\le u<x_1
+$$
+
+$$
+y_0\le v<y_1.
+$$
+
+不要用固定 global XYZ bbox 替代投影 membership。
+
+---
+
+# 五、计算 tile center ray
+
+tile 中心像素：
+
+$$
+u_c=\frac{x_0+x_1}{2}
+$$
+
+$$
+v_c=\frac{y_0+y_1}{2}.
+$$
+
+注意这里是 global 4096 pixel coordinate。
+
+通过 global intrinsics：
+
+$$
+r_c
+=
+K_g^{-1}
+\begin{bmatrix}
+u_c\\v_c\\1
+\end{bmatrix}.
+$$
+
+归一化：
+
+$$
+\boxed{
+\hat r_c
+=
+\frac{r_c}{\|r_c\|}
+}
+$$
+
+这是 OpenCV camera coordinate 中的 tile center ray。
+
+---
+
+# 六、求 tile center 对应的三维 anchor
+
+必须为每个 tile 找一个真实的三维中心：
+
+$$
+P_c^{cv}.
+$$
+
+优先使用 baseline Pixal3D mesh。
+
+从 global camera origin：
+
+$$
+O=(0,0,0)
+$$
+
+沿：
+
+$$
+\hat r_c
+$$
+
+进行 ray-mesh intersection。
+
+取第一可见交点。
+
+于是：
+
+$$
+\boxed{
+P_c^{cv}
+=
+\rho_c\hat r_c
+}
+$$
+
+其中：
+
+$$
+\boxed{
+\rho_c=\|P_c^{cv}\|
+}
+$$
+
+是 tile center surface point 到 global camera 的真实 ray distance。
+
+不要直接将 MoGe metric depth 与 Pixal3D canonical `d_g` 混用。
+
+必须保证：
+
+$$
+P_c,\rho_c,d_g
+$$
+
+处于同一个 Pixal3D generation/camera scale。
+
+如果 center ray 没有击中 baseline mesh：
+
+1. 在 tile 中心附近的小窗口寻找有效 foreground ray intersection；
+2. 使用其 robust median depth；
+3. 再沿真正的 center ray 构造：
+
+$$
+P_c=\rho_c\hat r_c.
+$$
+
+必须记录 fallback。
+
+如果整个 tile 没有有效 foreground，则跳过 tile。
+
+---
+
+# 七、构造 local camera frame
+
+现在需要把：
+
+$$
+\hat r_c
+$$
+
+变成 local camera 的正 Z 轴。
+
+在 OpenCV camera coordinates 中定义：
+
+$$
+z_l^{(g)}=\hat r_c.
+$$
+
+为了尽量保持图像方向，使用 global camera 的 image-down axis：
+
+$$
+y_g=(0,1,0).
+$$
+
+计算：
+
+$$
+x_l^{(g)}
+=
+\frac{
+y_g\times z_l^{(g)}
+}{
+\|y_g\times z_l^{(g)}\|
+}.
+$$
+
+然后：
+
+$$
+y_l^{(g)}
+=
+z_l^{(g)}\times x_l^{(g)}.
+$$
+
+构造：
+
+$$
+\boxed{
+R=
+\begin{bmatrix}
+(x_l^{(g)})^T\\
+(y_l^{(g)})^T\\
+(z_l^{(g)})^T
+\end{bmatrix}
+}
+$$
+
+必须满足：
+
+$$
+RR^T=I
+$$
+
+$$
+\det R=1
+$$
+
+以及：
+
+$$
+\boxed{
+R\hat r_c=(0,0,1)^T.
+}
+$$
+
+不要使用会产生 reflection 的矩阵。
+
+---
+
+# 八、根据 tile 实际角度求 local FOV
+
+不要简单使用：
+
+```python
+theta_local = theta_global / 4
 ```
 
-恢复 4096 像素：
+中心 tile 只有在小角度近似下才接近这种关系。
 
-```text
-u_4096 = u_t / r_x + x0
-v_4096 = v_t / r_y + y0
+正确做法是使用 tile 四个 corner ray。
+
+四个 corner：
+
+$$
+(u_i,v_i).
+$$
+
+计算：
+
+$$
+r_i=
+\operatorname{normalize}
+\left(
+K_g^{-1}
+[u_i,v_i,1]^T
+\right).
+$$
+
+变换到 local camera frame：
+
+$$
+r_i'=Rr_i.
+$$
+
+对于每个 corner：
+
+$$
+s_{x,i}=\frac{r'_{i,x}}{r'_{i,z}}
+$$
+
+$$
+s_{y,i}=\frac{r'_{i,y}}{r'_{i,z}}.
+$$
+
+计算：
+
+$$
+t_x=\max_i|s_{x,i}|
+$$
+
+$$
+t_y=\max_i|s_{y,i}|.
+$$
+
+如果 Pixal3D 只能接受 square / 单一 `camera_angle_x`，使用：
+
+$$
+\boxed{
+t=\max(t_x,t_y)
+}
+$$
+
+从而：
+
+$$
+\boxed{
+\theta_l=2\arctan(t).
+}
+$$
+
+如果代码允许独立 fx/fy，则分别使用：
+
+$$
+\theta_{l,x}=2\arctan(t_x)
+$$
+
+$$
+\theta_{l,y}=2\arctan(t_y).
+$$
+
+注意：
+
+边缘 tile 的左右角度一般不完全对称。
+
+如果要求 centered symmetric Pixal3D camera，就只能使用最大绝对角度，使整个 tile ray bundle 都被包含。
+
+因此某一侧可能存在少量 margin，这是 centered symmetric camera 本身造成的，不要人为再做非均匀 XYZ scale。
+
+---
+
+# 九、FOV 变小后重新计算 local camera distance
+
+local generation cube：
+
+$$
+[-0.5,0.5]^3.
+$$
+
+半边长：
+
+$$
+h=0.5.
+$$
+
+理想 pinhole 关系：
+
+$$
+\boxed{
+d_l=
+\frac{h}{\tan(\theta_l/2)}
+}
+$$
+
+即：
+
+$$
+\boxed{
+d_l=
+\frac{0.5}{\tan(\theta_l/2)}.
+}
+$$
+
+中心 tile、4096→1024 crop 时，应该近似满足：
+
+$$
+d_l\approx4d_g.
+$$
+
+但是实际代码优先使用 Pixal3D 已有：
+
+```python
+distance_from_fov(...)
 ```
 
-保留规范深度：
+保持和原模型 camera convention 完全一致。
+
+需要打印并验证：
 
 ```text
-q_g,z = q_l,z
-D_g = d_g - q_g,z / (2s_g)
+theta_global
+theta_local
+d_global
+d_local
+d_local / d_global
 ```
 
-用 global 深度和 global 内参反投影：
+中心 tile 应接近 4。
+
+不要因为 tile 之后 resize 到 512 再重新修改 `d_l`。
+
+1024 tile resize 到 512 只改变像素焦距，不改变 FOV 和三维 camera distance。
+
+---
+
+# 十、global → local 的统一三维尺度
+
+tile center 在 global camera 中距离：
+
+$$
+\rho_c.
+$$
+
+在新的 local generation space 中，我们希望：
+
+tile center：
+
+$$
+\rightarrow(0,0,0)
+$$
+
+而 global camera：
+
+$$
+\rightarrow
+\text{距 local origin }d_l.
+$$
+
+因此唯一自然的 uniform scale：
+
+$$
+\boxed{
+k=
+\frac{d_l}{\rho_c}.
+}
+$$
+
+global → local 是放大：
+
+$$
+k.
+$$
+
+local → global 是：
+
+$$
+\boxed{
+k^{-1}
+=
+\frac{\rho_c}{d_l}.
+}
+$$
+
+这是 XYZ 三个方向共同使用的尺度。
+
+禁止：
 
 ```text
-X_g = (u_4096 - 2048) D_g / f_g,4096,x
-Y_g = -(v_4096 - 2048) D_g / f_g,4096,y
-Z_g = -D_g
-
-q_g = 2s_g (P_g - (0,0,-d_g))
+scale_x != scale_y
+scale_z = 1
 ```
 
-因为 `D_l/D_g` 随 `q_z` 变化，这个逆变换一般不是单个 4×4 affine matrix。导出 global GLB 时必须逐顶点执行上述变换。
+之类的各向异性做法。
 
-## 9. 两种代码路径如何使用
+---
 
-### 9.1 当前可执行的 tile-only 路径
+# 十一、global 三维点变成 local generation point
 
-该路径不把 global 点传进 tile：
+先在 OpenCV camera coordinate 中计算相对于 anchor 的向量：
+
+$$
+\Delta p_g^{cv}
+=
+p_g^{cv}-P_c^{cv}.
+$$
+
+旋转并统一缩放：
+
+$$
+\boxed{
+t_l^{cv}
+=
+kR
+\left(
+p_g^{cv}-P_c^{cv}
+\right).
+}
+$$
+
+其中：
+
+$$
+t_l^{cv}
+=
+(\Delta X_l,\Delta Y_l,\Delta Z_l)
+$$
+
+使用的是：
+
+* X：右；
+* Y：下；
+* Z：朝相机观察方向的 forward。
+
+local generation coordinate 则是：
+
+$$
+\boxed{
+g_l=
+\begin{bmatrix}
+t_{l,x}\\
+-t_{l,y}\\
+-t_{l,z}
+\end{bmatrix}.
+}
+$$
+
+也就是说：
+
+$$
+\boxed{
+g_{l,x}=t_{l,x}
+}
+$$
+
+$$
+\boxed{
+g_{l,y}=-t_{l,y}
+}
+$$
+
+$$
+\boxed{
+g_{l,z}=-t_{l,z}.
+}
+$$
+
+这里的负号来自 Pixal3D generation/world Z 与 OpenCV camera-forward Z 方向相反。
+
+必须统一处理，不允许代码中随意切换符号。
+
+最终：
+
+$$
+\boxed{
+g_l\in[-0.5,0.5]^3.
+}
+$$
+
+如果内部 flow 使用：
+
+$$
+q_l\in[-1,1]^3
+$$
+
+则最后转换：
+
+$$
+\boxed{
+q_l=2s_lg_l.
+}
+$$
+
+---
+
+# 十二、这个公式的几何意义
+
+核心公式：
+
+$$
+\boxed{
+t_l^{cv}
+=
+\frac{d_l}{\rho_c}
+R
+(p_g^{cv}-P_c^{cv})
+}
+$$
+
+等价于：
 
 ```text
-tile image
-→ local SS32
-→ local shape512/C64
-→ local shape1024
-→ local texture1024
+1. 以 tile center 对应的真实三维 surface point 为原点；
+2. 把 tile center ray 旋转成新的 local Z axis；
+3. 根据 local FOV 对三维 XYZ 统一放大；
+4. 得到新的 isotropic local generation cube。
 ```
 
-它只使用从 global 相机和 crop 推导出的 centered local 相机：
+它不是 heuristic。
+
+它是一个严格的：
+
+$$
+\boxed{
+rotation
++
+translation
++
+uniform\ scale
+}
+$$
+
+similarity transform。
+
+---
+
+# 十三、深度公式必须满足
+
+如果一个 global point 到 global camera 的距离为：
+
+$$
+\rho_p
+$$
+
+它与 tile center ray 的夹角为：
+
+$$
+\gamma
+$$
+
+那么 rotation 后，其 axial depth 为：
+
+$$
+\bar Z_p
+=
+\rho_p\cos\gamma.
+$$
+
+相对于 center point：
+
+$$
+\Delta Z
+=
+\rho_p\cos\gamma-\rho_c.
+$$
+
+因此 local camera-frame depth offset：
+
+$$
+\boxed{
+t_{l,z}
+=
+d_l
+\left(
+\frac{\rho_p}{\rho_c}\cos\gamma-1
+\right).
+}
+$$
+
+对应 generation Z：
+
+$$
+\boxed{
+g_{l,z}
+=
+-d_l
+\left(
+\frac{\rho_p}{\rho_c}\cos\gamma-1
+\right).
+}
+$$
+
+必须通过数值实验验证矩阵版本和该显式公式一致。
+
+禁止继续使用：
+
+$$
+q_{l,z}=q_{g,z}.
+$$
+
+---
+
+# 十四、local cube 在 global 空间中的真实含义
+
+因为：
+
+$$
+t_l
+=
+kR(p_g-P_c)
+$$
+
+所以：
+
+$$
+g_l\in[-0.5,0.5]^3
+$$
+
+对应 global 中一个 oriented cube。
+
+其 global 边长为：
+
+$$
+\boxed{
+L_g=
+\frac{\rho_c}{d_l}.
+}
+$$
+
+半边长：
+
+$$
+\boxed{
+h_g=
+0.5\frac{\rho_c}{d_l}.
+}
+$$
+
+中心 tile 通常：
+
+$$
+\rho_c\approx d_g
+$$
+
+且：
+
+$$
+d_l\approx4d_g
+$$
+
+因此：
+
+$$
+L_g\approx0.25.
+$$
+
+也就是：
 
 ```text
-(theta_l, d_l, s_l)
+global 中约边长 0.25 的局部三维区域
+        ↓
+local 中边长 1.0 的完整 generation cube
 ```
 
-生成出的几何天然位于 local `q`。只有在需要拼回 global 相机空间或导出 global GLB 时，才使用第 8 节的逐顶点逆变换。
+因此理论上：
 
-### 9.2 文件后半段的注释版 projective-support 路径
+$$
+C256_{\text{global}}
+\rightarrow
+C64_{\text{local}}
+$$
 
-该路径会先选出投影落在 tile 内的 global 支持点，再按第 7 节变到 local `q`，之后量化到 local C32/C64/C1024。
+可以在 XYZ 三个方向上都接近一格对一格。
 
-量化前不做 clamp。由于透视规范立方体的远平面投影比中心平面窄，少量落在 tile 边缘的 global 点可能自然落到 local `[-1,1]³` 外；这些点应丢弃并统计，不能压到边界。
+这正是本次修改的主要目标。
 
-## 10. 实现对应关系
+---
 
-代码中的主要函数：
+# 十五、support 选择
+
+旧代码可能采用：
 
 ```text
-_derive_tile_camera
-    global MoGe camera + 4096 crop -> centered local camera
-
-_project_global_q_to_1024_and_4096
-    global q -> global pixels
-
-_global_q_to_centered_tile_q
-    global q -> crop/resize -> local q
-
-_centered_tile_q_to_global_q
-    local q -> inverse crop -> global q/global camera point
-
-_decoder_vertices_to_global_camera
-    decoder vertex [-0.5,0.5] -> local q -> global camera XYZ
+只要 global point 投影落入 tile
+→ 就认为属于 tile
 ```
 
-数值测试要求：
+现在要改为两级判断。
+
+第一层：
+
+global point 必须满足：
+
+$$
+Z_g>0
+$$
+
+且 global projection 落入 tile：
+
+$$
+x_0\le u_g<x_1
+$$
+
+$$
+y_0\le v_g<y_1.
+$$
+
+第二层：
+
+global point 变换到 local：
+
+$$
+g_l=T(g_g)
+$$
+
+以后，还需要满足：
+
+$$
+\boxed{
+|g_{l,x}|\le0.5
+}
+$$
+
+$$
+\boxed{
+|g_{l,y}|\le0.5
+}
+$$
+
+$$
+\boxed{
+|g_{l,z}|\le0.5.
+}
+$$
+
+不要 clamp。
+
+越界点直接统计并丢弃。
+
+必须分别统计：
 
 ```text
-global q -> local q -> global q
+num_projected_into_tile
+num_inside_local_cube
+num_outside_local_x
+num_outside_local_y
+num_outside_local_z
+```
+
+---
+
+# 十六、local → global 必须有严格解析逆
+
+已知：
+
+$$
+g_l.
+$$
+
+先恢复 local CV-relative coordinate：
+
+$$
+\boxed{
+t_l^{cv}
+=
+\begin{bmatrix}
+g_{l,x}\\
+-g_{l,y}\\
+-g_{l,z}
+\end{bmatrix}.
+}
+$$
+
+然后：
+
+$$
+\boxed{
+p_g^{cv}
+=
+P_c^{cv}
++
+\frac{\rho_c}{d_l}
+R^Tt_l^{cv}.
+}
+$$
+
+这就是严格 inverse。
+
+然后从 global camera CV coordinate 恢复 generation coordinate：
+
+$$
+\boxed{
+x_g=X_g
+}
+$$
+
+$$
+\boxed{
+y_g=-Y_g
+}
+$$
+
+$$
+\boxed{
+z_g=d_g-Z_g.
+}
+$$
+
+如果最终需要 `q_g∈[-1,1]`：
+
+$$
+q_g=2s_gg_g.
+$$
+
+---
+
+# 十七、非常重要：raw tile 图像不要 warp
+
+不要执行：
+
+$$
+H=K_lRK_g^{-1}
+$$
+
+去 warp 高清 tile。
+
+本项目保留：
+
+```text
+global 4096 image
+→ raw crop [x0:x1, y0:y1]
+→ 原始高清 tile
+```
+
+不改变原始 GT 图像。
+
+原因是：
+
+local generation space 是人为重新 canonicalize 的三维坐标系；
+
+但图像 condition 表示的仍然是原 global camera 中真实的观测 ray。
+
+因此需要将：
+
+```text
+geometry coordinate
+```
+
+和：
+
+```text
+image feature sampling coordinate
+```
+
+拆开。
+
+---
+
+# 十八、local 3D 点查询图像 feature 的正确方法
+
+禁止直接：
+
+```text
+local g_l
+→ 使用 local centered K_l / d_l
+→ 投影到 raw tile
+→ sample feature
+```
+
+因为纯 rotation 后：
+
+$$
+\Pi_l(g_l)
+$$
+
+通常不等于原始 crop 中对应 pixel。
+
+正确方法是：
+
+$$
+\boxed{
+g_l
+\rightarrow
+T^{-1}
+\rightarrow
+p_g^{cv}
+\rightarrow
+\Pi_g
+\rightarrow
+global4096 pixel
+\rightarrow
+raw tile pixel.
+}
+$$
+
+完整定义：
+
+$$
+\boxed{
+F_{\mathrm{proj}}(g_l)
+=
+F_{\mathrm{tile}}
+\left(
+\operatorname{Crop}
+\left[
+\Pi_g
+\left(
+T^{-1}(g_l)
+\right)
+\right]
+\right).
+}
+$$
+
+---
+
+# 十九、local point → raw tile pixel
+
+首先：
+
+$$
+t_l^{cv}
+=
+[g_{l,x},-g_{l,y},-g_{l,z}]^T.
+$$
+
+inverse：
+
+$$
+p_g^{cv}
+=
+P_c^{cv}
++
+\frac{\rho_c}{d_l}
+R^Tt_l^{cv}.
+$$
+
+设：
+
+$$
+p_g^{cv}=(X_g,Y_g,Z_g).
+$$
+
+投影回 global 4096：
+
+$$
+\boxed{
+u_g=f_xX_g/Z_g+c_x
+}
+$$
+
+$$
+\boxed{
+v_g=f_yY_g/Z_g+c_y.
+}
+$$
+
+raw tile pixel：
+
+$$
+\boxed{
+u_t=(u_g-x_0)r_x
+}
+$$
+
+$$
+\boxed{
+v_t=(v_g-y_0)r_y.
+}
+$$
+
+当前：
+
+$$
+r_x=r_y=1.
+$$
+
+所以：
+
+$$
+u_t=u_g-x_0
+$$
+
+$$
+v_t=v_g-y_0.
+$$
+
+然后按照现有 DINO preprocessing 的真实 resize / pixel-center convention，把：
+
+$$
+(u_t,v_t)
+$$
+
+换算为 DINO feature-map sampling coordinate。
+
+必须沿用当前 `grid_sample(..., align_corners=False)` 的 convention。
+
+如果是直接 resize：
+
+$$
+W_t\rightarrow W_f
+$$
+
+则 pixel-center 映射应使用：
+
+$$
+u_f
+=
+(u_t+0.5)\frac{W_f}{W_t}-0.5
+$$
+
+而不是简单：
+
+$$
+u_f=u_tW_f/W_t
+$$
+
+后直接忽略 pixel center。
+
+优先复用 Pixal3D 当前 feature sampling helper。
+
+---
+
+# 二十、不要 border clamp 图像 feature
+
+如果 inverse 后：
+
+$$
+u_t<0
+$$
+
+或：
+
+$$
+u_t\ge W_t
+$$
+
+或：
+
+$$
+v_t<0
+$$
+
+或：
+
+$$
+v_t\ge H_t
+$$
+
+则：
+
+$$
+\boxed{
+proj\_feature\_valid=False.
+}
+$$
+
+不要使用：
+
+```python
+padding_mode="border"
+```
+
+把越界点强行吸到 tile 边缘。
+
+越界点应该：
+
+1. 使用 null / zero proj feature；
+2. 或只保留 global image token；
+3. 同时输出 valid mask。
+
+具体选择保持和当前模型 architecture 最兼容，但绝对不要伪造边缘 correspondence。
+
+---
+
+# 二十一、需要修改 Pixal3D 当前 projection condition
+
+当前 Pixal3D 很可能默认：
+
+```text
+local 3D coordinate
+→ local camera projection
+→ feature map sample
+```
+
+现在需要拆开。
+
+新的逻辑：
+
+```text
+local sparse/grid coordinate
+        ↓
+local generation g_l
+        ↓
+T^{-1}
+        ↓
+global camera CV point
+        ↓
+K_global_4096 projection
+        ↓
+global 4096 pixel
+        ↓
+subtract tile origin
+        ↓
+raw tile pixel
+        ↓
+DINO preprocessing coordinate
+        ↓
+grid_sample feature
+```
+
+local camera：
+
+```text
+theta_l
+d_l
+```
+
+仍然用于：
+
+* local Pixal3D generation camera condition；
+* local generation-space definition；
+* local decoder；
+* local flow。
+
+但它不再负责 raw tile DINO feature correspondence。
+
+---
+
+# 二十二、建议新增函数
+
+请尽量把实现拆成独立函数，例如：
+
+```python
+generation_to_camera_cv(
+    g,
+    distance,
+)
+
+camera_cv_to_generation(
+    p_cv,
+    distance,
+)
+
+project_camera_cv_to_image(
+    p_cv,
+    K,
+)
+
+derive_tile_center_ray(
+    tile_box,
+    K_global,
+)
+
+raycast_tile_anchor(
+    baseline_mesh,
+    center_ray,
+    global_camera,
+)
+
+build_tile_rotation(
+    center_ray,
+)
+
+derive_local_fov_from_corner_rays(
+    tile_box,
+    K_global,
+    R,
+)
+
+derive_local_distance(
+    theta_local,
+    mesh_scale,
+)
+
+global_generation_to_local_generation(
+    g_global,
+    tile_transform,
+)
+
+local_generation_to_global_generation(
+    g_local,
+    tile_transform,
+)
+
+local_generation_to_raw_tile_pixel(
+    g_local,
+    tile_transform,
+    K_global,
+    tile_box,
+)
+
+sample_tile_projected_feature(
+    feature_map,
+    tile_pixel,
+    valid_mask,
+)
+```
+
+并定义一个明确的数据结构：
+
+```python
+TileProjectiveTransform:
+    tile_box
+    K_global
+    center_pixel
+    center_ray
+    anchor_camera_cv
+    rho_center
+    R_globalcv_to_localcv
+    theta_local
+    distance_local
+    scale_global_to_local
+```
+
+不要在不同函数内部重新独立计算这些量。
+
+---
+
+# 二十三、必须保存 debug 信息
+
+每个 tile 保存：
+
+```text
+tile_id
+tile_box
+tile_center_pixel
+
+center_ray
+anchor_global_generation
+anchor_camera_cv
+rho_center
+
+theta_global
+theta_local
+
+distance_global
+distance_local
+
+scale_global_to_local = d_l / rho_c
+scale_local_to_global = rho_c / d_l
+
+R
+det(R)
+orthogonality_error
+
+num_projected_points
+num_inside_local_cube
+num_outside_local_cube
+
+feature_valid_ratio
+```
+
+同时建议导出少量可视化：
+
+1. global 4096 上画 tile；
+2. 画 tile center ray；
+3. 标记 baseline anchor；
+4. local cube point cloud；
+5. local XYZ axis；
+6. inverse 回 global 后的 point cloud；
+7. raw tile 上画 projected feature lookup pixels。
+
+---
+
+# 二十四、必须做的数值测试
+
+## Test 1：rotation
+
+必须满足：
+
+$$
+\|R\hat r_c-e_z\|<10^{-6}
+$$
+
+$$
+\|RR^T-I\|<10^{-6}
+$$
+
+$$
+|\det R-1|<10^{-6}.
+$$
+
+---
+
+## Test 2：tile anchor
+
+必须满足：
+
+$$
+T(P_c)=0.
+$$
+
+误差：
+
+```text
+< 1e-6
+```
+
+---
+
+## Test 3：camera distance
+
+global camera origin 在 local CV-relative frame 中：
+
+$$
+t_{\mathrm{camera}}
+=
+\frac{d_l}{\rho_c}
+R(0-P_c).
+$$
+
+必须得到：
+
+$$
+\boxed{
+t_{\mathrm{camera}}
+=
+(0,0,-d_l).
+}
+$$
+
+误差：
+
+```text
+< 1e-6
+```
+
+---
+
+## Test 4：global→local→global round trip
+
+随机采样至少 100000 个点：
+
+$$
+g_g
+\rightarrow
+g_l
+\rightarrow
+\hat g_g.
+$$
+
+要求：
+
+```text
+float64 max_abs_error < 1e-9
+float32 max_abs_error < 2e-5
+```
+
+---
+
+## Test 5：local→global→local round trip
+
+同样：
+
+$$
+g_l
+\rightarrow
+g_g
+\rightarrow
+\hat g_l.
+$$
+
+要求：
+
+```text
 max_abs_error < 2e-5
-
-local q -> global q -> local q
-max_abs_error < 2e-5
 ```
 
-当前 float32 随机点测试的典型误差约为 `1e-6`，像素往返误差低于 `4e-4 px`。
+---
 
-## 11. 常见错误
+## Test 6：显式 depth 公式
 
-不要执行以下操作：
+随机点验证：
 
-1. tile FOV 缩小 4 倍，但保留 global `distance × mesh_scale`。
-2. 把 exact off-axis `cx_off/cy_off` 写进 JSON，却让生成阶段继续使用未变换的 global/local 点。
-3. global→local 反投影时直接沿用 global 物理深度。
-4. 对 tile 点云做质心或 bbox 归一化代替相机变换。
-5. local→global 使用固定 affine shear；重规范化后的正确变换依赖 `q_z`。
-6. 在 1024 tile resize 到 512 时再次修改 FOV 或 distance。
-7. 同时对点做 local recanonicalization、又在 local 相机上重复施加 off-axis shift；这会重复计算光心偏移。
+矩阵计算的 local CV Z：
 
-## 12. Local 立方体在 global 空间中的真实区域
+$$
+t_{l,z}
+$$
 
-### 12.1 它不是 global 的立方体或长方体
+和：
 
-对任意 global 深度：
+$$
+d_l
+\left(
+\frac{\rho_p}{\rho_c}\cos\gamma-1
+\right)
+$$
+
+一致。
+
+误差：
 
 ```text
-D_g(q_g,z) = d_g - q_g,z/(2s_g)
+< 1e-6
 ```
 
-投影落入 tile `[x0,x1) × [y0,y1)` 的 global X 范围是：
+---
+
+## Test 7：raw tile feature correspondence
+
+对于原本来自 global point 的：
+
+$$
+P_g
+$$
+
+先直接 global project：
+
+$$
+P_g
+\rightarrow
+(u_g,v_g)
+\rightarrow
+(u_t,v_t).
+$$
+
+另一条路径：
+
+$$
+P_g
+\rightarrow
+g_l
+\rightarrow
+T^{-1}(g_l)
+\rightarrow
+(u'_g,v'_g)
+\rightarrow
+(u'_t,v'_t).
+$$
+
+必须满足：
+
+$$
+\boxed{
+u_t=u'_t,\quad
+v_t=v'_t.
+}
+$$
+
+要求：
 
 ```text
-(x0-c_g,x) D_g/f_g,x <= X_g < (x1-c_g,x) D_g/f_g,x
+pixel roundtrip max error < 1e-4 px
 ```
 
-global Y 范围是：
+---
+
+## Test 8：中心 tile 尺度
+
+中心 tile 应验证：
 
 ```text
-(c_g,y-y1) D_g/f_g,y < Y_g <= (c_g,y-y0) D_g/f_g,y
+d_local / d_global ≈ 4
 ```
 
-因此深度改变时，允许的 X/Y 中心和宽度都会改变。把它写回 global q：
+以及：
 
 ```text
-q_g,x bounds = 2s_g D_g(q_g,z) (pixel_x_bounds-c_g,x)/f_g,x
-q_g,y bounds = 2s_g D_g(q_g,z) (c_g,y-pixel_y_bounds)/f_g,y
+global local-ROI side length
+≈ rho_center / d_local
+≈ 0.25
 ```
 
-这就是相机视锥与 global 规范空间的交集，不是固定的 XYZ bbox。实现必须先
-逐点投影判断 half-open tile membership，不能用固定的 global X/Y 范围裁剪。
+在物体中心深度接近 `d_global` 时应成立。
 
-### 12.2 光心偏移为什么必须依赖每个点的深度
+---
 
-设 tile 中心在 4096 上为：
+## Test 9：XYZ isotropic
+
+构造 local：
 
 ```text
-u_c = x0 + c_l,x/r_x
-v_c = y0 + c_l,y/r_y
+(+eps,0,0)
+(0,+eps,0)
+(0,0,+eps)
 ```
 
-对应中心射线斜率：
+inverse 到 global。
+
+三条方向对应的欧氏长度必须都约为：
+
+$$
+\epsilon\frac{\rho_c}{d_l}.
+$$
+
+即：
+
+$$
+\boxed{
+L_x=L_y=L_z
+}
+$$
+
+不能再出现：
 
 ```text
-a_x = (u_c-c_g,x)/f_g,x
-a_y = (c_g,y-v_c)/f_g,y
+X/Y ×4
+Z ×1
 ```
 
-global 点相对该中心射线的横向位置为：
+---
+
+# 二十五、禁止事项
+
+不要再执行以下操作：
+
+1. `q_l,z = q_g,z`
+2. local XYZ 使用不同缩放倍率
+3. bbox min-max normalization
+4. point-cloud centroid normalization
+5. clamp local point 到 cube 边界
+6. 仅仅因为 pixel 落入 tile 就认为 3D point 属于 local cube
+7. tile resize 1024→512 时再次修改 FOV/distance
+8. 用 local centered camera 直接投影 raw tile feature
+9. 为了匹配 local camera 去 warp 原始高清 tile
+10. `grid_sample(padding_mode="border")` 伪造越界 feature
+11. 把 MoGe metric depth 直接和 Pixal3D canonical camera distance 混用
+12. 在不同模块中重复计算不同版本的 tile center / FOV / R / distance
+
+---
+
+# 二十六、最终应形成的数学闭环
+
+整个 pipeline 必须严格实现：
 
 ```text
-X_rel = X_g - a_x D_g
-Y_rel = Y_g - a_y D_g
+global generation point g_g
+        ↓
+global camera CV coordinate
+        ↓
+global K_4096
+        ↓
+global 4096 pixel
+        ↓
+tile membership / raw tile crop
+        ↓
+derive tile center ray
+        ↓
+baseline mesh ray intersection → P_c, rho_c
+        ↓
+R * center_ray = local Z
+        ↓
+tile corner rays → exact local FOV
+        ↓
+FOV → d_l
+        ↓
+k = d_l / rho_c
+        ↓
+t_l = k R (p_g - P_c)
+        ↓
+local generation coordinate g_l
+        ↓
+local flow / local sparse lattice / decoder
 ```
 
-其中 `D_g` 是每个点自己的深度，所以同样的 global X/Y 在不同 Z 上会得到
-不同的 local X/Y。第 7 节从 `u_t/v_t` 和 local depth 反投影，正是在逐点
-实现这个 depth-dependent 光心重定向；它不是固定平移、固定 shear 或 bbox
-normalization。
-
-### 12.3 为什么不引入 z_center
-
-本文描述的是一个 2D image tile 穿过完整 global 规范深度的 projective
-context，因此：
+图像 condition 单独走：
 
 ```text
-q_l,z = q_g,z
+local generation point g_l
+        ↓
+T^{-1}
+        ↓
+global camera point
+        ↓
+global K_4096
+        ↓
+global pixel
+        ↓
+subtract tile origin
+        ↓
+raw tile pixel
+        ↓
+DINO feature sampling
 ```
 
-如果额外给出 `z_min/z_max`，可以另行构造 3D frustum slabs，并把每个 slab
-的 Z 重新归一化；但那些 depth bounds 来自新的三维分块策略，不是由 2D
-crop 或光心偏移推导出来的。没有显式 depth partition 时不得猜测
-`z_center`，也不得把 tile 错画成 global 中的轴对齐小立方体。
+最终最重要的两个公式必须作为代码注释保留。
 
-### 12.4 对 sparse lattice 的含义
+### Global → Local
 
-4096→1024 crop 使 local X/Y 获得约 4 倍的角分辨率，但 full-depth 约定没有
-同时把 Z 放大 4 倍。因此一个 local C64 不能被解释为三轴都等价于 global
-C256：
+$$
+\boxed{
+t_l^{cv}
+=
+\frac{d_l}{\rho_c}
+R
+\left(
+p_g^{cv}-P_c^{cv}
+\right)
+}
+$$
 
-```text
-global C256 X/Y -> local C64 X/Y：约一格对一格，且受透视深度影响
-global C256 Z   -> local C64 Z：约四个 global 格量化到一个 local 格
-```
+以及：
 
-这不说明相机公式错误；它说明“直接把 full-depth global C256 rows gather
-成 local C64 sparse rows”这一离散 support 假设不成立。continuous camera
-roundtrip 与 discrete lattice one-to-one 是两个不同问题，必须分开审计。
+$$
+\boxed{
+g_l=
+(t_{l,x},-t_{l,y},-t_{l,z}).
+}
+$$
+
+### Local → Global
+
+$$
+\boxed{
+p_g^{cv}
+=
+P_c^{cv}
++
+\frac{\rho_c}{d_l}
+R^T
+(g_{l,x},-g_{l,y},-g_{l,z})^T.
+}
+$$
+
+这两个公式必须成为唯一的 global/local 三维变换来源。
+
+不要继续维护旧的 projective-depth-preserving 路径作为主路径。
+
+实现完成后，请输出：
+
+1. 修改文件列表；
+2. 每个新增/修改函数及职责；
+3. 完整数学公式与代码变量对应关系；
+4. 所有数值测试结果；
+5. 中心 tile、边缘 tile 各选至少一个给出 debug 数值；
+6. round-trip error；
+7. pixel correspondence error；
+8. local cube occupancy；
+9. feature valid ratio；
+10. 是否仍存在任何旧 `q_l,z=q_g,z` 或 anisotropic scaling 路径。

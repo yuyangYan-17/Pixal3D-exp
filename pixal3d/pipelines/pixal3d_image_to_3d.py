@@ -903,6 +903,7 @@ class Pixal3DImageTo3DPipeline(Pipeline):
         self,
         slat: SparseTensor,
         resolution: int,
+        guide_subs: Optional[List[SparseTensor]] = None,
     ) -> Tuple[List[Mesh], List[SparseTensor]]:
         """
         Decode the structured latent.
@@ -918,7 +919,9 @@ class Pixal3DImageTo3DPipeline(Pipeline):
         if self.low_vram:
             self.models['shape_slat_decoder'].to(self.device)
             self.models['shape_slat_decoder'].low_vram = True
-        ret = self.models['shape_slat_decoder'](slat, return_subs=True)
+        ret = self.models['shape_slat_decoder'](
+            slat, guide_subs=guide_subs, return_subs=True
+        )
         if self.low_vram:
             self.models['shape_slat_decoder'].cpu()
             self.models['shape_slat_decoder'].low_vram = False

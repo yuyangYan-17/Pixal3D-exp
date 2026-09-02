@@ -715,6 +715,41 @@ def main() -> int:
     print(f"[Output] {output_dir}")
 
     raw_mesh, preprocessed_image, camera_params = _native_camera_and_mesh(args, output_dir)
+    # Preserve the exact canonical image seen by the native 1024 run and its
+    # continuous 4096 resize for downstream camera-only validation.
+    canonical_1024_path = output_dir / "canonical_1024.png"
+    canonical_4096_path = output_dir / "canonical_4096.png"
+    preprocessed_image.save(canonical_1024_path)
+    preprocessed_image.resize((4096, 4096), Image.Resampling.LANCZOS).save(
+        canonical_4096_path
+    )
+    camera_path = output_dir / "global_camera.json"
+    _atomic_json(
+        camera_path,
+        {
+            "camera_angle_x": float(camera_params["camera_angle_x"]),
+            "distance": float(camera_params["distance"]),
+            "mesh_scale": float(camera_params.get("mesh_scale", 1.0)),
+            "canonical_1024_intrinsics": {
+                "fx": 512.0 / math.tan(float(camera_params["camera_angle_x"]) / 2.0),
+                "fy": 512.0 / math.tan(float(camera_params["camera_angle_x"]) / 2.0),
+                "cx": 512.0,
+                "cy": 512.0,
+            },
+            "canonical_4096_intrinsics": {
+                "fx": 2048.0 / math.tan(float(camera_params["camera_angle_x"]) / 2.0),
+                "fy": 2048.0 / math.tan(float(camera_params["camera_angle_x"]) / 2.0),
+                "cx": 2048.0,
+                "cy": 2048.0,
+            },
+            "generation_camera_position": [
+                0.0,
+                0.0,
+                float(camera_params["distance"]),
+            ],
+            "opencv_convention": "p_cv=[x,-y,distance-z]",
+        },
+    )
     if raw_mesh.device != device:
         raw_mesh = raw_mesh.to(device)
     _validate_layout(raw_mesh.layout)
@@ -866,6 +901,9 @@ def main() -> int:
             "vertex_attrs": _stats(per_vertex.vertex_attrs, per_vertex.layout),
         },
         "artifacts": {
+            "canonical_1024": str(canonical_1024_path),
+            "canonical_4096": str(canonical_4096_path),
+            "global_camera": str(camera_path),
             "raw_ovoxel_mesh": str(raw_path),
             "per_face_pbr_mesh": str(face_path),
             "per_vertex_pbr_mesh": str(vertex_path),

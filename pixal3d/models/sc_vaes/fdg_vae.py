@@ -42,12 +42,28 @@ class FlexiDualGridVaeEncoder(SparseUnetVaeEncoder):
             use_fp16,
         )
         
-    def forward(self, vertices: sp.SparseTensor, intersected: sp.SparseTensor, sample_posterior=False, return_raw=False):
+    def forward(
+        self,
+        vertices: sp.SparseTensor,
+        intersected: sp.SparseTensor,
+        sample_posterior=False,
+        return_raw=False,
+        guide_subs: Optional[List[sp.SparseTensor]] = None,
+        guide_missing: Literal['error', 'zeros'] = 'error',
+        return_guide_diagnostics: bool = False,
+    ):
         x = vertices.replace(torch.cat([
             vertices.feats - 0.5,
             intersected.feats.float() - 0.5,
         ], dim=1))
-        return super().forward(x, sample_posterior, return_raw)
+        return super().forward(
+            x,
+            sample_posterior,
+            return_raw,
+            guide_subs=guide_subs,
+            guide_missing=guide_missing,
+            return_guide_diagnostics=return_guide_diagnostics,
+        )
     
     
 class FlexiDualGridVaeDecoder(SparseUnetVaeDecoder):

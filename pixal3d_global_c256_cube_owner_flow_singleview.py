@@ -754,8 +754,11 @@ def build_condition(
                 flush=True,
             )
             del condition, crop, subset_coords, glob, proj, payload
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            # Some image-conditioning backends retain CUDA tensors through
+            # Python reference cycles.  Emptying the allocator cache alone
+            # does not release those live allocations, so long cube sweeps
+            # can accumulate enough memory to OOM on a later large crop.
+            _empty_cuda()
     finally:
         if pending and low_vram:
             pipeline.low_vram = True

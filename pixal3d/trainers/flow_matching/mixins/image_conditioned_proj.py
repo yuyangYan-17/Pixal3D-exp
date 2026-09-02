@@ -611,6 +611,106 @@ class DinoV3ProjFeatureExtractor(nn.Module):
         if self.naf_model is not None:
             self.naf_model.cpu()
         return self
+
+    @torch.no_grad()
+    def _naf_forward_tiled(
+        self,
+        image: torch.Tensor,
+        features: torch.Tensor,
+        output_size: Tuple[int, int],
+        tile_size: int = 1024,
+        halo: int = 80,
+    ) -> torch.Tensor:
+        """Run native NAF exactly in aligned spatial tiles.
+
+        NAF uses two local 3x3 image-encoder blocks followed by 9x9
+        neighborhood attention.  For the native 16x upsampling ratio its
+        output-space attention radius is 64 pixels.  An 80-pixel halo covers
+        both that radius and the image encoder's five-pixel radius.  Tile and
+        halo boundaries stay patch-aligned, and RoPE coordinates are sliced
+        from the complete image grid, so retained tile interiors use the same
+        coordinates and neighborhoods as a monolithic forward.
+        """
+        if image.shape[0] != 1 or features.shape[0] != 1:
+            raise ValueError("tiled NAF currently requires batch size 1")
+        height, width = (int(output_size[0]), int(output_size[1]))
+        if tuple(image.shape[-2:]) != (height, width):
+            raise ValueError("tiled NAF requires native 1:1 guide/output size")
+        feature_height, feature_width = map(int, features.shape[-2:])
+        if height % feature_height or width % feature_width:
+            raise ValueError("NAF output/feature ratio must be integral")
+        scale_y, scale_x = height // feature_height, width // feature_width
+        if scale_y != scale_x or scale_y <= 0:
+            raise ValueError("tiled NAF requires one isotropic scale")
+        scale = scale_y
+        if tile_size % scale or halo % scale:
+            raise ValueError("NAF tile size and halo must be feature aligned")
+
+        naf = self.naf_model
+        rope = naf.image_encoder.rope
+        full_coords = rope.create_coordinate(H=height, W=width).reshape(
+            height, width, 2
+        )
+        def core_ranges(length: int) -> List[Tuple[int, int]]:
+            count = max(1, (length + tile_size - 1) // tile_size)
+            boundaries = [
+                int(round((index * length / count) / scale)) * scale
+                for index in range(count + 1)
+            ]
+            boundaries[0], boundaries[-1] = 0, length
+            return list(zip(boundaries[:-1], boundaries[1:]))
+
+        output_cpu = None
+        for y0, y1 in core_ranges(height):
+            ey0, ey1 = max(0, y0 - halo), min(height, y1 + halo)
+            for x0, x1 in core_ranges(width):
+                ex0, ex1 = max(0, x0 - halo), min(width, x1 + halo)
+                guide_tile = image[..., ey0:ey1, ex0:ex1]
+                feature_tile = features[
+                    ..., ey0 // scale:ey1 // scale, ex0 // scale:ex1 // scale
+                ]
+                tile_h, tile_w = ey1 - ey0, ex1 - ex0
+                encoded = naf.image_encoder.forward_encoder(
+                    guide_tile, output_size=(tile_h, tile_w)
+                )
+                heads = int(rope.num_heads)
+                head_dim = encoded.shape[1] // heads
+                query = encoded.reshape(
+                    1, heads, head_dim, tile_h, tile_w
+                ).permute(0, 1, 3, 4, 2).reshape(
+                    1, heads, tile_h * tile_w, head_dim
+                )
+                coords = full_coords[ey0:ey1, ex0:ex1].reshape(-1, 2)
+                query = rope.rotate(query, coords)
+                query = query.reshape(
+                    1, heads, tile_h, tile_w, head_dim
+                ).permute(0, 1, 4, 2, 3).reshape(
+                    1, heads * head_dim, tile_h, tile_w
+                )
+                keys = naf.key_encoder(query, feature_tile)
+                tile_output = naf.upsampler(
+                    query, keys, feature_tile, guide_tile
+                )
+                if output_cpu is None:
+                    output_cpu = torch.empty(
+                        (1, tile_output.shape[1], height, width),
+                        dtype=tile_output.dtype,
+                        device="cpu",
+                    )
+                output_cpu[..., y0:y1, x0:x1].copy_(
+                    tile_output[
+                        ..., y0 - ey0:y1 - ey0, x0 - ex0:x1 - ex0
+                    ].cpu()
+                )
+                # NATTEN's cutlass kernel is asynchronous; force completion
+                # before changing dilation/shape on the next tile so a stale
+                # kernel cannot touch a recycled workspace.
+                torch.cuda.synchronize(image.device)
+                del guide_tile, feature_tile, encoded, query, keys, tile_output
+                torch.cuda.empty_cache()
+        if output_cpu is None:
+            raise RuntimeError("tiled NAF produced no tiles")
+        return output_cpu.to(device=image.device)
     
     def extract_features(self, image: torch.Tensor) -> torch.Tensor:
         """Extract features using DINOv3."""
@@ -781,9 +881,19 @@ class DinoV3ProjFeatureExtractor(nn.Module):
                     )
                 else:
                     naf_target_size = self.naf_target_size
-                hr_features = self.naf_model(
-                    image_for_naf, lr_features_bchw, naf_target_size
-                )  # [B, D, H', W']
+                if (
+                    preserve_input_resolution
+                    and B == 1
+                    and max(naf_target_size) > 2048
+                    and tuple(image_for_naf.shape[-2:]) == tuple(naf_target_size)
+                ):
+                    hr_features = self._naf_forward_tiled(
+                        image_for_naf, lr_features_bchw, naf_target_size
+                    )
+                else:
+                    hr_features = self.naf_model(
+                        image_for_naf, lr_features_bchw, naf_target_size
+                    )  # [B, D, H', W']
                 
                 # Sample from high-res feature map using same projection coordinates
                 z_proj_hr = self.proj_grid(

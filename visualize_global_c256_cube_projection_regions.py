@@ -11,7 +11,7 @@ from typing import Any, Mapping
 
 import numpy as np
 import torch
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 
 import pixal3d_tile_c1024_local_slat_and_local_decode_return_global as camera_core
 
@@ -54,6 +54,240 @@ def convex_hull(points: list[tuple[float, float]]) -> list[tuple[float, float]]:
             upper.pop()
         upper.append(point)
     return lower[:-1] + upper[:-1]
+
+
+def align_bbox_outward(
+    points: torch.Tensor,
+    width: int,
+    height: int,
+    multiple: int = 16,
+) -> tuple[tuple[int, int, int, int], list[float], list[float]]:
+    """Clip a projected volume bbox, then expand it outwards to a patch multiple."""
+    if points.ndim != 2 or points.shape[1] != 2 or not points.numel():
+        raise ValueError("points must be nonempty [N,2]")
+    if width <= 0 or height <= 0 or multiple <= 0:
+        raise ValueError("image dimensions and multiple must be positive")
+    if width % multiple or height % multiple:
+        raise ValueError("image dimensions must be divisible by bbox alignment")
+    points = points.detach().cpu().to(torch.float64)
+    if not torch.isfinite(points).all():
+        raise ValueError("projected points contain NaN/Inf")
+    raw_lo, raw_hi = points.amin(0), points.amax(0)
+    clipped_lo = torch.maximum(raw_lo, torch.zeros(2, dtype=torch.float64))
+    clipped_hi = torch.minimum(
+        raw_hi,
+        torch.tensor([float(width), float(height)], dtype=torch.float64),
+    )
+    if bool((clipped_hi <= clipped_lo).any()):
+        raise RuntimeError("projected volume does not intersect the image")
+    x0 = int(math.floor(float(clipped_lo[0]))) // multiple * multiple
+    y0 = int(math.floor(float(clipped_lo[1]))) // multiple * multiple
+    x1 = min(width, math.ceil(float(clipped_hi[0]) / multiple) * multiple)
+    y1 = min(height, math.ceil(float(clipped_hi[1]) / multiple) * multiple)
+    raw = [float(raw_lo[0]), float(raw_lo[1]), float(raw_hi[0]), float(raw_hi[1])]
+    clipped = [
+        float(clipped_lo[0]), float(clipped_lo[1]),
+        float(clipped_hi[0]), float(clipped_hi[1]),
+    ]
+    return (x0, y0, x1, y1), raw, clipped
+
+
+def render_z_merged_bboxes(
+    image: Image.Image,
+    camera: Mapping[str, float],
+    output_path: Path,
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    """Merge the seven z cubes and draw 7x7 aligned projected prism bboxes."""
+    width, height = image.size
+    starts = tuple(range(0, 256 - 64 + 1, 32))
+    corner_bits = torch.tensor(
+        [(x, y, z) for x in (0, 1) for y in (0, 1) for z in (0, 1)],
+        dtype=torch.float64,
+    )
+    scale = torch.tensor([width / 1024.0, height / 1024.0], dtype=torch.float64)
+    records: list[dict[str, Any]] = []
+    for ix, sx in enumerate(starts):
+        for iy, sy in enumerate(starts):
+            prism_id = ix * len(starts) + iy
+            start = torch.tensor([sx, sy, 0], dtype=torch.float64)
+            extent = torch.tensor([64, 64, 256], dtype=torch.float64)
+            corners_c256 = start[None] + corner_bits * extent[None]
+            uv_1024, depth, finite = camera_core._project_global_q_to_image(
+                physical_boundary_q(corners_c256),
+                global_camera=camera,
+                image_width=1024,
+                image_height=1024,
+            )
+            if not bool(finite.all()):
+                raise RuntimeError(f"z-merged prism ({sx}, {sy}) crosses the camera plane")
+            # Match the flow route exactly: 1024 pixel centres become normalized
+            # pixel edges before scaling into the canonical source image.
+            points = (uv_1024.detach().cpu().to(torch.float64) + 0.5) * scale[None]
+            box, raw_box, clipped_box = align_bbox_outward(
+                points, width, height, int(args.bbox_alignment)
+            )
+            records.append({
+                "prism_id": prism_id,
+                "grid_xy": [ix, iy],
+                "start_c256": [sx, sy, 0],
+                "extent_c256": [64, 64, 256],
+                "merged_cube_starts_z": list(starts),
+                "color_rgb": list(cube_color(prism_id)),
+                "raw_bbox_pixel_edges": [round(value, 6) for value in raw_box],
+                "clipped_bbox_pixel_edges": [round(value, 6) for value in clipped_box],
+                "aligned_bbox_xyxy": list(box),
+                "crop_size": [box[2] - box[0], box[3] - box[1]],
+                "mean_depth": float(depth.mean()),
+            })
+
+    overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay, "RGBA")
+    for item in sorted(records, key=lambda row: row["mean_depth"], reverse=True):
+        x0, y0, x1, y1 = item["aligned_bbox_xyxy"]
+        color = tuple(item["color_rgb"])
+        draw.rectangle(
+            (x0, y0, x1 - 1, y1 - 1),
+            fill=(*color, int(args.prism_fill_alpha)),
+            outline=(*color, int(args.prism_line_alpha)),
+            width=int(args.line_width),
+        )
+    try:
+        label_font = ImageFont.truetype("DejaVuSans-Bold.ttf", int(args.label_font_size))
+    except OSError:
+        label_font = ImageFont.load_default()
+    label_padding = max(4, int(args.label_padding))
+    occupied_label_boxes: list[tuple[int, int, int, int]] = []
+    for item in sorted(records, key=lambda row: row["prism_id"]):
+        x0, y0, x1, y1 = item["aligned_bbox_xyxy"]
+        label = str(item["prism_id"])
+        text_box = draw.textbbox((0, 0), label, font=label_font, stroke_width=1)
+        text_width = text_box[2] - text_box[0]
+        text_height = text_box[3] - text_box[1]
+        cell_width = text_width + label_padding
+        cell_height = text_height + label_padding
+        label_x = x0 + label_padding
+        label_y = y0 + label_padding
+        found_slot = False
+        for row in range(max(1, (y1 - y0) // cell_height)):
+            for column in range(max(1, (x1 - x0) // cell_width)):
+                candidate_x = x0 + label_padding + column * cell_width
+                candidate_y = y0 + label_padding + row * cell_height
+                candidate = (
+                    candidate_x - label_padding // 2,
+                    candidate_y - label_padding // 2,
+                    candidate_x + text_width + label_padding // 2,
+                    candidate_y + text_height + label_padding // 2,
+                )
+                if candidate[2] >= x1 or candidate[3] >= y1:
+                    continue
+                intersects = any(
+                    candidate[0] < used[2] and candidate[2] > used[0]
+                    and candidate[1] < used[3] and candidate[3] > used[1]
+                    for used in occupied_label_boxes
+                )
+                if not intersects:
+                    label_x, label_y = candidate_x, candidate_y
+                    occupied_label_boxes.append(candidate)
+                    found_slot = True
+                    break
+            if found_slot:
+                break
+        background = (
+            label_x - label_padding // 2,
+            label_y - label_padding // 2,
+            min(x1 - 1, label_x + text_width + label_padding // 2),
+            min(y1 - 1, label_y + text_height + label_padding // 2),
+        )
+        draw.rounded_rectangle(
+            background,
+            radius=max(2, label_padding // 2),
+            fill=(0, 0, 0, int(args.label_background_alpha)),
+        )
+        draw.text(
+            (label_x, label_y - text_box[1]),
+            label,
+            font=label_font,
+            fill=(255, 255, 255, 255),
+            stroke_width=1,
+            stroke_fill=(0, 0, 0, 255),
+        )
+        item["label_xy"] = [label_x, label_y]
+    result = Image.alpha_composite(image.convert("RGBA"), overlay).convert("RGB")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    result.save(output_path)
+    individual_dir = (
+        Path(args.individual_dir).resolve()
+        if args.individual_dir is not None
+        else output_path.parent / f"{output_path.stem}_individual"
+    )
+    individual_dir.mkdir(parents=True, exist_ok=True)
+    for item in sorted(records, key=lambda row: row["prism_id"]):
+        x0, y0, x1, y1 = item["aligned_bbox_xyxy"]
+        color = tuple(item["color_rgb"])
+        single_overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
+        single_draw = ImageDraw.Draw(single_overlay, "RGBA")
+        single_draw.rectangle(
+            (x0, y0, x1 - 1, y1 - 1),
+            fill=(*color, int(args.prism_fill_alpha)),
+            outline=(*color, int(args.prism_line_alpha)),
+            width=int(args.line_width),
+        )
+        label = str(item["prism_id"])
+        text_box = single_draw.textbbox((0, 0), label, font=label_font, stroke_width=1)
+        text_width = text_box[2] - text_box[0]
+        text_height = text_box[3] - text_box[1]
+        label_x, label_y = x0 + label_padding, y0 + label_padding
+        single_draw.rounded_rectangle(
+            (
+                label_x - label_padding // 2,
+                label_y - label_padding // 2,
+                label_x + text_width + label_padding // 2,
+                label_y + text_height + label_padding // 2,
+            ),
+            radius=max(2, label_padding // 2),
+            fill=(0, 0, 0, int(args.label_background_alpha)),
+        )
+        single_draw.text(
+            (label_x, label_y - text_box[1]),
+            label,
+            font=label_font,
+            fill=(255, 255, 255, 255),
+            stroke_width=1,
+            stroke_fill=(0, 0, 0, 255),
+        )
+        sx, sy, _ = item["start_c256"]
+        individual_path = individual_dir / f"prism_{item['prism_id']:02d}_xy_{sx:03d}_{sy:03d}.png"
+        Image.alpha_composite(image.convert("RGBA"), single_overlay).convert("RGB").save(
+            individual_path,
+            compress_level=int(args.png_compress_level),
+        )
+        item["individual_output"] = str(individual_path)
+    manifest = {
+        "format": "global_c256_z_merged_prism_bbox_projection_v1",
+        "mode": "z-merged-bboxes",
+        "input_image": str(Path(args.image).resolve()),
+        "camera": str(Path(args.camera).resolve()),
+        "layout": "7x7 C64xC64xC256 prisms; xy size=64 stride=32; z merged over [0,256]",
+        "projection_convention": "global camera C1024 pixel centres -> normalized pixel edges -> source image",
+        "image_size": [width, height],
+        "prism_count": len(records),
+        "bbox_alignment": int(args.bbox_alignment),
+        "fill_alpha": int(args.prism_fill_alpha),
+        "line_alpha": int(args.prism_line_alpha),
+        "line_width": int(args.line_width),
+        "label_range": [0, len(records) - 1],
+        "label_font_size": int(args.label_font_size),
+        "output": str(output_path),
+        "individual_output_dir": str(individual_dir),
+        "individual_output_count": len(records),
+        "prisms": sorted(records, key=lambda row: row["prism_id"]),
+    }
+    output_path.with_suffix(".json").write_text(
+        json.dumps(manifest, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    return manifest
 
 
 def render_full_generation_cubes(
@@ -281,20 +515,27 @@ def render(args: argparse.Namespace) -> dict[str, Any]:
     cubes_dir = Path(args.cubes_dir).resolve()
     camera_path = Path(args.camera).resolve()
     output_path = Path(args.output).resolve()
-    for path in (image_path, support_path, cubes_dir, camera_path):
+    required = [image_path, camera_path]
+    if args.mode in {"point-regions", "full-cubes"}:
+        required.append(cubes_dir)
+    if args.mode == "point-regions":
+        required.append(support_path)
+    for path in required:
         if not path.exists():
             raise FileNotFoundError(path)
 
     image = Image.open(image_path).convert("RGB")
     width, height = image.size
-    support = torch.load(support_path, map_location="cpu", weights_only=False)
-    coords = support["coords"].to(torch.int32)
     camera_payload = json.loads(camera_path.read_text(encoding="utf-8"))
     camera: Mapping[str, float] = camera_payload.get("camera", camera_payload)
+    if args.mode == "z-merged-bboxes":
+        return render_z_merged_bboxes(image, camera, output_path, args)
     if args.mode == "global-aabb":
         return render_global_aabb(image, camera, output_path, args)
     if args.mode == "full-cubes":
         return render_full_generation_cubes(image, cubes_dir, camera, output_path, args)
+    support = torch.load(support_path, map_location="cpu", weights_only=False)
+    coords = support["coords"].to(torch.int32)
     q = official_endpoint_q(coords[:, 1:4])
     uv, depth, finite = camera_core._project_global_q_to_image(
         q,
@@ -377,11 +618,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cubes-dir", default=root / "cubes")
     parser.add_argument("--camera", default=baseline / "global_camera.json")
     parser.add_argument("--output", default=root / "visualizations/cube_projection_regions_on_global_input_1024.png")
-    parser.add_argument("--mode", choices=("point-regions", "full-cubes", "global-aabb"), default="point-regions")
+    parser.add_argument(
+        "--mode",
+        choices=("point-regions", "full-cubes", "global-aabb", "z-merged-bboxes"),
+        default="point-regions",
+    )
     parser.add_argument("--fill-alpha", type=int, default=48)
     parser.add_argument("--line-alpha", type=int, default=230)
     parser.add_argument("--cube-fill-alpha", type=int, default=5)
     parser.add_argument("--cube-line-alpha", type=int, default=190)
+    parser.add_argument("--prism-fill-alpha", type=int, default=30)
+    parser.add_argument("--prism-line-alpha", type=int, default=220)
+    parser.add_argument("--bbox-alignment", type=int, default=16)
+    parser.add_argument("--label-font-size", type=int, default=48)
+    parser.add_argument("--label-padding", type=int, default=12)
+    parser.add_argument("--label-background-alpha", type=int, default=180)
+    parser.add_argument("--individual-dir", default=None)
+    parser.add_argument("--png-compress-level", type=int, choices=range(0, 10), default=2)
     parser.add_argument("--aabb-color", type=lambda value: tuple(int(x) for x in value.split(",")), default=(0, 255, 255))
     parser.add_argument("--aabb-fill-alpha", type=int, default=24)
     parser.add_argument("--aabb-line-alpha", type=int, default=255)
@@ -395,5 +648,5 @@ def parse_args() -> argparse.Namespace:
 
 if __name__ == "__main__":
     result = render(parse_args())
-    count = result.get("drawn_nonempty_cubes", result.get("cube_count", 1))
+    count = result.get("drawn_nonempty_cubes", result.get("cube_count", result.get("prism_count", 1)))
     print(f"[complete] mode={result.get('mode', 'point-regions')} drawn={count} output={result['output']}")

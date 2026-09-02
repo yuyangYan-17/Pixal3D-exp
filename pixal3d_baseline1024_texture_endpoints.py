@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run native Pixal3D 1024 flow and render every texture x0 endpoint."""
+"""Run native Pixal3D 1024 flow and retain paired shape/texture x0 endpoints."""
 from __future__ import annotations
 
 import argparse
@@ -58,7 +58,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("outputs/baseline1024_texture_endpoints"),
+        default=Path("outputs/baseline1024_shape_tex_endpoints"),
     )
     parser.add_argument("--model-path", type=Path, default=Path(DEFAULT_MODEL_PATH))
     parser.add_argument("--moge-model", type=Path, default=Path(DEFAULT_MOGE_MODEL))
@@ -72,6 +72,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--face-chunk-size", type=int, default=4_000_000)
     parser.add_argument("--envmap", type=str, default="studio")
     parser.add_argument("--angles", type=int, nargs="+", default=[0])
+    parser.add_argument(
+        "--render-endpoints", action=argparse.BooleanOptionalAction, default=True
+    )
     parser.add_argument(
         "--low-vram", action=argparse.BooleanOptionalAction, default=True
     )
@@ -90,8 +93,10 @@ def main() -> int:
     torch.cuda.set_device(args.cuda_device)
     device = torch.device("cuda", args.cuda_device)
     output_dir = args.output_dir.expanduser().resolve()
-    endpoint_dir = output_dir / "endpoint_latents"
-    endpoint_dir.mkdir(parents=True, exist_ok=True)
+    shape_endpoint_dir = output_dir / "shape_endpoint_latents"
+    texture_endpoint_dir = output_dir / "texture_endpoint_latents"
+    shape_endpoint_dir.mkdir(parents=True, exist_ok=True)
+    texture_endpoint_dir.mkdir(parents=True, exist_ok=True)
 
     from inference import distance_from_fov, get_camera_params_wild_moge, init_pipeline, load_moge_model
 
@@ -128,22 +133,32 @@ def main() -> int:
             gc.collect()
             torch.cuda.empty_cache()
 
-        endpoint_records: list[dict[str, Any]] = []
+        image.save(output_dir / "canonical_1024.png")
+        (output_dir / "global_camera.json").write_text(
+            json.dumps({key: float(value) for key, value in camera.items()}, indent=2)
+            + "\n",
+            encoding="utf-8",
+        )
 
-        def save_texture_endpoint(**payload: Any) -> None:
+        shape_endpoint_records: list[dict[str, Any]] = []
+        texture_endpoint_records: list[dict[str, Any]] = []
+
+        def save_endpoint(
+            records: list[dict[str, Any]], directory: Path, label: str, **payload: Any
+        ) -> None:
             step = int(payload["step_index"])
             endpoint = payload["endpoint"]
-            x_t = payload["x_t"]
-            velocity = payload["v"]
-            t = float(payload["t"])
-            expected = pipeline.tex_slat_sampler._pred_to_xstart(x_t, t, velocity)
+            expected = pipeline.shape_slat_sampler._pred_to_xstart(
+                payload["x_t"], float(payload["t"]), payload["v"]
+            )
             error = float((endpoint.feats - expected.feats).abs().max().item())
-            path = endpoint_dir / f"step_{step:02d}.pt"
+            path = directory / f"step_{step:02d}.pt"
             _save_endpoint(
                 path,
                 {
+                    "stage": label,
                     "step": step,
-                    "t": t,
+                    "t": float(payload["t"]),
                     "t_next": float(payload["t_next"]),
                     "coords": endpoint.coords.detach().cpu(),
                     "endpoint_normalized_feats": endpoint.feats.detach().cpu(),
@@ -151,16 +166,33 @@ def main() -> int:
                     "formula_max_abs_error": error,
                 },
             )
-            endpoint_records.append(
+            records.append(
                 {
+                    "stage": label,
                     "step": step,
-                    "t": t,
+                    "t": float(payload["t"]),
                     "t_next": float(payload["t_next"]),
                     "path": str(path),
                     "formula_max_abs_error": error,
                 }
             )
-            print(f"[texture endpoint] step={step:02d} t={t:.8f} saved={path}")
+            # The 1024 cascade invokes the shape sampler once at C32 and once
+            # at C64 with the same callback. Keep the later/high-resolution
+            # endpoint for each step instead of reporting 24 shape records.
+            same_step = [i for i, row in enumerate(records[:-1]) if row["step"] == step]
+            for index in reversed(same_step):
+                records.pop(index)
+            print(f"[{label} endpoint] step={step:02d} t={float(payload['t']):.8f} saved={path}")
+
+        def save_shape_endpoint(**payload: Any) -> None:
+            save_endpoint(
+                shape_endpoint_records, shape_endpoint_dir, "shape", **payload
+            )
+
+        def save_texture_endpoint(**payload: Any) -> None:
+            save_endpoint(
+                texture_endpoint_records, texture_endpoint_dir, "texture", **payload
+            )
 
         common = {
             "steps": 12,
@@ -173,6 +205,8 @@ def main() -> int:
             "guidance_strength": 7.5,
             "guidance_rescale": 0.5,
             "rescale_t": 3.0,
+            "endpoint_callback": save_shape_endpoint,
+            "return_model_history": False,
         }
         texture_params = {
             "steps": 12,
@@ -194,13 +228,50 @@ def main() -> int:
             pipeline_type="1024_cascade",
             max_num_tokens=args.max_num_tokens,
         )
-        if resolution != 1024 or len(endpoint_records) != 12:
+        if (
+            resolution != 1024
+            or len(shape_endpoint_records) != 12
+            or len(texture_endpoint_records) != 12
+        ):
             raise RuntimeError(
-                f"expected resolution=1024 and 12 endpoints, got {resolution}, {len(endpoint_records)}"
+                "expected resolution=1024 and 12 paired endpoints, got "
+                f"{resolution}, shape={len(shape_endpoint_records)}, "
+                f"texture={len(texture_endpoint_records)}"
             )
 
-        # Geometry is constant across texture endpoints, so decode it once.
-        meshes, subs = pipeline.decode_shape_slat(shape_slat, resolution)
+        _save_endpoint(
+            output_dir / "final_latents.pt",
+            {
+                "resolution": int(resolution),
+                "shape_coords": shape_slat.coords.detach().cpu(),
+                "shape_raw_feats": shape_slat.feats.detach().cpu(),
+                "texture_coords": final_tex_slat.coords.detach().cpu(),
+                "texture_raw_feats": final_tex_slat.feats.detach().cpu(),
+            },
+        )
+
+        if not args.render_endpoints:
+            summary = {
+                "pipeline_type": "1024_cascade",
+                "seed": args.seed,
+                "resolution": resolution,
+                "camera": {key: float(value) for key, value in camera.items()},
+                "endpoint_formula": "x0=(1-sigma_min)*x_t-(sigma_min+(1-sigma_min)*t)*v",
+                "shape_endpoint_count": len(shape_endpoint_records),
+                "texture_endpoint_count": len(texture_endpoint_records),
+                "shape_endpoints": shape_endpoint_records,
+                "texture_endpoints": texture_endpoint_records,
+                "rendered": False,
+            }
+            (output_dir / "summary.json").write_text(
+                json.dumps(summary, indent=2, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+            print(f"[done] {output_dir}")
+            return 0
+
+        shape_mean = torch.tensor(pipeline.shape_slat_normalization["mean"], device=device)[None]
+        shape_std = torch.tensor(pipeline.shape_slat_normalization["std"], device=device)[None]
         tex_mean = torch.tensor(pipeline.tex_slat_normalization["mean"], device=device)[None]
         tex_std = torch.tensor(pipeline.tex_slat_normalization["std"], device=device)[None]
         extrinsics, intrinsics, _ = _make_camera_views(
@@ -223,15 +294,23 @@ def main() -> int:
             device=f"cuda:{args.cuda_device}",
         )
         sheet_paths: dict[int, list[Path]] = {angle: [] for angle in args.angles}
-        for record in endpoint_records:
-            saved = torch.load(record["path"], map_location="cpu", weights_only=False)
-            if not torch.equal(saved["coords"], final_tex_slat.coords.cpu()):
-                raise RuntimeError(f"endpoint coordinate mismatch at step {record['step']}")
-            normalized = final_tex_slat.replace(
-                feats=saved["endpoint_normalized_feats"].to(device)
+        for shape_record, texture_record in zip(
+            shape_endpoint_records, texture_endpoint_records
+        ):
+            if shape_record["step"] != texture_record["step"]:
+                raise RuntimeError("shape/texture endpoint step mismatch")
+            shape_saved = torch.load(shape_record["path"], map_location="cpu", weights_only=False)
+            texture_saved = torch.load(texture_record["path"], map_location="cpu", weights_only=False)
+            shape_normalized = shape_slat.replace(
+                feats=shape_saved["endpoint_normalized_feats"].to(device)
             )
-            raw_endpoint = normalized * tex_std + tex_mean
-            tex_voxels = pipeline.decode_tex_slat(raw_endpoint, subs)
+            shape_endpoint = shape_normalized * shape_std + shape_mean
+            meshes, subs = pipeline.decode_shape_slat(shape_endpoint, resolution)
+            texture_normalized = final_tex_slat.replace(
+                feats=texture_saved["endpoint_normalized_feats"].to(device)
+            )
+            texture_endpoint = texture_normalized * tex_std + tex_mean
+            tex_voxels = pipeline.decode_tex_slat(texture_endpoint, subs)
             decoded = MeshWithVoxel(
                 meshes[0].vertices,
                 meshes[0].faces,
@@ -242,7 +321,7 @@ def main() -> int:
                 voxel_shape=torch.Size([*tex_voxels[0].shape, *tex_voxels[0].spatial_shape]),
                 layout=pipeline.pbr_attr_layout,
             )
-            step_dir = output_dir / "renders" / f"step_{record['step']:02d}_t_{record['t']:.6f}"
+            step_dir = output_dir / "renders" / f"step_{shape_record['step']:02d}_t_{shape_record['t']:.6f}"
             for angle in args.angles:
                 torch.cuda.manual_seed_all(args.seed + 100_000 + angle)
                 result = renderer.render(
@@ -256,7 +335,8 @@ def main() -> int:
                 _save_render(result, yaw_dir)
                 sheet_paths[angle].append(yaw_dir / "shaded.png")
                 del result
-            del normalized, raw_endpoint, tex_voxels, decoded
+            del shape_normalized, shape_endpoint, texture_normalized
+            del texture_endpoint, meshes, subs, tex_voxels, decoded
             torch.cuda.empty_cache()
 
         for angle, paths in sheet_paths.items():
@@ -267,8 +347,10 @@ def main() -> int:
             "resolution": resolution,
             "camera": {key: float(value) for key, value in camera.items()},
             "endpoint_formula": "x0=(1-sigma_min)*x_t-(sigma_min+(1-sigma_min)*t)*v",
-            "endpoint_count": len(endpoint_records),
-            "endpoints": endpoint_records,
+            "shape_endpoint_count": len(shape_endpoint_records),
+            "texture_endpoint_count": len(texture_endpoint_records),
+            "shape_endpoints": shape_endpoint_records,
+            "texture_endpoints": texture_endpoint_records,
             "angles": args.angles,
             "render_resolution": args.render_resolution,
             "final_native_mesh_vertices": int(mesh_list[0].vertices.shape[0]),

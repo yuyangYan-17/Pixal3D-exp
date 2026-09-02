@@ -17,10 +17,12 @@ class SparseSpatial2Channel(nn.Module):
         DIM = x.coords.shape[-1] - 1
         cache = x.get_spatial_cache(f'spatial2channel_{self.factor}')
         if cache is None:
-            coord = list(x.coords.unbind(dim=-1))
+            # C4096 linear indices exceed signed int32. Keep coordinate
+            # storage unchanged, but perform key arithmetic in int64.
+            coord = list(x.coords.to(torch.int64).unbind(dim=-1))
             for i in range(DIM):
                 coord[i+1] = coord[i+1] // self.factor
-            subidx = x.coords[:, 1:] % self.factor
+            subidx = x.coords[:, 1:].to(torch.int64) % self.factor
             subidx = sum([subidx[..., i] * self.factor ** i for i in range(DIM)])
 
             MAX = [(s + self.factor - 1) // self.factor for s in x.spatial_shape]
@@ -32,7 +34,7 @@ class SparseSpatial2Channel(nn.Module):
                 [code // OFFSET[0]] +
                 [(code // OFFSET[i+1]) % MAX[i] for i in range(DIM)],
                 dim=-1
-            )
+            ).to(dtype=x.coords.dtype)
         else:
             new_coords, idx, subidx = cache
             

@@ -9,6 +9,17 @@ class ConstantVelocity(torch.nn.Module):
         return torch.full_like(x_t, 0.25)
 
 
+class CountingVelocity(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.calls = 0
+
+    def forward(self, x_t, timestep, cond=None):
+        del timestep, cond
+        self.calls += 1
+        return torch.zeros_like(x_t)
+
+
 def test_endpoint_callback_observes_current_state_velocity_and_time():
     sampler = FlowEulerSampler(sigma_min=1e-5)
     noise = torch.tensor([[1.0, -2.0]])
@@ -43,3 +54,26 @@ def test_endpoint_callback_observes_current_state_velocity_and_time():
         return_model_history=False,
     )
     assert torch.equal(result.samples, reference.samples)
+
+
+def test_first_step_endpoint_replaces_only_the_first_model_call():
+    sampler = FlowEulerSampler(sigma_min=1e-5)
+    model = CountingVelocity()
+    noise = torch.tensor([[1.0, -2.0]])
+    endpoint = torch.tensor([[0.25, 0.5]])
+    seen = []
+    result = sampler.sample(
+        model,
+        noise,
+        steps=3,
+        verbose=False,
+        return_model_history=False,
+        first_step_endpoint=endpoint,
+        endpoint_callback=lambda **payload: seen.append(payload),
+    )
+    assert model.calls == 2
+    assert torch.equal(seen[0]["endpoint"], endpoint)
+    expected_v = sampler._xstart_to_pred(noise, 1.0, endpoint)
+    expected_after_first = noise - (1.0 / 3.0) * expected_v
+    # Remaining model velocities are zero, so the first guided update remains.
+    assert torch.allclose(result.samples, expected_after_first)

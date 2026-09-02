@@ -152,6 +152,7 @@ class FlowEulerSampler(Sampler):
         trajectory_device: Union[str, torch.device] = "cpu",
         return_model_history: bool = True,
         endpoint_callback: Optional[Callable[..., None]] = None,
+        first_step_endpoint=None,
         **kwargs
     ):
         """
@@ -174,6 +175,16 @@ class FlowEulerSampler(Sampler):
             - 'pred_x_0': a list of prediction of x_0.
         """
         sample = noise
+        if first_step_endpoint is not None:
+            if sample.shape != first_step_endpoint.shape:
+                raise ValueError(
+                    "first_step_endpoint must have the same shape as noise: "
+                    f"{first_step_endpoint.shape} != {sample.shape}"
+                )
+            if hasattr(sample, "coords") and not torch.equal(
+                sample.coords, first_step_endpoint.coords.to(sample.coords.device)
+            ):
+                raise ValueError("first_step_endpoint sparse coordinates do not match noise")
         t_seq = self.timestep_schedule(steps, rescale_t)
         t_pairs = list((t_seq[i], t_seq[i + 1]) for i in range(steps))
         ret = edict({
@@ -200,7 +211,19 @@ class FlowEulerSampler(Sampler):
             # endpoint is defined by the model velocity at the *current*
             # state/time, not by pred_x_prev.
             current_sample = sample
-            out = self.sample_once(model, sample, t, t_prev, cond, **kwargs)
+            if step_index == 0 and first_step_endpoint is not None:
+                endpoint = first_step_endpoint.to(
+                    device=current_sample.device, dtype=current_sample.dtype
+                )
+                pred_v = self._xstart_to_pred(current_sample, t, endpoint)
+                out = edict({
+                    "pred_x_prev": current_sample - (t - t_prev) * pred_v,
+                    "pred_x_0": endpoint,
+                    "pred_v": pred_v,
+                    "time_interval": float(t - t_prev),
+                })
+            else:
+                out = self.sample_once(model, sample, t, t_prev, cond, **kwargs)
             if endpoint_callback is not None:
                 endpoint_callback(
                     step_index=step_index,
