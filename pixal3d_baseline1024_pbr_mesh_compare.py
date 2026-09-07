@@ -629,14 +629,21 @@ def _native_camera_and_mesh(
             "guidance_rescale": 0.5,
             "rescale_t": 3.0,
         }
+        tex_image_unconditional = bool(
+            getattr(args, "tex_image_unconditional", False)
+        )
         tex_sampler = {
             "steps": 12,
-            "guidance_strength": 1.0,
+            "guidance_strength": 0.0 if tex_image_unconditional else 1.0,
             "guidance_rescale": 0.0,
+            "guidance_interval": (0.0, 1.0) if tex_image_unconditional else (0.6, 0.9),
             "rescale_t": 3.0,
         }
         torch.manual_seed(int(args.seed))
-        print(f"[Inference] Running native pipeline_type={PIPELINE_TYPE}")
+        print(
+            f"[Inference] Running native pipeline_type={PIPELINE_TYPE} "
+            f"tex_image_unconditional={tex_image_unconditional}"
+        )
         mesh_list, (_, _, resolution) = pipeline.run(
             image_preprocessed,
             camera_params=camera_params,
@@ -686,6 +693,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="manual horizontal FOV in radians; default uses native MoGe estimation",
     )
     parser.add_argument("--max-num-tokens", type=int, default=1_000_000)
+    parser.add_argument(
+        "--tex-image-unconditional",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="use zero image condition for all C64 texture-flow timesteps; shape concat remains enabled",
+    )
     return parser
 
 

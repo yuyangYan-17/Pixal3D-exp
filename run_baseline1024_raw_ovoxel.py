@@ -32,6 +32,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--fov", type=float, default=-1.0)
     parser.add_argument("--max-num-tokens", type=int, default=1_000_000)
     parser.add_argument(
+        "--tex-image-unconditional",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="zero only the image condition throughout texture flow; retain C64 shape concat",
+    )
+    parser.add_argument(
         "--model-path",
         type=Path,
         default=Path("/home/nvme04/yyyan/download/model/Pixal3D"),
@@ -122,6 +128,14 @@ def main() -> int:
         "pipeline_type": "1024_cascade",
         "decoder_resolution": 1024,
         "seed": int(args.seed),
+        "tex_image_unconditional": bool(args.tex_image_unconditional),
+        "texture_sampler_override": {
+            "guidance_strength": 0.0 if args.tex_image_unconditional else 1.0,
+            "guidance_rescale": 0.0,
+            "guidance_interval": [0.0, 1.0] if args.tex_image_unconditional else [0.6, 0.9],
+            "rescale_t": 3.0,
+        },
+        "texture_shape_concat_retained": True,
         "cuda_device": int(args.cuda_device),
         "gpu": torch.cuda.get_device_name(args.cuda_device),
         "representation": "MeshWithVoxel (raw decoded O-Voxel)",

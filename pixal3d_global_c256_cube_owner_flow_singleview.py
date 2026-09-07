@@ -1259,8 +1259,10 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    if (args.grid_resolution, args.cube_size, args.cube_stride) != (256, 64, 32):
-        raise ValueError("this experiment is fixed to C256/C64/stride32")
+    if (args.grid_resolution, args.cube_size, args.cube_stride) != (GRID, CUBE, STRIDE):
+        raise ValueError(
+            f"this experiment is fixed to C{GRID}/C{CUBE}/stride{STRIDE}"
+        )
     if not math.isfinite(args.gaussian_sigma) or args.gaussian_sigma <= 0:
         raise ValueError("--gaussian-sigma must be finite and positive")
     visible = os.environ.get("CUDA_VISIBLE_DEVICES")
