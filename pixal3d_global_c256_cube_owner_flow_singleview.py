@@ -487,7 +487,13 @@ def _distribution(values: Sequence[int] | torch.Tensor) -> dict[str, Any]:
 def _load_mesh_geometry(path: Path) -> tuple[torch.Tensor, torch.Tensor, dict[str, str]]:
     artifact = torch.load(path, map_location="cpu", weights_only=False)
     mesh = artifact.get("mesh", artifact) if isinstance(artifact, dict) else artifact
-    vertices = mesh.vertices.float().cpu().contiguous(); faces = mesh.faces.int().cpu().contiguous()
+    if isinstance(mesh, Mapping):
+        vertices = torch.as_tensor(mesh["vertices"])
+        faces = torch.as_tensor(mesh["faces"])
+    else:
+        vertices = mesh.vertices
+        faces = mesh.faces
+    vertices = vertices.float().cpu().contiguous(); faces = faces.int().cpu().contiguous()
     hashes = {"mesh_file_sha256": sha256_file(path), "vertices_sha256": tensor_sha256(vertices),
               "faces_sha256": tensor_sha256(faces)}
     return vertices, faces, hashes
