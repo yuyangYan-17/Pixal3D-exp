@@ -74,6 +74,14 @@ class SparseMultiHeadAttention(nn.Module):
         if use_rope:
             self.rope = SparseRotaryPositionEmbedder(self.head_dim, rope_freq=rope_freq)
 
+        # Optional, experiment-only hook in head space.  It observes the final
+        # Q/K (after QK norm and RoPE), V, and the attention-kernel output, and
+        # may return a replacement kernel output.  Keeping this as a plain
+        # runtime attribute (rather than a submodule/parameter) guarantees that
+        # pretrained state dicts and the default forward path are unchanged.
+        self.runtime_attention_processor = None
+        self.runtime_last_intervention = None
+
     @staticmethod
     def _linear(module: nn.Linear, x: Union[VarLenTensor, torch.Tensor]) -> Union[VarLenTensor, torch.Tensor]:
         if isinstance(x, VarLenTensor):
@@ -97,6 +105,7 @@ class SparseMultiHeadAttention(nn.Module):
         return x.replace(x_feats.squeeze(0)) if isinstance(x, VarLenTensor) else x_feats
     
     def forward(self, x: SparseTensor, context: Optional[Union[VarLenTensor, torch.Tensor]] = None) -> SparseTensor:
+        self.runtime_last_intervention = None
         if self._type == "self":
             qkv = self._linear(self.to_qkv, x)
             qkv = self._fused_pre(qkv, num_fused=3)
@@ -124,6 +133,35 @@ class SparseMultiHeadAttention(nn.Module):
                     qkv1, self.window_size, shift_window=tuple([self.window_size//2] * 3)
                 )
                 h = qkv.replace(torch.cat([h0.feats, h1.feats], dim=1))
+            if self.runtime_attention_processor is not None:
+                local_h = h
+                replacement = self.runtime_attention_processor(self, qkv, h)
+                if replacement is not None:
+                    if not isinstance(replacement, VarLenTensor):
+                        raise TypeError(
+                            "runtime_attention_processor must return a "
+                            "VarLenTensor or None"
+                        )
+                    if replacement.feats.shape != h.feats.shape:
+                        raise ValueError(
+                            "runtime attention replacement shape mismatch: "
+                            f"{tuple(replacement.feats.shape)} != "
+                            f"{tuple(h.feats.shape)}"
+                        )
+                    head_delta = replacement.replace(
+                        replacement.feats - local_h.feats
+                    )
+                    # A delta passes through only the linear part of to_out;
+                    # its bias is common to both trajectories and cancels.
+                    flat_delta = self._reshape_chs(head_delta, (-1,))
+                    projected_delta = flat_delta.replace(
+                        F.linear(flat_delta.feats, self.to_out.weight, None)
+                    )
+                    self.runtime_last_intervention = {
+                        "head_delta": head_delta,
+                        "to_out_delta": projected_delta,
+                    }
+                    h = replacement
         else:
             q = self._linear(self.to_q, x)
             q = self._reshape_chs(q, (self.num_heads, -1))

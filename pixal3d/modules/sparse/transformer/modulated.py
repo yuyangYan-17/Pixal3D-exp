@@ -178,6 +178,7 @@ class ModulatedSparseTransformerCrossBlock(nn.Module):
         else:
             self.modulation = nn.Parameter(torch.randn(6 * channels) / channels ** 0.5)
         self.last_routing_tensors: Optional[Dict[str, torch.Tensor]] = None
+        self.runtime_last_self_attention_intervention = None
 
     @staticmethod
     def _masked_rms(
@@ -224,6 +225,40 @@ class ModulatedSparseTransformerCrossBlock(nn.Module):
         h = h * (1 + scale_msa) + shift_msa
         self_attention_input = h
         h = self.self_attn(h)
+        intervention = self.self_attn.runtime_last_intervention
+        if intervention is not None:
+            to_out_delta = intervention["to_out_delta"]
+            gated_delta = to_out_delta * gate_msa
+            original_projected = h.replace(h.feats - to_out_delta.feats)
+            original_gated = original_projected * gate_msa
+            self.runtime_last_self_attention_intervention = {
+                "head_delta_rms": self._masked_rms(
+                    intervention["head_delta"].feats,
+                    torch.ones(
+                        intervention["head_delta"].feats.shape[0],
+                        dtype=torch.bool,
+                        device=h.device,
+                    ),
+                ).detach(),
+                "to_out_delta_rms": self._masked_rms(
+                    to_out_delta.feats,
+                    torch.ones(to_out_delta.feats.shape[0], dtype=torch.bool, device=h.device),
+                ).detach(),
+                "gated_to_out_delta_rms": self._masked_rms(
+                    gated_delta.feats,
+                    torch.ones(gated_delta.feats.shape[0], dtype=torch.bool, device=h.device),
+                ).detach(),
+                "original_gated_self_attention_update_rms": self._masked_rms(
+                    original_gated.feats,
+                    torch.ones(original_gated.feats.shape[0], dtype=torch.bool, device=h.device),
+                ).detach(),
+                "hidden_before_residual_rms": self._masked_rms(
+                    x.feats,
+                    torch.ones(x.feats.shape[0], dtype=torch.bool, device=h.device),
+                ).detach(),
+            }
+        else:
+            self.runtime_last_self_attention_intervention = None
         intervention_back_delta = None
         if (
             record_diagnostics
