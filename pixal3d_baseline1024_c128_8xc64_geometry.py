@@ -254,7 +254,10 @@ def render_geometry(
     intersection = int(np.logical_and(reference_mask, prediction_mask).sum())
     union = int(np.logical_or(reference_mask, prediction_mask).sum())
     metrics = {
-        "metric_target": "geometry-only gray Lambert render; texture intentionally absent",
+        "metric_target": "geometry-only gray Lambert render compared with the input RGB view; proxy only",
+        "is_ground_truth": False,
+        "reference_kind": "input_rgb_conditioning_view",
+        "reference_mask_kind": "provided_foreground_proxy",
         "reference": str(reference_path.resolve()),
         "reference_mask": str(reference_mask_path.resolve()),
         "input_view_yaw": int(angles[0]),
