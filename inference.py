@@ -1,5 +1,6 @@
 import os
 import argparse
+import json
 import math
 import time
 import torch
@@ -182,6 +183,7 @@ def run_inference(
     manual_fov: float = -1.0,
     low_vram: bool = False,
     resolution: int = -1,
+    camera_output: str | None = None,
 ):
     # Load models
     pipeline = init_pipeline(model_path, low_vram=low_vram)
@@ -223,6 +225,15 @@ def run_inference(
         del moge_model
         torch.cuda.empty_cache()
     os.remove(tmp_path)
+
+    # 可选地保存相机参数，供后续 C128/8×C64 分块 flow 使用同一相机。
+    if camera_output:
+        camera_path = os.path.abspath(camera_output)
+        os.makedirs(os.path.dirname(camera_path) or ".", exist_ok=True)
+        with open(camera_path, "w", encoding="utf-8") as handle:
+            json.dump(camera_params, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+        print(f"[Camera] Saved to: {camera_path}")
 
     # Run pipeline
     print("[Inference] Running 3D generation pipeline...")
@@ -306,6 +317,8 @@ if __name__ == "__main__":
                              "Reduces peak VRAM from ~18GB to ~10-12GB at the cost of slower inference.")
     parser.add_argument("--resolution", type=int, default=1024,
                         help="Pipeline resolution (1024 or 1536). Default: 1024 if --low_vram, else 1536.")
+    parser.add_argument("--camera-output", type=str, default="",
+                        help="Optional JSON path for saving the estimated camera parameters.")
 
     args = parser.parse_args()
 
@@ -317,5 +330,6 @@ if __name__ == "__main__":
         model_path=args.model_path,
         low_vram=args.low_vram,
         resolution=args.resolution,
-        max_num_tokens=1_000_000
+        max_num_tokens=1_000_000,
+        camera_output=args.camera_output or None,
     )

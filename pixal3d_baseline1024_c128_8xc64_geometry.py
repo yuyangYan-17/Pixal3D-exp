@@ -1,20 +1,25 @@
 #!/usr/bin/env python3
-"""Geometry-only C64 baseline -> global C128 support -> 8-way C64 flow.
+"""纯几何 C64 baseline → global C128 support → 8 个 C64 分块 flow。
 
-The first three stages are the native Pixal3D 1024 cascade.  Instead of
-decoding its C64 shape SLat, the shape decoder is used only as a learned
-support upsampler.  Those C1024 candidate coordinates are requantized to a
-global C128 support with the baseline round-to-(grid-1) convention.  The full
-support is projected into the complete canonical 1024 input once, partitioned
-into eight disjoint C64 cubes, packed as a real sparse batch, and passed
-through one Shape1024 flow.  The assembled global shape SLat is decoded once
-at resolution 2048.  No texture model or texture decoder is loaded or run.
+前 3 个阶段沿用 Pixal3D 原生 1024 cascade：
+
+1. 从 canonical 图像生成 Sparse Structure C32；
+2. 运行 Shape512/C32 flow；
+3. 用 shape decoder 的 support upsample 得到 C64，再运行 Shape1024/C64 flow。
+
+随后不直接解码原生 C64，而是把 C64 support 通过 decoder 上采样到 C1024
+候选坐标，再按 baseline 的 ``round((x + 0.5) / 1024 * 127)`` 规则量化为
+global C128。global C128 被严格拆成 8 个互不重叠的 local C64 cube；完整的
+canonical 1024 图像只投影一次，条件特征按照 global row id 路由到各个 cube，
+再作为一个真正的稀疏 batch 运行 Shape1024 flow。最后把 8 块结果按原始 row
+顺序还原为 global C128，并一次性解码为 2048 geometry mesh。
+
+本入口不运行 texture flow、texture decoder、PBR 渲染或局部 crop 实验。
 """
 from __future__ import annotations
 
 import argparse
 import json
-import math
 import os
 import time
 from pathlib import Path
@@ -30,22 +35,20 @@ os.environ.setdefault(
 
 import numpy as np
 import torch
-from PIL import Image, ImageDraw
-from skimage.metrics import structural_similarity
+from PIL import Image
 
 import pixal3d_cascade512_1024_tiled2048_crop_condition as tiled
 from pixal3d.modules.sparse import SparseTensor
-from pixal3d.utils import render_utils
 
 
 FORMAT = "pixal3d_baseline1024_c128_8xc64_geometry_v1"
 GRID = 128
 CUBE = 64
 DECODE_RESOLUTION = 2048
-DEFAULT_BASELINE = Path("outputs/baseline1024_raw_ovoxel_cuda4_0_img")
 
 
 def save_sparse(path: Path, value: SparseTensor, normalized: bool) -> None:
+    """保存 SparseTensor 的坐标和特征，供 ``--resume`` 复用。"""
     tiled.atomic_save(
         path,
         {
@@ -58,6 +61,7 @@ def save_sparse(path: Path, value: SparseTensor, normalized: bool) -> None:
 
 
 def load_sparse(path: Path, device: torch.device) -> SparseTensor:
+    """从 CPU checkpoint 读取 SparseTensor，并把特征移动到目标设备。"""
     payload = torch.load(path, map_location="cpu", weights_only=False)
     return SparseTensor(payload["features"].to(device), payload["coords"].to(device).int())
 
@@ -70,9 +74,15 @@ def full_image_conditions(
     records: Sequence[Mapping[str, Any]],
     out: Path,
 ) -> dict[int, dict[str, torch.Tensor]]:
-    """Project global C128 once, then route aligned rows to the eight cubes."""
+    """只对完整 1024 图像做一次投影，再按 row id 路由到 8 个 cube。
+
+    ``global`` 是每个 batch 共用的全局图像 token，``proj`` 与 C128 support
+    的行一一对应。这里不重新裁剪图像，也不改变局部坐标；局部化只发生在
+    稀疏 batch 的坐标字段中。
+    """
     cache = out / "conditions" / "shape_global_c128_full_image.pt"
     if cache.is_file():
+        # cache 中的坐标必须与当前 support 完全一致，避免错误复用条件。
         payload = torch.load(cache, map_location="cpu", weights_only=False)
         if not torch.equal(payload["coords"].int(), coords.cpu().int()):
             raise RuntimeError("cached C128 condition coordinates do not match support")
@@ -81,6 +91,7 @@ def full_image_conditions(
     else:
         if image.size != (1024, 1024):
             raise RuntimeError(f"shape condition must be 1024x1024, got {image.size}")
+        # 一次性对完整 canonical image_1024 投影所有 global C128 token。
         cond = pipeline.get_proj_cond_shape(
             pipeline.image_cond_model_shape_1024,
             [image],
@@ -109,6 +120,7 @@ def full_image_conditions(
         raise RuntimeError("global C128 projected condition is not row-aligned")
     result: dict[int, dict[str, torch.Tensor]] = {}
     for rec in records:
+        # 每个 cube 只取属于自己的 global row；global token 保持同一个来源。
         rows = rec["global_row_ids"].long()
         if rows.numel():
             result[int(rec["cube_id"])] = {
@@ -132,7 +144,11 @@ def full_image_conditions(
 
 
 def c128_support(pipeline: Any, shape_c64: SparseTensor) -> torch.Tensor:
-    """Exact requested decoder.upsample + round-to-(grid-1) requantization."""
+    """把原生 C64 support 上采样并按 baseline 规则量化成 global C128。
+
+    decoder 输出的是 C1024 坐标。先加半个 voxel 中心偏移，再除以 1024，
+    映射到 ``[0, 127]``，最后 round 并去重。
+    """
     decoder = pipeline.models["shape_slat_decoder"]
     if pipeline.low_vram:
         decoder.to(pipeline.device)
@@ -157,128 +173,9 @@ def c128_support(pipeline: Any, shape_c64: SparseTensor) -> torch.Tensor:
     return coords
 
 
-def shade_normal(normal: np.ndarray, mask: np.ndarray) -> np.ndarray:
-    n = normal.astype(np.float32) / 255.0 * 2.0 - 1.0
-    # MeshRenderer orients visible camera-space normals toward +Z for this
-    # projective camera convention, so use a slightly elevated camera light.
-    light = np.asarray([0.25, -0.35, 1.0], dtype=np.float32)
-    light /= np.linalg.norm(light)
-    lambert = np.clip(np.sum(n * light[None, None], axis=2), 0.0, 1.0)
-    gray = 0.22 + 0.72 * lambert
-    rgb = np.repeat(gray[..., None], 3, axis=2)
-    alpha = mask[..., :1].astype(np.float32) / 255.0
-    return np.uint8(np.clip(rgb * alpha + (1.0 - alpha), 0.0, 1.0) * 255.0 + 0.5)
-
-
-def contact_sheet(items: Sequence[tuple[str, Image.Image]], path: Path) -> None:
-    if not items:
-        return
-    panel = items[0][1].width
-    header = 36
-    cols = min(3, len(items))
-    rows = (len(items) + cols - 1) // cols
-    sheet = Image.new("RGB", (cols * panel, rows * (panel + header)), "white")
-    draw = ImageDraw.Draw(sheet)
-    for index, (label, image) in enumerate(items):
-        x, y = index % cols * panel, index // cols * (panel + header)
-        sheet.paste(image.convert("RGB"), (x, y + header))
-        draw.text((x + 8, y + 10), label, fill="black")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    sheet.save(path)
-
-
-@torch.no_grad()
-def render_geometry(
-    mesh: Any,
-    camera: Mapping[str, float],
-    reference_path: Path,
-    reference_mask_path: Path,
-    out: Path,
-    resolution: int,
-    angles: Sequence[int],
-    chunk_size: int,
-) -> dict[str, Any]:
-    device = mesh.device
-    extrinsics, intrinsics, _ = __import__(
-        "pixal3d_baseline1024_pbr_mesh_compare"
-    )._make_camera_views(float(camera["camera_angle_x"]), float(camera["distance"]), angles)
-    options = {
-        "resolution": int(resolution),
-        "near": 0.01,
-        "far": float(camera["distance"]) + 10.0,
-        "ssaa": 1,
-        "chunk_size": int(chunk_size),
-    }
-    result = render_utils.render_frames(
-        mesh,
-        [extrinsics[a].to(device) for a in angles],
-        [intrinsics.to(device) for _ in angles],
-        options=options,
-        return_types=["normal", "mask"],
-        verbose=True,
-    )
-    render_dir = out / f"multiview_{resolution}"
-    render_dir.mkdir(parents=True, exist_ok=True)
-    normal_panels: list[tuple[str, Image.Image]] = []
-    shaded_panels: list[tuple[str, Image.Image]] = []
-    for index, angle in enumerate(angles):
-        normal = np.asarray(result["normal"][index])
-        mask = np.asarray(result["mask"][index])
-        normal_image = Image.fromarray(normal).convert("RGB")
-        shaded_image = Image.fromarray(shade_normal(normal, mask)).convert("RGB")
-        normal_image.save(render_dir / f"view_{angle:03d}_camera_normal.png")
-        shaded_image.save(render_dir / f"view_{angle:03d}_geometry_shaded.png")
-        Image.fromarray(mask).convert("L").save(render_dir / f"view_{angle:03d}_mask.png")
-        normal_panels.append((f"yaw {angle} normal", normal_image))
-        shaded_panels.append((f"yaw {angle} geometry", shaded_image))
-    normal_sheet = render_dir / "camera_normal_contact_sheet.png"
-    shaded_sheet = render_dir / "geometry_shaded_contact_sheet.png"
-    contact_sheet(normal_panels, normal_sheet)
-    contact_sheet(shaded_panels, shaded_sheet)
-
-    size = (resolution, resolution)
-    reference = np.asarray(
-        Image.open(reference_path).convert("RGB").resize(size, Image.Resampling.LANCZOS),
-        dtype=np.float32,
-    ) / 255.0
-    prediction = np.asarray(shaded_panels[0][1], dtype=np.float32) / 255.0
-    reference_mask = np.asarray(
-        Image.open(reference_mask_path).convert("L").resize(size, Image.Resampling.NEAREST),
-        dtype=np.float32,
-    ) / 255.0 > 0.5
-    prediction_mask = np.asarray(result["mask"][0])[..., 0] > 127
-    diff = prediction - reference
-    mse = float(np.mean(diff * diff))
-    fg_mse = float(np.mean(diff[reference_mask] ** 2))
-    _, ssim_map = structural_similarity(reference, prediction, data_range=1.0, channel_axis=2, full=True)
-    intersection = int(np.logical_and(reference_mask, prediction_mask).sum())
-    union = int(np.logical_or(reference_mask, prediction_mask).sum())
-    metrics = {
-        "metric_target": "geometry-only gray Lambert render compared with the input RGB view; proxy only",
-        "is_ground_truth": False,
-        "reference_kind": "input_rgb_conditioning_view",
-        "reference_mask_kind": "provided_foreground_proxy",
-        "reference": str(reference_path.resolve()),
-        "reference_mask": str(reference_mask_path.resolve()),
-        "input_view_yaw": int(angles[0]),
-        "psnr_db": float(10.0 * math.log10(1.0 / max(mse, 1e-12))),
-        "foreground_psnr_db": float(10.0 * math.log10(1.0 / max(fg_mse, 1e-12))),
-        "ssim": float(np.mean(ssim_map)),
-        "foreground_ssim": float(np.mean(ssim_map[reference_mask])),
-        "mae": float(np.mean(np.abs(diff))),
-        "foreground_mae": float(np.mean(np.abs(diff[reference_mask]))),
-        "silhouette_iou": float(intersection / max(union, 1)),
-    }
-    tiled.atomic_json(render_dir / "input_view_metrics.json", metrics)
-    return {
-        "normal_contact_sheet": str(normal_sheet.resolve()),
-        "geometry_contact_sheet": str(shaded_sheet.resolve()),
-        "metrics": metrics,
-    }
-
-
 @torch.no_grad()
 def run(args: argparse.Namespace) -> None:
+    """执行完整的 C64→C128→8×C64→2048 geometry cascade。"""
     from inference import init_pipeline
 
     visible = os.environ.get("CUDA_VISIBLE_DEVICES")
@@ -286,6 +183,7 @@ def run(args: argparse.Namespace) -> None:
         raise RuntimeError(f"CUDA_VISIBLE_DEVICES={visible!r}, expected {args.cuda_device}")
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
+    # 设置 CUDA_VISIBLE_DEVICES 后，进程内可见卡会重新编号为 cuda:0。
     device = torch.device("cuda:0" if visible else f"cuda:{args.cuda_device}")
     torch.cuda.set_device(device)
     out = args.output_dir.resolve()
@@ -293,7 +191,9 @@ def run(args: argparse.Namespace) -> None:
     started = time.perf_counter()
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
+    # low_vram 模式按阶段把模型搬到 GPU，避免同时常驻所有大模型。
     pipeline = init_pipeline(str(args.model_path), device=str(device), low_vram=True)
+    # 这里的 canonical 预处理包含前景分割、bbox padding、正方形居中和多尺度图像。
     canonical = pipeline.preprocess_canonical_images(Image.open(args.image).convert("RGB"))
     camera = json.loads(args.camera.read_text(encoding="utf-8"))
     if "camera" in camera:
@@ -312,12 +212,14 @@ def run(args: argparse.Namespace) -> None:
         },
     )
 
+    # ------------------------- 原生 1024 baseline -------------------------
     baseline_cache = out / "baseline" / "shape_c64_denormalized.pt"
     if baseline_cache.is_file() and args.resume:
         print("[baseline] reuse cached native C64 shape SLat", flush=True)
         shape_c64 = load_sparse(baseline_cache, device)
     else:
         print("[baseline 1/3] sparse structure -> C32", flush=True)
+        # SS 条件只负责确定 C32 的稀疏 support。
         cond_ss = pipeline.get_proj_cond_ss(
             [canonical["image_512"]],
             camera_angle_x=float(camera["camera_angle_x"]),
@@ -328,6 +230,7 @@ def run(args: argparse.Namespace) -> None:
         del cond_ss
         tiled.empty_cuda()
         print("[baseline 2/3] Shape512 flow on C32", flush=True)
+        # Shape512 使用 image_512 条件，在原生 C32 support 上生成 shape SLat。
         cond_c32 = pipeline.get_proj_cond_shape(
             pipeline.image_cond_model_shape_512,
             [canonical["image_512"]],
@@ -342,6 +245,7 @@ def run(args: argparse.Namespace) -> None:
         del cond_c32, coords_c32
         tiled.empty_cuda()
         print("[baseline 3/3] decoder support -> C64, Shape1024 flow", flush=True)
+        # decoder support upsample 只改变稀疏坐标，不是对 latent 特征做插值。
         coords_c64 = tiled.upsample_and_quantize(pipeline, shape_c32, 512, 64, True)
         cond_c64 = pipeline.get_proj_cond_shape(
             pipeline.image_cond_model_shape_1024,
@@ -359,6 +263,7 @@ def run(args: argparse.Namespace) -> None:
         del cond_c64, coords_c64, shape_c32
         tiled.empty_cuda()
 
+    # ------------------------- 构造 global C128 -------------------------
     support_cache = out / "support" / "coords_c128.pt"
     if support_cache.is_file() and args.resume:
         coords_c128 = torch.load(support_cache, map_location="cpu", weights_only=False)["coords"].int()
@@ -369,9 +274,9 @@ def run(args: argparse.Namespace) -> None:
     del shape_c64
     tiled.empty_cuda()
 
-    # build_records needs camera only for its unused crop metadata.  The flow
-    # condition below always comes from the complete 1024 image.
-    records = tiled.build_records(coords_c128, camera)
+    # 只切 support，不切图像；条件仍来自完整 canonical 1024 图像，
+    # 后续由 global row id 精确路由到对应的 local cube。
+    records = tiled.build_records(coords_c128)
     tiled.atomic_json(
         out / "support" / "cube_layout.json",
         {
@@ -385,6 +290,7 @@ def run(args: argparse.Namespace) -> None:
             ],
         },
     )
+    # ----------------------- 8×C64 Shape1024 flow -----------------------
     final_norm_cache = out / "shape" / "final_state_normalized.pt"
     if final_norm_cache.is_file() and args.resume:
         payload = torch.load(final_norm_cache, map_location="cpu", weights_only=False)
@@ -405,6 +311,7 @@ def run(args: argparse.Namespace) -> None:
         if old_steps is not None:
             pipeline.shape_slat_sampler_params["steps"] = old_steps
         del conditions
+    # flow 输出是归一化 latent，解码前恢复训练时的 mean/std。
     mean, std = tiled.normalization_tensors(
         pipeline.shape_slat_normalization, torch.device("cpu")
     )
@@ -415,6 +322,7 @@ def run(args: argparse.Namespace) -> None:
     )
     tiled.empty_cuda()
 
+    # -------------------------- 全局一次性解码 --------------------------
     print("[decode] assembled global C128 shape -> geometry-only decode at 2048", flush=True)
     shape_st = SparseTensor(shape_raw.to(device), coords_c128.to(device))
     meshes, _ = pipeline.decode_shape_slat(shape_st, DECODE_RESOLUTION)
@@ -422,6 +330,7 @@ def run(args: argparse.Namespace) -> None:
         raise RuntimeError(f"shape decoder returned B={len(meshes)}, expected 1")
     mesh = meshes[0]
     tiled.atomic_save(out / "final" / "geometry_mesh.pt", {"format": FORMAT, "mesh": mesh.cpu()})
+    # 同时保存原生 mesh checkpoint 和便于查看的 GLB；GLB 导出失败不影响 PT 结果。
     try:
         import trimesh
 
@@ -435,16 +344,6 @@ def run(args: argparse.Namespace) -> None:
     except Exception as exc:
         tiled.atomic_json(out / "final" / "glb_export_error.json", {"error": repr(exc)})
 
-    render = render_geometry(
-        mesh,
-        camera,
-        args.reference,
-        args.reference_mask,
-        out,
-        args.render_resolution,
-        tuple(int(x) % 360 for x in args.angles.split(",")),
-        args.render_chunk_size,
-    )
     summary = {
         "format": FORMAT,
         "status": "complete",
@@ -456,18 +355,16 @@ def run(args: argparse.Namespace) -> None:
         "seconds": time.perf_counter() - started,
         "mesh_pt": str((out / "final" / "geometry_mesh.pt").resolve()),
         "mesh_glb": str((out / "final" / "geometry_mesh.glb").resolve()),
-        **render,
     }
     tiled.atomic_json(out / "summary.json", summary)
     print(json.dumps(tiled._jsonable(summary), indent=2, ensure_ascii=False), flush=True)
 
 
 def parse_args() -> argparse.Namespace:
+    """命令行参数；图像和相机文件显式传入，避免依赖历史 outputs。"""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--image", type=Path, default=Path("assets/choose/0_img.png"))
-    parser.add_argument("--camera", type=Path, default=DEFAULT_BASELINE / "global_camera.json")
-    parser.add_argument("--reference", type=Path, default=DEFAULT_BASELINE / "canonical_1024.png")
-    parser.add_argument("--reference-mask", type=Path, default=DEFAULT_BASELINE / "raw_ovoxel_render/alpha.png")
+    parser.add_argument("--image", type=Path, required=True)
+    parser.add_argument("--camera", type=Path, required=True)
     parser.add_argument("--model-path", type=Path, default=Path(tiled.DEFAULT_MODEL_PATH))
     parser.add_argument(
         "--output-dir", type=Path,
@@ -477,9 +374,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--shape-seed", type=int, default=43)
     parser.add_argument("--shape-steps", type=int, default=12)
-    parser.add_argument("--angles", default="0,60,120,180,240,300")
-    parser.add_argument("--render-resolution", type=int, default=1024)
-    parser.add_argument("--render-chunk-size", type=int, default=200_000)
     parser.add_argument("--resume", action="store_true")
     return parser.parse_args()
 
