@@ -15,7 +15,7 @@ os.environ["FLEX_GEMM_AUTOTUNE_CACHE_PATH"] = os.path.join(os.path.dirname(os.pa
 os.environ["FLEX_GEMM_AUTOTUNER_VERBOSE"] = '1'
 
 from pixal3d.pipelines import Pixal3DImageTo3DPipeline
-import o_voxel
+# import o_voxel  # 暂停：其 to_glb() 会执行 UV unwrap、纹理烘焙和 PBR 材质导出。
 
 # ============================================================================
 # Constants & Defaults
@@ -274,32 +274,34 @@ def run_inference(
         f"faces={mesh.faces.shape[0]:,}"
     )
 
-    # Extract GLB
-    print("[Inference] Extracting GLB...")
-    glb = o_voxel.postprocess.to_glb(
-        vertices=mesh.vertices, 
-        faces=mesh.faces, 
-        attr_volume=mesh.attrs,
-        coords=mesh.coords, 
-        attr_layout=pipeline.pbr_attr_layout,
-        grid_size=res, aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
-        decimation_target=1_000_000, texture_size=4096,
-        remesh=False, use_tqdm=True,verbose=False
+    # 当前阶段禁用原来的 o_voxel.postprocess.to_glb()：
+    #
+    #   glb = o_voxel.postprocess.to_glb(...)
+    #
+    # 该函数内部会执行 UV unwrap、UV 空间 rasterize、attribute/texture baking、
+    # PBRMaterial 构造以及 TextureVisuals(uv=...)。现阶段只导出无 UV、无纹理
+    # 的几何 mesh，因此直接用 vertices/faces 创建 trimesh。
+    import trimesh
+
+    glb = trimesh.Trimesh(
+        vertices=mesh.vertices.detach().cpu().numpy(),
+        faces=mesh.faces.detach().cpu().numpy(),
+        process=False,
     )
 
-    # Apply rotation
-    rot = np.array([
-        [-1,  0,  0,  0],
-        [ 0,  0, -1,  0],
-        [ 0, -1,  0,  0],
-        [ 0,  0,  0,  1],
+    # 保留原 to_glb + apply_transform 后的坐标方向，但不创建任何 UV 属性。
+    geometry_rot = np.array([
+        [-1, 0,  0, 0],
+        [ 0, 1,  0, 0],
+        [ 0, 0, -1, 0],
+        [ 0, 0,  0, 1],
     ], dtype=np.float64)
-    glb.apply_transform(rot)
+    glb.apply_transform(geometry_rot)
 
-    # Export
+    # Export geometry-only GLB；trimesh 不会写入 TEXCOORD_0 或纹理材质。
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
-    glb.export(output_path, extension_webp=False)
-    print(f"[Done] GLB saved to: {output_path}")
+    glb.export(output_path)
+    print(f"[Done] UV-free geometry GLB saved to: {output_path}")
 
 
 if __name__ == "__main__":

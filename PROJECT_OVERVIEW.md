@@ -12,18 +12,22 @@
 
 | 文件 | 用途 |
 | --- | --- |
-| `pixal3d_baseline1024_c128_8xc64_geometry.py` | 运行原生 SS/C32 → Shape512/C32 → Shape1024/C64；将 C64 decoder support 上采样并量化为 global C128，拆为 8 个互不重叠的 local C64，进行一次 Shape1024 geometry flow，最后一次性解码 2048 mesh。 |
-| `pixal3d_cascade512_1024_tiled2048_crop_condition.py` | 上述路径的最小几何 helper：support 量化、8 块稀疏 batch 打包、完整 1024 图像条件路由、Shape flow 和 global row 回填；不包含 texture、crop、PBR 或渲染实验。 |
+| `pixal3d_baseline1024_c128_8xc64_geometry.py` | 纯入口：只保留 `run()` 的执行顺序和 CLI 参数，不放坐标、flow、解码或渲染实现。 |
+| `pixal3d_baseline1024_c256_64xc32_geometry.py` | 新的两级纯几何 cascade 入口：baseline C64→Shape1024→decoder upsample(1)→global C128→64×C32→global C256→Shape1024→4096 mesh。 |
+| `pixal3d_cascade512_1024_tiled2048_crop_condition.py` | 纯实现：初始化、C64→8×C32 分块、local→global 坐标映射、support 量化、条件路由、Shape flow、解码、mesh/normal 保存；不包含 CLI、不作为独立程序运行，也不包含 texture、UV、crop 或 PBR。 |
+
+代码阅读边界：先看入口文件即可得到完整实验顺序；需要检查某一步的具体算法时，再到 helper 文件查看对应函数。两者之间只通过明确的 `geometry_ops.*` 函数调用连接，不保留旧实验别名或兼容入口。
 
 流程：
 
 ```text
 输入图像
   -> canonical 预处理 + MoGe 相机
-  -> SS/C32 -> Shape512/C32 -> Shape1024/C64
-  -> decoder support upsample -> global C128
-  -> 8 个 disjoint C64 Shape1024 flow
-  -> global geometry decode -> 2048 mesh
+  -> SS/C32 -> Shape512/C32 -> native C64 support
+  -> baseline Shape1024/C64 -> decoder upsample(1) -> global C128
+  -> 64 个 local C32 -> local Shape512 -> local C64
+  -> 64 个 local Shape1024 -> global C256 latent
+  -> global geometry decode -> 4096 mesh
 ```
 
 运行示例：
@@ -38,7 +42,7 @@ CUDA_VISIBLE_DEVICES=4 python pixal3d_baseline1024_c128_8xc64_geometry.py \
 ## 3. baseline 与分块 flow 对照运行
 
 先运行原生 baseline，同时保存 MoGe 相机；再使用同一张图像、相机和 seed
-运行 C128/8×C64 geometry flow：
+运行 native C64 → 8×local C32 → global C128 geometry flow：
 
 ```bash
 mkdir -p outputs/baseline_vs_tiled_0
@@ -57,8 +61,9 @@ CUDA_VISIBLE_DEVICES=4 python pixal3d_baseline1024_c128_8xc64_geometry.py \
 ```
 
 第一条输出原生 1024 baseline GLB；第二条输出
-`tiled_2048/final/geometry_mesh.glb` 和 `geometry_mesh.pt`。第二条会从图像重新
-跑 SS/C32、Shape512/C32、原生 Shape1024/C64，再继续 C128 分块 flow；它不会从
+`tiled_2048/final/geometry_mesh.glb`、`geometry_mesh.pt` 和
+`geometry_normal.png`。第二条会从图像重新跑 SS/C32、Shape512/C32、native C64
+support，再跑 8 个 local C32→C64→Shape1024；它不会从
 第一条生成的 GLB 反推 latent。`--resume` 只复用第二条输出目录中的中间 checkpoint。
 
 ## 4. 目录边界
