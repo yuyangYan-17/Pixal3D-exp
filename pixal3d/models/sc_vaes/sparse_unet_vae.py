@@ -9,6 +9,25 @@ from ...modules import sparse as sp
 from ...modules.norm import LayerNorm32
 
 
+
+def chunked_decoder_output(feats, linear, dtype, chunk_rows=None):
+    """Pointwise decoder norm/projection with bounded row count and FP32 memory.
+
+    Large CUDA LayerNorm launches can silently leave rows after 2**26 zero
+    on the deployed PyTorch build. Spatial convolutions/topology stay global.
+    This helper is inference-only; the training path remains differentiable.
+    """
+    if chunk_rows is None:
+        chunk_rows=max(1,(128*1024*1024)//(feats.shape[1]*4))
+    if chunk_rows<1:raise ValueError('chunk_rows must be positive')
+    result=torch.empty((len(feats),linear.out_features),device=feats.device,dtype=dtype)
+    for start in range(0,len(feats),chunk_rows):
+        end=min(start+chunk_rows,len(feats))
+        normalized=F.layer_norm(feats[start:end].to(dtype),feats.shape[-1:])
+        result[start:end]=F.linear(normalized,linear.weight,linear.bias)
+    return result
+
+
 def subdivision_to_child_coords(subdivision: sp.SparseTensor) -> torch.Tensor:
     """Expand one decoder subdivision tensor into its selected child coords."""
     if not isinstance(subdivision, sp.SparseTensor):
@@ -373,7 +392,7 @@ class SparseResBlockC2S3d(nn.Module):
         subdiv_binarized = subdiv.replace(subdiv.feats > 0) if subdiv is not None else None
         h = self.updown(h, subdiv_binarized)
         x = self.updown(x, subdiv_binarized)     
-        print_gpu_mem("After updown")
+        # print_gpu_mem("After updown")
         low_peak = (
             os.environ.get("PIXAL3D_LOW_MEMORY_DECODER", "0") == "1"
             and not torch.is_grad_enabled()
@@ -400,7 +419,7 @@ class SparseResBlockC2S3d(nn.Module):
                 del normalized
         else:
             h = h.replace(self.norm2(h.feats))
-        print_gpu_mem("After norm2")
+        # print_gpu_mem("After norm2")
         h = h.replace(F.silu(h.feats, inplace=low_peak))
         h = self.conv2(h)
         if low_peak:
@@ -446,8 +465,45 @@ class SparseConvNeXtBlock3d(nn.Module):
 
     def _forward(self, x: sp.SparseTensor) -> sp.SparseTensor:
         h = self.conv(x)
-        h = h.replace(self.norm(h.feats))
-        h = h.replace(self.mlp(h.feats))
+        low_peak = (
+            os.environ.get("PIXAL3D_LOW_MEMORY_DECODER", "0") == "1"
+            and not torch.is_grad_enabled()
+            and h.feats.numel() >= 64 * 1024 * 1024
+        )
+        if low_peak:
+            # The final C4096 sparse stage can contain tens of millions of
+            # rows.  LayerNorm32 and the two pointwise MLP temporaries are
+            # row-independent, so chunking them is exact and avoids a single
+            # 20--30 GiB allocation.  The sparse convolution remains global.
+            rows = max(
+                1,
+                (128 * 1024 * 1024)
+                // max(1, h.feats.shape[1] * h.feats.element_size()),
+            )
+            normalized = torch.empty_like(h.feats)
+            for begin in range(0, h.feats.shape[0], rows):
+                end = min(h.feats.shape[0], begin + rows)
+                normalized[begin:end] = self.norm(h.feats[begin:end])
+            h = h.replace(normalized)
+            activated = torch.empty_like(h.feats)
+            for begin in range(0, h.feats.shape[0], rows):
+                end = min(h.feats.shape[0], begin + rows)
+                activated[begin:end] = F.silu(h.feats[begin:end])
+            h = h.replace(activated)
+            mlp_rows = max(
+                1,
+                (128 * 1024 * 1024)
+                // max(1, self.mlp[0].out_features * h.feats.element_size()),
+            )
+            projected = torch.empty_like(h.feats)
+            for begin in range(0, h.feats.shape[0], mlp_rows):
+                end = min(h.feats.shape[0], begin + mlp_rows)
+                projected[begin:end] = self.mlp(h.feats[begin:end])
+            h = h.replace(projected)
+            del normalized, activated, projected
+        else:
+            h = h.replace(self.norm(h.feats))
+            h = h.replace(self.mlp(h.feats))
         return h + x
     
     def forward(self, x: sp.SparseTensor) -> sp.SparseTensor:
@@ -728,9 +784,12 @@ class SparseUnetVaeDecoder(nn.Module):
                 # map while preserving the single global forward pass.
                 res.cpu()
                 torch.cuda.empty_cache()
-        h = h.type(x.dtype)
-        h = h.replace(F.layer_norm(h.feats, h.feats.shape[-1:]))
-        h = self.output_layer(h)
+        if not torch.is_grad_enabled() and h.feats.numel() >= 64 * 1024 * 1024:
+            h = h.replace(chunked_decoder_output(h.feats, self.output_layer, x.dtype))
+        else:
+            h = h.type(x.dtype)
+            h = h.replace(F.layer_norm(h.feats, h.feats.shape[-1:]))
+            h = self.output_layer(h)
         if self.training and self.pred_subdiv:
             return h, subs_gt, subs
         else:

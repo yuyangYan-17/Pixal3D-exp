@@ -31,3 +31,6 @@ tmp
 outputs/
 
 assets/
+# Local checker caches
+.ruff_cache/
+.pytest_cache/

@@ -1,21 +1,39 @@
 import os
 import argparse
-import json
+from pathlib import Path
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Native baseline1024: SS512 -> Shape512 -> Shape1024 -> Texture1024"
+    )
+    parser.add_argument("--image", type=Path, required=True)
+    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--gpu", default="GPU-5a01b63c-14ed-235f-7936-8043e91e88a5")
+    args = parser.parse_args()
+    return args
+
+
+# Bind the selected physical device before importing any CUDA-dependent package.
+if __name__ == "__main__":
+    cli_args = parse_args()
+    os.environ["CUDA_VISIBLE_DEVICES"] = cli_args.gpu
+
 import math
-import time
 import torch
 import numpy as np
-import cv2
 from PIL import Image
 
-os.environ['OPENCV_IO_ENABLE_OPENEXR'] = '1'
+os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 os.environ.setdefault("ATTN_BACKEND", "flash_attn")
-os.environ["FLEX_GEMM_AUTOTUNE_CACHE_PATH"] = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'autotune_cache.json')
-os.environ["FLEX_GEMM_AUTOTUNER_VERBOSE"] = '1'
+os.environ.setdefault(
+    "FLEX_GEMM_AUTOTUNE_CACHE_PATH",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "autotune_cache.json"),
+)
+os.environ.setdefault("FLEX_GEMM_AUTOTUNER_VERBOSE", "0")
 
 from pixal3d.pipelines import Pixal3DImageTo3DPipeline
-# import o_voxel  # 暂停：其 to_glb() 会执行 UV unwrap、纹理烘焙和 PBR 材质导出。
 
 # ============================================================================
 # Constants & Defaults
@@ -57,8 +75,12 @@ IMAGE_COND_CONFIGS = {
 # Model Loading
 # ============================================================================
 
+
 def build_image_cond_model(config: dict):
-    from pixal3d.trainers.flow_matching.mixins.image_conditioned_proj import DinoV3ProjFeatureExtractor
+    from pixal3d.trainers.flow_matching.mixins.image_conditioned_proj import (
+        DinoV3ProjFeatureExtractor,
+    )
+
     model = DinoV3ProjFeatureExtractor(**config)
     model.eval()
     return model
@@ -66,6 +88,7 @@ def build_image_cond_model(config: dict):
 
 def load_moge_model(device="cuda", model_name=MOGE_MODEL_NAME):
     from moge.model.v2 import MoGeModel
+
     moge_model = MoGeModel.from_pretrained(model_name)
     moge_model = moge_model.to(device)
     moge_model.eval()
@@ -78,18 +101,28 @@ def init_pipeline(model_path=MODEL_PATH, device="cuda", low_vram=False):
 
     print("[ImageCond] Building DinoV3ProjFeatureExtractor models...")
     pipeline.image_cond_model_ss = build_image_cond_model(IMAGE_COND_CONFIGS["ss"])
-    pipeline.image_cond_model_shape_512 = build_image_cond_model(IMAGE_COND_CONFIGS["shape_512"])
-    pipeline.image_cond_model_shape_1024 = build_image_cond_model(IMAGE_COND_CONFIGS["shape_1024"])
-    pipeline.image_cond_model_tex_1024 = build_image_cond_model(IMAGE_COND_CONFIGS["tex_1024"])
+    pipeline.image_cond_model_shape_512 = build_image_cond_model(
+        IMAGE_COND_CONFIGS["shape_512"]
+    )
+    pipeline.image_cond_model_shape_1024 = build_image_cond_model(
+        IMAGE_COND_CONFIGS["shape_1024"]
+    )
+    pipeline.image_cond_model_tex_1024 = build_image_cond_model(
+        IMAGE_COND_CONFIGS["tex_1024"]
+    )
 
     if low_vram:
         # Low-VRAM mode: models stay on CPU, loaded to GPU on-demand per stage.
         # Peak VRAM = one flow model + one DinoV3, not all ~18 GB at once.
         print("[NAF] Pre-downloading NAF upsampler weights (CPU only)...")
-        for attr in ['image_cond_model_ss', 'image_cond_model_shape_512',
-                     'image_cond_model_shape_1024', 'image_cond_model_tex_1024']:
+        for attr in [
+            "image_cond_model_ss",
+            "image_cond_model_shape_512",
+            "image_cond_model_shape_1024",
+            "image_cond_model_tex_1024",
+        ]:
             m = getattr(pipeline, attr, None)
-            if m is not None and getattr(m, 'use_naf_upsample', False):
+            if m is not None and getattr(m, "use_naf_upsample", False):
                 m._load_naf()
         pipeline._device = torch.device(device)
         pipeline.low_vram = True
@@ -103,18 +136,24 @@ def init_pipeline(model_path=MODEL_PATH, device="cuda", low_vram=False):
         pipeline.image_cond_model_shape_1024.cuda()
         pipeline.image_cond_model_tex_1024.cuda()
         print("[NAF] Pre-loading NAF upsampler model...")
-        for attr in ['image_cond_model_ss', 'image_cond_model_shape_512',
-                     'image_cond_model_shape_1024', 'image_cond_model_tex_1024']:
+        for attr in [
+            "image_cond_model_ss",
+            "image_cond_model_shape_512",
+            "image_cond_model_shape_1024",
+            "image_cond_model_tex_1024",
+        ]:
             m = getattr(pipeline, attr, None)
-            if m is not None and getattr(m, 'use_naf_upsample', False):
+            if m is not None and getattr(m, "use_naf_upsample", False):
                 m._load_naf()
         print("[Pipeline] Standard mode (all models on GPU).")
 
     return pipeline
 
+
 # ============================================================================
 # Camera Estimation
 # ============================================================================
+
 
 def compute_f_pixels(camera_angle_x: float, resolution: int) -> float:
     focal_length = 16.0 / torch.tan(torch.tensor(camera_angle_x / 2.0))
@@ -122,20 +161,28 @@ def compute_f_pixels(camera_angle_x: float, resolution: int) -> float:
     return float(f_pixels.item())
 
 
-def distance_from_fov(camera_angle_x, grid_point, target_point, mesh_scale, image_resolution):
+def distance_from_fov(
+    camera_angle_x, grid_point, target_point, mesh_scale, image_resolution
+):
     rotation_matrix = torch.tensor([[1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]])
     gp = grid_point.to(torch.float32) @ rotation_matrix.T
     gp = gp / mesh_scale / 2
-    xw, yw, zw = gp[0].item(), gp[1].item(), gp[2].item()
-    xt, yt = float(target_point[0].item()), float(target_point[1].item())
+    xw, yw = gp[0].item(), gp[1].item()
+    xt = float(target_point[0].item())
     f_pixels = compute_f_pixels(camera_angle_x, image_resolution)
     x_ndc = xt - image_resolution / 2.0
-    y_ndc = -(yt - image_resolution / 2.0)
     distance_x = f_pixels * xw / x_ndc - yw
     return {"distance_from_x": float(distance_x), "f_pixels": float(f_pixels)}
 
 
-def get_camera_params_wild_moge(image_path, moge_model, device="cuda", mesh_scale=1.0, extend_pixel=0, image_resolution=512):
+def get_camera_params_wild_moge(
+    image_path,
+    moge_model,
+    device="cuda",
+    mesh_scale=1.0,
+    extend_pixel=0,
+    image_resolution=512,
+):
     pil_image = Image.open(image_path).convert("RGB")
     width, height = pil_image.size
     image_np = np.array(pil_image).astype(np.float32) / 255.0
@@ -149,189 +196,33 @@ def get_camera_params_wild_moge(image_path, moge_model, device="cuda", mesh_scal
 
     grid_point = torch.tensor([-1.0, 0.0, 0.0])
     distance = distance_from_fov(
-        camera_angle_x, grid_point,
+        camera_angle_x,
+        grid_point,
         torch.tensor([0 - extend_pixel, image_resolution - 1 + extend_pixel]),
-        mesh_scale, image_resolution
+        mesh_scale,
+        image_resolution,
     )["distance_from_x"]
-    return {'camera_angle_x': camera_angle_x, 'distance': distance, 'mesh_scale': mesh_scale}
-
-# ============================================================================
-# Main Inference
-# ============================================================================
-
-def run_inference(
-    image_path: str,
-    output_path: str,
-    seed: int = 42,
-    ss_guidance_strength: float = 7.5,
-    ss_guidance_rescale: float = 0.7,
-    ss_sampling_steps: int = 12,
-    ss_rescale_t: float = 5.0,
-    shape_slat_guidance_strength: float = 7.5,
-    shape_slat_guidance_rescale: float = 0.5,
-    shape_slat_sampling_steps: int = 12,
-    shape_slat_rescale_t: float = 3.0,
-    tex_slat_guidance_strength: float = 1.0,
-    tex_slat_guidance_rescale: float = 0.0,
-    tex_slat_sampling_steps: int = 12,
-    tex_slat_rescale_t: float = 3.0,
-    mesh_scale: float = 1.0,
-    extend_pixel: int = 0,
-    image_resolution: int = 512,
-    max_num_tokens: int = 49152,
-    model_path: str = MODEL_PATH,
-    manual_fov: float = -1.0,
-    low_vram: bool = False,
-    resolution: int = -1,
-    camera_output: str | None = None,
-):
-    # Load models
-    pipeline = init_pipeline(model_path, low_vram=low_vram)
-
-    # Preprocess image first — rembg loads to GPU for this call, then offloads.
-    # MoGe is loaded afterwards so both never occupy VRAM at the same time.
-    print(f"[Inference] Processing image: {image_path}")
-    img = Image.open(image_path)
-    image_preprocessed = pipeline.preprocess_image(img)
-
-    # Save preprocessed image for MoGe
-    tmp_path = os.path.join(os.path.dirname(os.path.abspath(output_path)), f"_tmp_preprocessed_{int(time.time()*1000)}.png")
-    image_preprocessed.save(tmp_path)
-
-    # Camera estimation
-    if manual_fov > 0:
-        # Use manually specified FOV (in radians)
-        camera_angle_x = float(manual_fov)
-        grid_point = torch.tensor([-1.0, 0.0, 0.0])
-        distance = distance_from_fov(
-            camera_angle_x, grid_point,
-            torch.tensor([0 - extend_pixel, image_resolution - 1 + extend_pixel]),
-            mesh_scale, image_resolution
-        )["distance_from_x"]
-        camera_params = {'camera_angle_x': camera_angle_x, 'distance': distance, 'mesh_scale': mesh_scale}
-        print(f"[Inference] Using manual FOV: {math.degrees(manual_fov):.2f}° ({manual_fov:.4f} rad), distance={distance:.4f}")
-    else:
-        print("[MoGe-2] Loading model for camera estimation...")
-        moge_model = load_moge_model(device="cuda")
-        print("[Inference] Estimating camera parameters...")
-        camera_params = get_camera_params_wild_moge(
-            tmp_path, moge_model, device="cuda",
-            mesh_scale=mesh_scale, extend_pixel=extend_pixel,
-            image_resolution=image_resolution,
-        )
-        print(f"  camera_angle_x={camera_params['camera_angle_x']:.4f}, distance={camera_params['distance']:.4f}")
-        # MoGe is only needed for camera estimation; free its VRAM for inference.
-        moge_model.cpu()
-        del moge_model
-        torch.cuda.empty_cache()
-    os.remove(tmp_path)
-
-    # 可选地保存相机参数，供后续 C128/8×C64 分块 flow 使用同一相机。
-    if camera_output:
-        camera_path = os.path.abspath(camera_output)
-        os.makedirs(os.path.dirname(camera_path) or ".", exist_ok=True)
-        with open(camera_path, "w", encoding="utf-8") as handle:
-            json.dump(camera_params, handle, ensure_ascii=False, indent=2)
-            handle.write("\n")
-        print(f"[Camera] Saved to: {camera_path}")
-
-    # Run pipeline
-    print("[Inference] Running 3D generation pipeline...")
-    torch.manual_seed(seed)
-
-    ss_sampler_override = {
-        "steps": ss_sampling_steps, "guidance_strength": ss_guidance_strength,
-        "guidance_rescale": ss_guidance_rescale, "rescale_t": ss_rescale_t,
-    }
-    shape_sampler_override = {
-        "steps": shape_slat_sampling_steps, "guidance_strength": shape_slat_guidance_strength,
-        "guidance_rescale": shape_slat_guidance_rescale, "rescale_t": shape_slat_rescale_t,
-    }
-    tex_sampler_override = {
-        "steps": tex_slat_sampling_steps, "guidance_strength": tex_slat_guidance_strength,
-        "guidance_rescale": tex_slat_guidance_rescale, "rescale_t": tex_slat_rescale_t,
+    return {
+        "camera_angle_x": camera_angle_x,
+        "distance": distance,
+        "mesh_scale": mesh_scale,
     }
 
-    pipeline_type = f"{resolution if resolution > 0 else (1024 if low_vram else 1536)}_cascade"
-    print(f"[Inference] Using pipeline_type={pipeline_type}")
-    mesh_list, (shape_slat, tex_slat, res) = pipeline.run(
-        image_preprocessed,
-        camera_params=camera_params,
-        seed=seed,
-        sparse_structure_sampler_params=ss_sampler_override,
-        shape_slat_sampler_params=shape_sampler_override,
-        tex_slat_sampler_params=tex_sampler_override,
-        preprocess_image=False,
-        return_latent=True,
-        pipeline_type=pipeline_type,
-        max_num_tokens=max_num_tokens,
-    )
 
-    mesh = mesh_list[0]
-    print(
-        f"[Decoder mesh] "
-        f"vertices={mesh.vertices.shape[0]:,}, "
-        f"faces={mesh.faces.shape[0]:,}"
-    )
+def main(args):
+    """Run the same native 1024 baseline used by sr.py, without any SR stages."""
+    from sr_tools import common, rendering
+    from sr_tools.baseline import run_baseline1024
+    from sr_tools.metrics import evaluate
 
-    # 当前阶段禁用原来的 o_voxel.postprocess.to_glb()：
-    #
-    #   glb = o_voxel.postprocess.to_glb(...)
-    #
-    # 该函数内部会执行 UV unwrap、UV 空间 rasterize、attribute/texture baking、
-    # PBRMaterial 构造以及 TextureVisuals(uv=...)。现阶段只导出无 UV、无纹理
-    # 的几何 mesh，因此直接用 vertices/faces 创建 trimesh。
-    import trimesh
-
-    glb = trimesh.Trimesh(
-        vertices=mesh.vertices.detach().cpu().numpy(),
-        faces=mesh.faces.detach().cpu().numpy(),
-        process=False,
-    )
-
-    # 保留原 to_glb + apply_transform 后的坐标方向，但不创建任何 UV 属性。
-    geometry_rot = np.array([
-        [-1, 0,  0, 0],
-        [ 0, 1,  0, 0],
-        [ 0, 0, -1, 0],
-        [ 0, 0,  0, 1],
-    ], dtype=np.float64)
-    glb.apply_transform(geometry_rot)
-
-    # Export geometry-only GLB；trimesh 不会写入 TEXCOORD_0 或纹理材质。
-    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
-    glb.export(output_path)
-    print(f"[Done] UV-free geometry GLB saved to: {output_path}")
+    out = args.output_dir.resolve()
+    with torch.no_grad():
+        pipe = common.setup(out)
+        canonical, camera, mesh = run_baseline1024(pipe, args.image, out)
+        rendering.render(pipe, mesh, out, resolution=2048, camera=camera)
+        evaluate({"baseline1024": mesh}, canonical, camera, out / "evaluation_1024")
+    print("COMPLETE", out)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Pixal3D Inference: Image to GLB")
-    parser.add_argument("--image", type=str, default="/home/nvme04/yyyan/Pixal3D/assets/choose/0_img.png", help="Path to input image")
-    parser.add_argument("--output", type=str, default="./output_1024_8192.glb", help="Output GLB file path")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    parser.add_argument("--fov", type=float, default=-1.0,
-                        help="Manual camera FOV in radians (e.g. 0.2). "
-                             "If not set, FOV is auto-estimated via MoGe-2. "
-                             "Try 0.2 rad if you notice distortion.")
-    parser.add_argument("--model_path", type=str, default=MODEL_PATH, help="Model path or HuggingFace repo")
-    parser.add_argument("--low_vram", action="store_true",
-                        help="Enable low-VRAM mode: models stay on CPU and are loaded to GPU on-demand per stage. "
-                             "Reduces peak VRAM from ~18GB to ~10-12GB at the cost of slower inference.")
-    parser.add_argument("--resolution", type=int, default=1024,
-                        help="Pipeline resolution (1024 or 1536). Default: 1024 if --low_vram, else 1536.")
-    parser.add_argument("--camera-output", type=str, default="",
-                        help="Optional JSON path for saving the estimated camera parameters.")
-
-    args = parser.parse_args()
-
-    run_inference(
-        image_path=args.image,
-        output_path=args.output,
-        seed=args.seed,
-        manual_fov=args.fov,
-        model_path=args.model_path,
-        low_vram=args.low_vram,
-        resolution=args.resolution,
-        max_num_tokens=1_000_000,
-        camera_output=args.camera_output or None,
-    )
+    main(cli_args)
